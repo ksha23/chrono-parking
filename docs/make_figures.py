@@ -68,8 +68,8 @@ def args_for(kind, cars, seed=1, extra=()):
 def run(kind, cars, seed=1):
     """Run one scenario, recording what the figures need."""
     sim = ps.ParkingSim(args_for(kind, cars, seed))
-    rec = dict(sim=sim, t=[], pose=[], v=[], vcmd=[], steer=[], e=[], psi=[], gf=[], gr=[], state=[], frame=None, plan=None,
-               mpc=None)
+    rec = dict(sim=sim, t=[], pose=[], v=[], vcmd=[], steer=[], drive=[], brake=[], e=[], psi=[], gf=[], gr=[], state=[],
+               frame=None, plan=None, mpc=None)
     while sim.result is None and sim.time < 200.0:
         sim.advance(25)
         trk = sim.tracker
@@ -79,6 +79,8 @@ def run(kind, cars, seed=1):
         rec["v"].append(sim.speed)
         rec["vcmd"].append(trk.v_cmd * trk.seg.dir if on else 0.0)
         rec["steer"].append(sim.cmd[0])
+        rec["drive"].append(sim.cmd[1])
+        rec["brake"].append(sim.cmd[2])
         rec["e"].append(trk.err[0] if on else np.nan)
         rec["psi"].append(trk.err[1] if on else np.nan)
         rec["gf"].append(trk.gain.g[1])
@@ -100,9 +102,9 @@ def run(kind, cars, seed=1):
         if rec["mpc"] is None and sim.state == "DRIVE" and len(trk.k_ref) and np.ptp(trk.k_ref) > 0.1 and abs(sim.speed) > 0.5:
             i = trk.i
             rec["mpc"] = dict(k_ref=trk.k_ref.copy(), k_plan=trk.k_plan.copy(), g=trk.gain.g[trk.seg.dir], d=trk.seg.dir,
-                              e=trk.err[0], psi=trk.err[1], steer=trk.steer, v=sim.speed, pose=sim.pose,
+                              e=trk.err[0], psi=trk.err[1], steer=trk.delta, v=sim.speed, pose=sim.pose,
                               horizon=trk.horizon.copy(), seg=(trk.seg.x[i:i + 60].copy(), trk.seg.y[i:i + 60].copy()))
-    for k in ("t", "v", "vcmd", "steer", "e", "psi", "gf", "gr"):
+    for k in ("t", "v", "vcmd", "steer", "drive", "brake", "e", "psi", "gf", "gr"):
         rec[k] = np.array(rec[k])
     print("%s / %s: %s" % (kind, cars, {k: (round(v, 3) if isinstance(v, float) else v) for k, v in sim.result.items()}))
     return rec
@@ -339,17 +341,18 @@ def fig_mpc(rec):
     mpc = ps.LateralMPC()
     N, h = mpc.N, mpc.H
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.3))
-    dk = min(ps.STEER_RATE * m["g"] * h / max(abs(m["v"]), 0.3), 2.0 * m["g"])
-    K, pred = mpc.solve(m["d"], m["e"], m["psi"], m["g"] * m["steer"], m["k_ref"], m["g"], dk)
-    Ku, predu = ps.LateralMPC().solve(m["d"], m["e"], m["psi"], m["g"] * m["steer"], m["k_ref"], 10.0, 10.0)
+    k_now, k_max = m["g"] * math.tan(m["steer"]), m["g"] * math.tan(ps.EGO.steer_max)
+    dk = min(m["g"] * (1.0 + math.tan(m["steer"]) ** 2) * ps.STEER_RATE * h / max(abs(m["v"]), 0.3), 2.0 * k_max)
+    K, pred = mpc.solve(m["d"], m["e"], m["psi"], k_now, m["k_ref"], k_max, dk)
+    Ku, predu = ps.LateralMPC().solve(m["d"], m["e"], m["psi"], k_now, m["k_ref"], 10.0, 10.0)
     s = (np.arange(N) + 0.5) * h
     ax = axes[0]
     ax.step(s, m["k_ref"], where="mid", color=C["grey"], lw=1.5, label="path curvature (reference)")
     ax.step(s, Ku, where="mid", color="#9a6fd0", lw=1.0, ls="--", label="unconstrained optimum")
     ax.step(s, K, where="mid", color=C["mpc"], lw=2.2, label="MPC plan")
-    ax.axhline(m["g"], color=C["occ"], lw=0.8, ls=":")
-    ax.axhline(-m["g"], color=C["occ"], lw=0.8, ls=":", label="steering limit  g * 1")
-    ax.plot(0, m["g"] * m["steer"], "ko", ms=4, label="curvature now")
+    ax.axhline(k_max, color=C["occ"], lw=0.8, ls=":")
+    ax.axhline(-k_max, color=C["occ"], lw=0.8, ls=":", label="steering limit  g tan(delta_max)")
+    ax.plot(0, k_now, "ko", ms=4, label="curvature now")
     ax.set_xlabel("distance ahead [m]")
     ax.set_ylabel("curvature [1/m]")
     ax.set_title("curvature over the horizon (rate limit %.3f per step)" % dk)
@@ -379,7 +382,7 @@ def fig_mpc(rec):
 def fig_tracking(rec, name):
     t = rec["t"]
     state = np.array(rec["state"])
-    fig, axes = plt.subplots(4, 1, figsize=(12, 9), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(12, 11), sharex=True)
     spans = []
     start = 0
     for i in range(1, len(state) + 1):
@@ -400,20 +403,26 @@ def fig_tracking(rec, name):
     axes[0].set_ylabel("m/s")
     axes[0].set_ylim(-1.6, 2.6)
     axes[0].legend(frameon=False, ncol=2, loc="lower left")
-    axes[1].plot(t, rec["steer"], color=C["fwd"], lw=1.4)
-    axes[1].set_ylabel("steering input")
-    axes[1].set_ylim(-1.1, 1.1)
-    axes[2].plot(t, 100 * rec["e"], color=C["track"], lw=1.4, label="lateral error [cm]")
-    axes[2].plot(t, np.degrees(rec["psi"]), color="#e07a10", lw=1.4, label="heading error [deg]")
-    axes[2].set_ylim(-9, 9)
-    axes[2].legend(frameon=False, ncol=2, loc="lower left")
-    axes[3].axhline(ps.EGO.kappa, color=C["grey"], lw=1.0, ls="--", label="model value tan(delta_max) / L")
-    axes[3].plot(t, rec["gf"], color=C["fwd"], lw=1.6, label="identified gain, forward")
-    axes[3].plot(t, rec["gr"], color=C["rev"], lw=1.6, label="identified gain, reverse")
-    axes[3].set_ylabel("curvature per unit steering [1/m]")
-    axes[3].set_xlabel("time [s]")
-    axes[3].set_ylim(0.08, 0.30)
-    axes[3].legend(frameon=False, ncol=3, loc="lower left")
+    axes[1].plot(t, rec["drive"], color="#1c9c4a", lw=1.4, label="drive torque at the wheels (negative = reverse)")
+    axes[1].plot(t, -rec["brake"], color=C["occ"], lw=1.4, label="brake torque (drawn negative)")
+    axes[1].set_ylabel("N m")
+    axes[1].legend(frameon=False, ncol=2, loc="lower left")
+    axes[2].plot(t, np.degrees(rec["steer"]), color=C["fwd"], lw=1.4)
+    axes[2].axhline(math.degrees(ps.EGO.steer_max), color=C["occ"], lw=0.8, ls=":")
+    axes[2].axhline(-math.degrees(ps.EGO.steer_max), color=C["occ"], lw=0.8, ls=":")
+    axes[2].set_ylabel("road-wheel angle [deg]")
+    axes[2].set_ylim(-40, 40)
+    axes[3].plot(t, 100 * rec["e"], color=C["track"], lw=1.4, label="lateral error [cm]")
+    axes[3].plot(t, np.degrees(rec["psi"]), color="#e07a10", lw=1.4, label="heading error [deg]")
+    axes[3].set_ylim(-9, 9)
+    axes[3].legend(frameon=False, ncol=2, loc="lower left")
+    axes[4].axhline(1.0 / ps.EGO.wheelbase, color=C["grey"], lw=1.0, ls="--", label="ideal bicycle, 1 / wheelbase")
+    axes[4].plot(t, rec["gf"], color=C["fwd"], lw=1.6, label="identified gain, forward")
+    axes[4].plot(t, rec["gr"], color=C["rev"], lw=1.6, label="identified gain, reverse")
+    axes[4].set_ylabel("curvature / tan(angle) [1/m]")
+    axes[4].set_xlabel("time [s]")
+    axes[4].set_ylim(0.15, 0.50)
+    axes[4].legend(frameon=False, ncol=3, loc="lower left")
     axes[0].set_title("%s: signals of one run (background: search, stopping, driving the plan, parked)" % rec["sim"].scn.name)
     save(fig, name)
 

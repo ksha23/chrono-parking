@@ -31,7 +31,14 @@ The kinematic model is the bicycle model at the rear axle, with a curvature limi
 ```
 
 where the wheelbase `L` and the maximum steering angle `delta_max` are read from the Chrono
-model. For the sedan that gives 0.168 per metre, a 5.95 m turning radius at the rear axle.
+model. For the sedan the declared maximum is 25 degrees, which gives 0.168 per metre, a 5.95 m
+turning radius at the rear axle.
+
+That limit is deliberately not the steering stop. The wheels can physically turn to 35 degrees,
+but the real car turns less than a bicycle model at the same wheel angle (see
+[control.md](control.md#the-steering-gain)): at the stop it reaches 0.194 per metre going forward
+and 0.216 in reverse. Planning at 0.168 leaves the controller 15 percent of curvature in hand
+going forward and 29 percent in reverse, which it needs to correct errors on a full-lock arc.
 
 ## Goal pose and docking run
 

@@ -14,35 +14,35 @@ the **ground-truth** stall, not against the agent's own estimate of it.
 
 | Stalls | Cars | Variant | Runs parked | Lateral [cm] | Heading [deg] | Depth [cm] | Clearance [m] | Gear changes | Time [s] |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| perpendicular | both | default | 4 of 4 | 2.4 | 0.48 | 8.8 | 0.38 | 1 | 32 |
-| perpendicular | left | default | 4 of 4 | 1.1 | 0.11 | 10.3 | 0.38 | 1 to 3 | 33 |
-| perpendicular | none | default | 4 of 4 | 0.7 | 0.30 | 8.2 | 0.49 | 1 | 31 |
-| perpendicular | random | default | 4 of 4 | 2.3 | 0.45 | 7.0 | 0.37 | 1 | 32 |
-| perpendicular | right | default | 4 of 4 | 3.8 | 0.74 | 5.6 | 0.51 | 1 | 36 |
-| perpendicular | both | noise 2 | 1 of 1 | 0.3 | 0.12 | 9.7 | 0.58 | 3 | 40 |
-| perpendicular | both | park forward | 1 of 1 | 0.8 | 0.66 | 5.3 | 0.23 | 4 | 46 |
-| perpendicular | both | side left | 1 of 1 | 0.6 | 0.25 | 1.9 | 0.50 | 3 | 43 |
-| perpendicular | random | target 17.6,-6.3,90 | 1 of 1 | 0.6 | 0.07 | 0.6 | 0.49 | 1 | 36 |
-| perpendicular | none | target 6.0,0.5,25, no-snap | 1 of 1 | 0.2 | 0.08 | 3.3 | n/a | 1 | 24 |
-| perpendicular | both | tire pac02 | 1 of 1 | 0.3 | 0.24 | 7.3 | 0.55 | 3 | 40 |
-| angled | both | default | 4 of 4 | 1.0 | 0.23 | 7.9 | 0.43 | 1 to 2 | 32 |
-| angled | left | default | 4 of 4 | 0.8 | 0.41 | 2.4 | 0.41 | 2 | 28 |
-| angled | none | default | 4 of 4 | 0.6 | 0.80 | 4.3 | 0.64 | 0 to 1 | 22 |
-| angled | random | default | 4 of 4 | 0.8 | 0.45 | 3.2 | 0.49 | 1 to 2 | 29 |
-| angled | right | default | 4 of 4 | 2.0 | 2.01 | 1.9 | 0.38 | 1 | 33 |
-| angled | both | angle 45 | 1 of 1 | 0.1 | 0.02 | 0.6 | 0.58 | 1 | 30 |
-| angled | both | noise 2 | 1 of 1 | 0.3 | 0.49 | 1.2 | 0.45 | 2 | 33 |
-| angled | both | side left | 1 of 1 | 0.3 | 0.23 | 0.5 | 0.48 | 2 | 33 |
-| angled | both | tire pac02 | 1 of 1 | 0.8 | 0.21 | 2.8 | 0.61 | 2 | 33 |
-| parallel | both | default | 4 of 4 | 2.8 | 0.19 | 4.1 | 0.25 | 2 | 42 |
-| parallel | left | default | 4 of 4 | 2.6 | 0.26 | 4.0 | 0.26 | 2 | 36 |
-| parallel | none | default | 4 of 4 | 2.5 | 0.13 | 4.7 | 0.26 | 2 | 35 |
-| parallel | random | default | 4 of 4 | 2.5 | 0.28 | 3.6 | 0.27 | 2 | 41 |
-| parallel | right | default | 4 of 4 | 2.6 | 0.10 | 3.3 | 0.26 | 2 | 48 |
-| parallel | both | noise 2 | 1 of 1 | 2.2 | 0.05 | 4.0 | 0.21 | 2 | 43 |
-| parallel | both | side left | 1 of 1 | 2.4 | 0.07 | 4.4 | 0.26 | 2 | 41 |
-| parallel | both | target 18.0,-3.0,0 | 1 of 1 | 2.2 | 0.30 | 4.8 | 0.29 | 2 | 44 |
-| parallel | both | tire pac02 | 1 of 1 | 2.5 | 0.03 | 3.5 | 0.26 | 2 | 44 |
+| perpendicular | both | default | 4 of 4 | 1.1 | 0.35 | 5.1 | 0.44 | 1 to 3 | 38 |
+| perpendicular | left | default | 4 of 4 | 1.7 | 0.51 | 25.4 | 0.24 | 1 | 30 |
+| perpendicular | none | default | 4 of 4 | 0.7 | 0.17 | 7.7 | 0.41 | 1 | 30 |
+| perpendicular | random | default | 4 of 4 | 2.0 | 0.27 | 2.7 | 0.36 | 1 | 32 |
+| perpendicular | right | default | 4 of 4 | 3.1 | 0.44 | 3.0 | 0.46 | 1 | 37 |
+| perpendicular | both | noise 2 | 1 of 1 | 4.4 | 0.48 | 9.9 | 0.39 | 1 | 33 |
+| perpendicular | both | park forward | 1 of 1 | 0.8 | 0.31 | 3.2 | 0.12 | 4 | 44 |
+| perpendicular | both | side left | 1 of 1 | 0.0 | 0.15 | 4.8 | 0.44 | 3 | 42 |
+| perpendicular | random | target 17.6,-6.3,90 | 1 of 1 | 1.4 | 0.43 | 1.0 | 0.47 | 1 | 37 |
+| perpendicular | none | target 6.0,0.5,25, no-snap | 1 of 1 | 0.3 | 0.00 | 0.5 | n/a | 1 | 25 |
+| perpendicular | both | tire pac02 | 1 of 1 | 0.9 | 0.02 | 3.6 | 0.45 | 3 | 41 |
+| angled | both | default | 4 of 4 | 1.0 | 0.76 | 2.5 | 0.41 | 1 to 2 | 31 |
+| angled | left | default | 4 of 4 | 0.3 | 0.14 | 2.3 | 0.43 | 2 | 28 |
+| angled | none | default | 4 of 4 | 1.2 | 0.64 | 4.1 | 0.65 | 0 to 1 | 19 |
+| angled | random | default | 4 of 4 | 0.8 | 1.24 | 4.5 | 0.49 | 1 to 2 | 28 |
+| angled | right | default | 4 of 4 | 1.2 | 1.40 | 2.6 | 0.32 | 1 | 34 |
+| angled | both | angle 45 | 1 of 1 | 0.5 | 0.01 | 0.5 | 0.56 | 1 | 29 |
+| angled | both | noise 2 | 1 of 1 | 0.7 | 0.08 | 4.9 | 0.47 | 1 | 31 |
+| angled | both | side left | 1 of 1 | 0.4 | 0.14 | 3.7 | 0.51 | 2 | 33 |
+| angled | both | tire pac02 | 1 of 1 | 0.1 | 0.32 | 2.3 | 0.60 | 1 | 34 |
+| parallel | both | default | 4 of 4 | 2.8 | 0.47 | 1.0 | 0.17 | 2 to 4 | 45 |
+| parallel | left | default | 4 of 4 | 2.5 | 0.16 | 2.2 | 0.26 | 1 to 2 | 35 |
+| parallel | none | default | 4 of 4 | 2.5 | 0.02 | 0.8 | 0.27 | 2 | 35 |
+| parallel | random | default | 4 of 4 | 2.5 | 0.16 | 2.1 | 0.26 | 1 to 4 | 41 |
+| parallel | right | default | 4 of 4 | 2.4 | 0.04 | 1.3 | 0.27 | 2 | 48 |
+| parallel | both | noise 2 | 1 of 1 | 1.9 | 0.32 | 4.2 | 0.23 | 2 | 41 |
+| parallel | both | side left | 1 of 1 | 2.3 | 0.12 | 0.5 | 0.29 | 2 | 43 |
+| parallel | both | target 18.0,-3.0,0 | 1 of 1 | 2.6 | 0.09 | 0.7 | 0.28 | 4 | 50 |
+| parallel | both | tire pac02 | 1 of 1 | 2.4 | 0.08 | 3.3 | 0.28 | 2 | 44 |
 
 The default rows are seeds 1 to 4. `noise 2` doubles every perception noise term. The `target`
 rows give the car a parking pose instead of letting it choose, and `no-snap` parks at exactly that
@@ -52,15 +52,24 @@ pose in open space, so stall-relative clearance does not apply.
 
 | | Parked | Lateral | Heading | Clearance | Gear changes |
 | --- | --- | --- | --- | --- | --- |
-| perpendicular | 25 of 25 | at most 3.8 cm | at most 0.74 deg | at least 0.23 m | 1 to 4 |
-| angled | 24 of 24 | at most 2.0 cm | at most 2.01 deg | at least 0.38 m | 0 to 2 |
-| parallel | 24 of 24 | at most 2.8 cm | at most 0.30 deg | at least 0.21 m | 2 |
+| perpendicular | 25 of 25 | at most 4.4 cm | at most 0.51 deg | at least 0.12 m | 1 to 4 |
+| angled | 24 of 24 | at most 1.2 cm | at most 1.40 deg | at least 0.32 m | 0 to 2 |
+| parallel | 24 of 24 | at most 2.8 cm | at most 0.47 deg | at least 0.17 m | 1 to 4 |
 
-No run needed a replan or a correction maneuver. The longest took 49 s of simulated time.
+No run needed a replan or a correction maneuver. The longest took 50 s of simulated time.
 
-Earlier versions of the pipeline went through larger batches (116 runs including left-hand stalls
-for every type, forward parking with one neighbour, and zero noise) with the same outcome. Those
-ran before the controller was replaced by the MPC, so they are not counted here.
+Two of those numbers need a comment:
+
+- **0.12 m clearance.** That is the nose-in perpendicular run between two cars. The planner only
+  found a way in at its tightest margin setting (8 cm), so the small clearance is the plan being
+  followed, not the controller straying. Every other perpendicular run kept at least 0.24 m.
+- **25 cm of depth** in one perpendicular run: the car stood 25 cm short of the middle of the stall,
+  still inside the lines. The far end of a stall line is the least well observed part of it.
+
+These runs use the physical command interface (steering angle, drive torque, brake torque). An
+earlier batch of the same 74 runs with Chrono's normalized pedal inputs gave similar accuracy, and
+larger earlier batches (116 runs including left-hand stalls for every type and zero noise) also
+all parked. Those are not counted here because the control interface has changed since.
 
 ## How to reproduce
 
@@ -109,14 +118,21 @@ direction.
 - **This car turns wide.** The sedan's kinematic turning radius is 5.95 m at the rear axle. Tight
   maneuvers need an extra back and forth, and the parallel stalls are 7.2 m long to make a single
   reverse sweep possible. A car with a 4.5 m radius would do visibly better with the same code.
-- **Planning is conservative about steering.** The planner uses the model's kinematic limit. The
-  car can actually turn 15 percent tighter forward and 29 percent tighter in reverse, which the
-  controller learns but the planner does not use.
-- **Forward docking is less precise than reverse.** The forward steering response has slack near
-  straight-ahead that one gain cannot capture. The largest final heading error, 2.0 degrees, was a
-  nose-in angled stall.
+- **Planning is conservative about steering.** The planner uses the bicycle model at the declared
+  25 degree steering angle. At its 35 degree stop the car turns 15 percent tighter than that
+  going forward and 29 percent tighter in reverse, which the controller learns but the planner
+  does not use.
+- **Forward docking is less precise than reverse.** Going forward on a steady circle the car turns
+  a quarter to a third less than a bicycle model at the same wheel angle, and least of all near
+  straight-ahead, which one gain per direction cannot capture. The largest final heading errors,
+  up to 1.4 degrees, were nose-in angled stalls.
+- **Nose-in perpendicular parking is at the edge of what this car can do** in a 7 m aisle. It
+  works, with four gear changes and the tightest planning margin.
 - **Early commitment.** The car can commit to a stall on an estimate that is still poor. The
   planner then refuses it, the car drives on and tries again a few metres later, which costs an
-  extra gear change or two. That happened in one of the 74 runs.
+  extra gear change or two.
+- **Brake torque, not pressure.** Chrono's brake has no hydraulics, so the brake command is a
+  torque. The drive torque acts on the half-shafts with the engine bypassed, which is closer to an
+  electric drive unit than to a combustion powertrain.
 - **Stall geometry is assumed.** The thresholds that turn line pairs into stalls encode ordinary
   car stalls. Motorcycle bays, double-length stalls or unmarked spaces are not recognised.

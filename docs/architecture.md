@@ -38,7 +38,7 @@ flowchart TB
         PLAN["Planner<br/>CSpace + Hybrid A*"]
         TRK["MpcTracker<br/>LateralMPC + SteeringGain + PI"]
     end
-    VEH -- "pose, speed, yaw rate" --> SENSE
+    VEH -- "pose" --> SENSE
     SCN --> SENSE
     SENSE -- "range scan" --> GRID
     SENSE -- "line detections" --> LINES
@@ -49,8 +49,8 @@ flowchart TB
     GRID -- "blocked cells" --> PLAN
     PLAN -- "path segments" --> TRK
     SLOTS -. "refined goal pose" .-> TRK
-    VEH -- "pose, speed, yaw rate" --> TRK
-    TRK -- "steering, throttle, brake" --> VEH
+    VEH -- "pose, speed" --> TRK
+    TRK -- "steering angle, drive torque, brake torque" --> VEH
 ```
 
 The agent never reads the scenario directly. Everything it knows about lines and obstacles comes
@@ -61,7 +61,7 @@ through `Perception.sense`. The one thing it takes from ground truth is its own 
 | Loop | Period | What runs |
 | --- | --- | --- |
 | Physics | 2 ms | Chrono vehicle and terrain, tire sub-step 1 ms |
-| Control | 20 ms | error measurement, steering gain update, MPC solve, speed PI |
+| Control | 20 ms | error measurement, steering gain update, MPC solve, speed loop, torque commands |
 | Perception and mapping | 100 ms | sensing, grid and line map update, stall inference, decision, plan refinement, path monitor |
 | Rendering | about 33 ms | four camera views and the internals panel |
 | Planning | on demand | runs in a worker thread while simulated time is frozen |
@@ -113,7 +113,7 @@ Three events can interrupt `DRIVE`:
 2. Newly seen obstacle cells lie inside the footprint along the remaining path, on two consecutive
    perception ticks. The car stops and replans. If no plan exists, the run fails instead of driving
    a blocked path.
-3. After the last segment, the pose is more than 0.12 m sideways, 2.5 degrees, or 0.3 m lengthwise
+3. After the last segment, the pose is more than 0.08 m sideways, 1.5 degrees, or 0.3 m lengthwise
    from the goal. The car plans a correction, at most twice.
 
 ## Coordinates and conventions
@@ -125,7 +125,9 @@ Three events can interrupt `DRIVE`:
 - Curvature `kappa` is signed in the car's frame: positive means steering left, in forward and
   in reverse. With signed speed `v`, the yaw rate is `v * kappa`.
 - Direction `d` is +1 forward and -1 reverse.
-- The steering input `s` is Chrono's driver input in [-1, 1].
+- The three commands to the car are physical: steering angle `delta` (road-wheel angle, rad,
+  positive left), drive torque at the wheels (N m, negative drives backwards) and brake torque
+  (N m). Chrono's normalized pedal inputs are not used by the agent.
 
 ## Where things are in the file
 
@@ -134,7 +136,7 @@ installation and run. It is organised in sections, in this order:
 
 | Section | Main names |
 | --- | --- |
-| Ego vehicle | `Ego`, `EGO` (geometry read from the Chrono model) |
+| Ego vehicle | `Ego`, `EGO` (geometry, mass and limits read from the Chrono model) |
 | Geometry helpers | `rect_poly`, `ego_poly`, `poly_distance`, `footprint_hits` |
 | Scenarios | `Scenario`, `make_lot`, `make_street`, `parked_model` |
 | Perception | `Perception` |
@@ -144,7 +146,7 @@ installation and run. It is organised in sections, in this order:
 | Configuration space | `CSpace`, `holonomic_distance` |
 | Planner | `Planner` (`search`, `shoot`, `_rs_shot`, `_arc_shot`), `Segment`, `split_segments` |
 | Control | `LateralMPC`, `SteeringGain`, `MpcTracker` |
-| Chrono world | `World` |
+| Chrono world | `World` (the model, the scene, and the physical actuation in `step`) |
 | Agent | `ParkingSim` (state machine, decision, planning requests, refinement, monitor) |
 | Viewer | `MouseKeys`, `Viewer` |
 | Entry point | `parse_args`, `main` |
@@ -170,6 +172,13 @@ car gets closer. The remaining part of the plan is moved rigidly with it, weight
 last few metres move. The car therefore ends up where the lines are, not where they were first
 believed to be.
 
-**No measured vehicle data.** The planner uses the kinematic curvature limit that follows from the
-Chrono model's wheelbase and maximum steering angle. The controller starts from the same value and
-identifies the real steering gain while driving (see [control.md](control.md#the-steering-gain)).
+**No measured vehicle data.** Geometry, mass, wheel radius, steering stop and brake capacity are
+read from the Chrono model at start-up. The planner uses the kinematic curvature limit that follows
+from the model's wheelbase and declared maximum steering angle. The controller starts from the
+ideal bicycle model and identifies the real steering gain while driving (see
+[control.md](control.md#the-steering-gain)).
+
+**Physical commands.** The controller outputs a steering angle, a drive torque and a brake torque,
+and the simulation applies those to the model directly (see
+[simulation-and-viewer.md](simulation-and-viewer.md#actuation)). There is no throttle map, gearbox
+or steering ratio hidden between the controller and the car.

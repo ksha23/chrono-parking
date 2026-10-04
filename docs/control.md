@@ -1,33 +1,44 @@
 # Control
 
-The controller turns a planned path into steering, throttle and brake commands at 50 Hz. Steering
-is model predictive control. Speed is a PI loop on a speed profile. Code: `LateralMPC`, `nnls`,
-`SteeringGain`, `MpcTracker`, and the plan refinement in `ParkingSim._refine` and `_monitor`.
+The controller turns a planned path into commands for the car at 50 Hz. The commands are physical
+quantities, not pedal positions:
+
+| Command | Unit | Meaning |
+| --- | --- | --- |
+| steering angle | rad | road-wheel angle of the front axle |
+| drive torque | N m | total torque at the driven wheels, negative to drive backwards |
+| brake torque | N m | total brake torque over all four wheels |
+
+Steering is model predictive control. Speed is a PI loop that outputs an acceleration, which
+becomes a torque through the car's mass and wheel radius. Code: `LateralMPC`, `nnls`,
+`SteeringGain`, `MpcTracker`, and the plan refinement in `ParkingSim._refine` and `_monitor`. How
+the commands reach the Chrono model is in
+[simulation-and-viewer.md](simulation-and-viewer.md#actuation).
 
 ```mermaid
 flowchart LR
     SEG["path segment<br/>x, y, heading, curvature"] --> ERR["errors at the rear axle<br/>e, psi, distance left"]
-    POSE["pose, speed, yaw rate<br/>from Chrono"] --> ERR
+    POSE["pose and speed<br/>from Chrono"] --> ERR
     POSE --> RLS["SteeringGain<br/>recursive least squares"]
     ERR --> MPC["LateralMPC<br/>QP over 4 m"]
     SEG -- "curvature ahead" --> MPC
     RLS -- "gain g" --> MPC
-    MPC -- "curvature for the next step" --> MAP["steering = curvature / g<br/>rate limited"]
-    ERR --> SPD["speed profile + PI"]
-    MAP --> OUT["steering"]
-    SPD --> OUT2["throttle, brake"]
+    MPC -- "curvature for the next step" --> MAP["angle = atan(curvature / g)<br/>rate limited"]
+    ERR --> SPD["speed profile + PI<br/>acceleration"]
+    MAP --> OUT["steering angle [rad]"]
+    SPD --> OUT2["drive torque, brake torque [N m]<br/>= mass x acceleration x wheel radius"]
 ```
 
 ![Signals of one run](img/tracking_perpendicular.png)
 
 ## Why MPC here
 
-A planned parking path is made of straight lines and arcs, so its curvature jumps. A real
-steering system cannot jump: this simulator limits the steering input rate to 1.3 per second, about
-1.5 s from lock to lock. A feedback law reacts to a curvature jump when it arrives and is then late
-by the time the steering needs to move. An MPC sees the jump coming over its horizon, knows the
-rate limit, and starts turning early by exactly the amount that minimises the error. It also
-handles the hard steering limit explicitly instead of saturating.
+A planned parking path is made of straight lines and arcs, so its curvature jumps. A steering
+system cannot jump: here the road wheels turn at no more than 0.8 rad/s, about 1.5 s from lock to
+lock. A feedback law reacts to a curvature jump when it arrives and is then late by the time the
+steering needs to move. An MPC sees the jump coming over its horizon, knows the rate limit, and
+starts turning early by exactly the amount that minimises the error. It also handles the hard
+steering limit explicitly instead of saturating.
 
 ## Error model in travelled distance
 
@@ -40,6 +51,10 @@ distance `sigma` as
 \frac{de}{d\sigma} = d \sin\psi, \qquad
 \frac{d\psi}{d\sigma} = d \left( \kappa - \frac{\kappa_{ref} \cos\psi}{1 - \kappa_{ref}\, e} \right)
 ```
+
+The errors are measured against the path interpolated between its samples, which are 10 cm apart.
+Measured against the nearest sample instead, the reference heading jumps on every arc, and the
+steering followed those jumps with a wiggle that was three to five times rougher.
 
 Writing the model in distance instead of time is deliberate. At parking speeds the car creeps to a
 stop at the end of every segment. A time-domain horizon of fixed duration shrinks to nothing in
@@ -71,7 +86,7 @@ Horizon `N = 20` steps of `h = 0.2 m`. Decision variables: the curvatures
 ```
 
 ```math
-\text{subject to} \quad |\kappa_k| \le g, \qquad |\kappa_k - \kappa_{k-1}| \le \Delta
+\text{subject to} \quad |\kappa_k| \le g \tan\delta_{max}, \qquad |\kappa_k - \kappa_{k-1}| \le \Delta
 ```
 
 | Symbol | Value | Meaning |
@@ -80,9 +95,13 @@ Horizon `N = 20` steps of `h = 0.2 m`. Decision variables: the curvatures
 | `gamma_N` | 3 | extra weight on the last step, 1 elsewhere |
 | `r` | 1 | stay near the path's own curvature |
 | `r_Delta` | 1 | smooth steering |
-| `kappa_{-1}` | `g * s_now` | the curvature the car has right now |
-| `g` | identified online | curvature per unit of steering input, so `abs(kappa) <= g` is the steering limit |
-| `Delta` | `min(1.3 g h / max(abs(v), 0.3), 2 g)` | curvature change allowed per step by the steering rate at the current speed |
+| `kappa_{-1}` | `g tan(delta)` | the curvature the car has right now, from its steering angle `delta` |
+| `g` | identified online | curvature per unit of `tan(steering angle)`, see below |
+| `delta_max` | 35.4 deg, read from the model | the steering stop |
+| `Delta` | `g (1 + tan(delta)^2) * 0.8 * h / max(abs(v), 0.3)` | curvature change one step allows, from the 0.8 rad/s steering rate at the current speed |
+
+The rate bound follows from differentiating `kappa = g tan(delta)`: the curvature changes at
+`g (1 + tan^2 delta)` times the steering rate, and one horizon step lasts `h / |v|` seconds.
 
 The reference `kappa_ref` is the raw path curvature sampled at the middle of each step. It is not
 smoothed: dealing with the jumps is the MPC's job. Beyond the end of a segment the last curvature
@@ -147,50 +166,80 @@ method is both faster and correct.
 
 ## The steering gain
 
-The MPC plans in curvature. The car takes a steering input `s` in [-1, 1]. The link is one number
-per driving direction:
+The MPC plans in curvature. The car takes a steering angle `delta`. The link is one number per
+driving direction:
 
 ```math
-\kappa = g\, s
+\kappa = g \tan\delta
 ```
 
-**Starting value.** The kinematic bicycle with the Chrono model's wheelbase and maximum steering
-angle: `g_0 = tan(delta_max) / L = 0.168`.
+**Starting value.** For an ideal bicycle `g = 1 / L`, one over the wheelbase, which is 0.360 per
+metre for this car. That is where the estimate starts. No calibration data is involved.
 
-**Online identification.** The curvature the car is actually driving is measured as yaw rate over
-speed, and `g` is updated by recursive least squares with a forgetting factor:
+**Online identification.** The measurement comes from the car's own track over the last half
+second. Integrating the model along the distance driven gives
 
 ```math
-\hat\kappa = \frac{\omega}{v}, \qquad
-k = \frac{P s}{\lambda + P s^2}, \qquad
-g \leftarrow g + k \left( \hat\kappa - g s \right), \qquad
-P \leftarrow \frac{P - k s P}{\lambda}
+\theta(t) - \theta(t - T) = d \; g \int \tan\delta \; ds
 ```
 
-with `lambda = 0.995` and `P` capped at 0.5. Samples are used only when they carry information
-and are not transients: speed above 0.5 m/s, `|s|` above 0.15, and the steering not moving faster
-than 0.5 per second (the yaw response lags a moving wheel). `g` is kept within 0.4 to 2.5 times
-the starting value.
+so over a window in which the car covered a distance `S`, the curvature it drove and the
+regressor that explains it are
 
-**What it finds.** Driving steady circles and comparing the identified `g * s` with the curvature
-of the circle actually driven:
+```math
+\hat\kappa = \frac{\theta(t) - \theta(t - T)}{d \, S}, \qquad
+x = \frac{1}{S} \int \tan\delta \; ds
+```
 
-| Direction | Steering input | Curvature of the driven circle | Identified `g * s` |
-| --- | --- | --- | --- |
-| forward | 0.3 | 0.042 | 0.036 |
-| forward | 0.7 | 0.125 | 0.125 |
-| forward | 1.0 | 0.193 | 0.203 |
-| reverse | 0.7 | 0.150 | 0.149 |
-| reverse | 1.0 | 0.216 | 0.217 |
+This relation holds while the steering is moving, which during a maneuver it nearly always is.
+`g` is then updated by recursive least squares with a forgetting factor:
 
-So the real car turns tighter than the kinematic value suggests, 15 percent going forward at full
-lock and 29 percent in reverse, and the forward response is not linear: the gain is 0.12 at a
-steering input of 0.3 and 0.20 at full lock. A single gain cannot represent that curve. It works
-as gain scheduling by adaptation: on an arc the estimate converges to the local gain within a few
-tenths of a second, and the MPC feedback covers the transient.
+```math
+k = \frac{P x}{\lambda + P x^2}, \qquad
+g \leftarrow g + k \left( \hat\kappa - g x \right), \qquad
+P \leftarrow \frac{P - k x P}{\lambda}
+```
 
-The bottom panel of the figure at the top of this page shows it happening in a run: both gains
-start at the model value and move when the car first turns in that direction.
+with `lambda = 0.98` per control tick, so the estimate follows a change within about a second. A
+window is used only if the car covered at least 0.25 m in it, in one direction, and the average
+`tan(delta)` is at least 0.05. `g` is kept within 0.4 to 1.5 times `1 / L`.
+
+Two simpler versions were tried first and did not work:
+
+- **Yaw rate over speed** as the curvature measurement. In this simulation the ratio scatters by
+  50 percent at a gentle curvature and its average was off by up to 40 percent from the circle the
+  car was driving. The estimate wandered, the MPC's idea of its own steering limit wandered with
+  it, and forward arcs tracked worse.
+- **Heading change over distance, but only when the steering is held still.** Clean on a test
+  circle and useless in practice: during a real maneuver the steering is almost never still for
+  half a second, so the estimate never moved from its starting value.
+
+**What it finds.** Driving steady circles at a fixed steering angle, 1.1 m/s:
+
+| Direction | Steering angle | Curvature driven | Bicycle model `tan(delta) / L` | True gain | Identified gain |
+| --- | --- | --- | --- | --- | --- |
+| forward | 8.6 deg | 0.034 | 0.054 | 0.223 | 0.223 |
+| forward | 20.1 deg | 0.101 | 0.132 | 0.276 | 0.275 |
+| forward | 35.4 deg (stop) | 0.194 | 0.256 | 0.273 | 0.273 |
+| reverse | 8.6 deg | 0.054 | 0.054 | 0.358 | 0.358 |
+| reverse | 20.1 deg | 0.128 | 0.132 | 0.350 | 0.349 |
+| reverse | 35.4 deg (stop) | 0.216 | 0.256 | 0.304 | 0.303 |
+
+The identified value is within 1 percent of the true one three seconds after pulling away, except
+at the smallest forward angle, where it took much longer.
+
+In reverse the car is close to an ideal bicycle. Going forward on a steady circle it turns a
+quarter to a third less than the bicycle model says for the same wheel angle, and the gain changes
+with the angle. A single gain per direction cannot represent that curve exactly. It works as gain
+scheduling by adaptation, with the MPC feedback covering the transient.
+
+During an actual parking maneuver the forward gain comes out higher than on the steady circles,
+around 0.33 to 0.36. The arcs are short and driven with little torque. A plausible reason for the
+difference is that a steady full-lock circle needs sustained drive torque on the steered front
+wheels, which makes a front-driven car push wide. That explanation was not tested.
+
+The bottom panel of the figure at the top of this page shows it in a run: both gains start at
+`1 / L` and move when the car first turns in that direction.
 
 Two things were tried and are not in the code:
 
@@ -198,46 +247,69 @@ Two things were tried and are not in the code:
   it made things worse (one failure, larger final heading errors), most likely because the two
   estimators compete for the same residual.
 - Using the identified gain in the planner. The first plan is made before the car has turned at
-  all, so it would not help where it matters. The planner uses the model value throughout, which is
-  conservative: the real car can always turn tighter than planned.
+  all, so it would not help where it matters. The planner uses a fixed, conservative limit (see
+  [planning.md](planning.md#the-planning-problem)).
 
-## From MPC output to steering
+## From MPC output to steering angle
 
-`s_target = kappa_0 / g`, clipped to [-1, 1]. The steering input then moves toward the target at
-no more than 1.3 per second. Because the MPC already respects that rate, this limiter rarely binds.
-It is there because the rate limit is a property of the actuator, not of the controller.
+`delta_target = atan(kappa_0 / g)`. The commanded angle then moves toward the target at no more
+than 0.8 rad/s. Because the MPC already respects that rate, this limiter rarely binds. It is there
+because the rate limit is a property of the actuator, not of the controller.
 
-## Speed
+## Speed and torque
 
-Each segment gets a speed limit from the steering actuator. Where the path curvature changes by
-`d kappa / d s` per metre, driving at `v` requires the steering to move at `v * d kappa / d s`,
-which must not exceed what the rate limit allows:
+**Speed limit from the steering.** Where the path curvature changes by `d kappa / d s` per metre,
+driving at `v` requires the steering angle to change at about `L v d kappa / d s`, which must not
+exceed the steering rate:
 
 ```math
-v_{ref}(s) = \min\left( v_{max},\; \mathrm{clamp}\!\left( \frac{1.3\, g_0}{|d\kappa/ds|},\; 0.5,\; v_{max} \right) \right)
+v_{ref}(s) = \min\left( v_{max},\; \mathrm{clamp}\!\left( \frac{0.8}{L\,|d\kappa/ds|},\; 0.5,\; v_{max} \right) \right)
 ```
 
 `v_max` is 2.2 m/s while searching, 1.4 m/s forward and 1.0 m/s in reverse while maneuvering. The
-target speed also ramps down toward the end of the segment:
+target speed also ramps down toward the end of the segment, so the car arrives at a creep, and it
+is ramped up at no more than 0.7 m/s^2:
 
 ```math
-v = \max\left( \min\left( v_{ref},\; \sqrt{2 \cdot 0.5 \cdot s_{rem}} \right),\; 0.15 \right)
+v_{cmd} = \max\left( \min\left( v_{ref},\; \sqrt{2 \cdot 0.5 \cdot s_{rem}} \right),\; 0.15 \right)
 ```
 
-so the car arrives at a creep. It is ramped up at no more than 0.7 m/s^2. A PI loop on the speed
-error drives the throttle (gains 0.5 and 0.5 per second, integrator limited). The brake comes on in
-proportion when the car is more than 0.08 m/s too fast.
+**Acceleration.** The speed loop works in acceleration, so its gains are plain physical rates:
 
-**Stopping.** When the distance left drops below `0.015 m + 0.06 s * v`, the brake is applied and
-held until the car has been still for 0.3 s. Near the end, the distance left is measured along the
+```math
+a = \dot v_{cmd} + 4\,(v_{cmd} - v) + 2 \int (v_{cmd} - v)\, dt
+```
+
+The first term is the slope of the speed profile, as feedforward. Without it the car lags the
+decelerating profile and arrives at the end of a segment too fast, which showed up as stopping
+10 cm late.
+
+**Torque.** The acceleration becomes a torque through the mass and wheel radius read from the
+model:
+
+```math
+T = m\, a\, r_w
+```
+
+If `a` is positive it is a drive torque, signed by the driving direction and capped at
+2.5 m/s^2 worth. If `a` is below -0.1 m/s^2 it is a brake torque, capped the same way. In
+between the car coasts. There is no gearbox in this loop: reversing is a negative drive torque.
+
+In open loop the model delivers 86 percent of `T / (m r_w)` as acceleration (800 N m gives
+1.25 m/s^2 against 1.46 ideal). The rest goes to rolling resistance and to spinning up the wheels
+and driveline. The integrator absorbs that. Brake torque is closer: 550 N m gives 1.00 m/s^2.
+
+**Stopping.** When the distance left drops below `0.015 m + 0.06 s * v`, a brake torque worth
+2.5 m/s^2 (1375 N m) is applied and held until the car has been still for 0.3 s. That torque
+holds the car to within 0.2 mm over 3 s. Near the end, the distance left is measured along the
 final heading, which is more accurate than arc length along the path.
 
 ## Sequencing a segment
 
 ```mermaid
 stateDiagram-v2
-    [*] --> steer: gear selected
-    steer --> go: wheels within 0.03 of the MPC target, at least 0.3 s
+    [*] --> steer: segment starts
+    steer --> go: steering within 0.02 rad of the MPC target, at least 0.3 s
     go --> stop: distance left under the stopping threshold
     stop --> [*]: still for 0.3 s
 ```
@@ -272,7 +344,7 @@ Each perception tick, `_monitor` places the footprint at every third remaining p
 tests it against the occupied cells. Two consecutive hits make the car stop and replan. If no plan
 exists the run fails. It does not drive a path it knows to be blocked.
 
-After the last segment the pose is compared with the goal. More than 12 cm sideways, 2.5 degrees
+After the last segment the pose is compared with the goal. More than 8 cm sideways, 1.5 degrees
 or 30 cm lengthwise triggers a correction plan, at most twice.
 
 ## Limits
@@ -281,9 +353,9 @@ or 30 cm lengthwise triggers a correction plan, at most twice.
   here, not for recovering from a large disturbance.
 - Only the steering is predictive. Speed is a separate loop, so the MPC cannot trade speed against
   tracking. It does not need to at parking speeds.
-- The forward steering response has slack near straight-ahead that a single gain cannot describe.
-  Docking runs driven forward therefore end with a larger heading error than those driven in
-  reverse. The worst case in the verification batch was 2.0 degrees.
+- One gain per direction is a coarse model of the forward steering response, which is weakest
+  near straight-ahead. Docking runs driven forward therefore end with a larger heading error than
+  those driven in reverse.
 
 ## References
 

@@ -13,13 +13,13 @@ The car is the `Sedan` from Chrono::Vehicle, a template-based multibody model:
 | rear suspension | multi-link |
 | steering | rack and pinion |
 | driveline | shaft-based, two wheel drive |
-| engine and gearbox | map-based engine, automatic transmission with forward and reverse |
+| engine and gearbox | map-based engine and automatic transmission. Present in the model but bypassed: the gearbox stays in neutral |
 | brakes | shaft-based |
 | tires | TMeasy (default) or Pacejka 2002 with `--tire pac02` |
 
 That is 20 rigid bodies, 38 joints and force elements and 10 driveline shafts, integrated at 2 ms with a 1 ms tire
-sub-step and penalty (SMC) contact. The agent sends the same three inputs a driver would: steering,
-throttle and brake, plus the gear selection.
+sub-step and penalty (SMC) contact. The agent drives it with three physical commands: steering
+angle, drive torque and brake torque.
 
 Three settings matter and are not the defaults:
 
@@ -31,9 +31,59 @@ Three settings matter and are not the defaults:
 - **Parked cars are fixed bodies** with a collision box and the vehicle meshes that ship with
   Chrono. They are scenery with contact, not full vehicle models.
 
+### Actuation
+
+Chrono::Vehicle is normally driven through `DriverInputs`: steering in [-1, 1], throttle and
+braking in [0, 1]. Those are pedal positions. A controller that outputs them has to carry an
+implicit model of the engine map, the gearbox and the steering ratio. Here the controller outputs
+physical quantities, and `World.step(steering angle, drive torque, brake torque)` applies them:
+
+| Command | How it reaches the model |
+| --- | --- |
+| steering angle [rad] | converted to a rack position through a table of the steering geometry, which the car reads from its own model at power-up |
+| drive torque [N m] | applied directly to the two half-shafts of the driven axle (`ChSuspension::ApplyAxleTorque`), half each. The gearbox is in neutral and the throttle stays at zero, so the engine is out of the loop. A negative torque drives backwards, so there is no gear to select |
+| brake torque [N m] | Chrono's brakes take a fraction of their capacity, so the command is divided by the capacity read from the model. The four brakes share it in proportion to their size |
+
+```mermaid
+flowchart LR
+    C["controller"] -- "steering angle [rad]" --> T["angle to rack table"] --> R["rack and pinion"]
+    C -- "drive torque [N m]" --> H["half-shafts of the driven axle"]
+    C -- "brake torque [N m]" --> B["brakes, as a fraction of capacity"]
+    R --> V["Chrono sedan"]
+    H --> V
+    B --> V
+```
+
+**Power-up.** Before the run starts, `World._actuators` moves the rack through its travel in five
+steps with the brakes fully applied, and reads the mean angle of the two front wheels at each. That
+gives the angle to rack table and the steering stop (35.4 degrees). The same moment gives the brake
+capacity (8000 N m in total). Nothing is typed in.
+
+**What the steering angle means.** It is the road-wheel angle the steering geometry produces at
+rest, the mean of the two front wheels. A commanded angle is reproduced within 0.001 rad at
+standstill. Under cornering load the wheels deflect from it by up to 2.5 degrees (compliance):
+at the stop the loaded angle is 37.8 degrees going forward and 34.7 in reverse. An earlier version
+closed a servo loop on the measured loaded angle. That cost steering authority, because the stop
+learned at standstill is reached before the rack is, and a forward arc then tracked up to 39 cm off.
+
+**Why brake torque and not pressure.** Chrono's brake is a torque element on the wheel shaft with
+no hydraulics behind it. A pressure command would need a caliper model (piston area, pad friction,
+effective radius) that this vehicle model does not contain, so torque is the honest quantity.
+
+**What the commands do.** Measured on the model, on level ground:
+
+| Command | Result | Ideal `T / (m r)` |
+| --- | --- | --- |
+| drive torque +800 N m | +1.25 m/s^2 | 1.46 m/s^2 |
+| drive torque -800 N m | -1.26 m/s^2 | -1.46 m/s^2 |
+| brake torque 550 N m | 1.00 m/s^2 deceleration | 1.00 m/s^2 |
+| brake torque 1375 N m at standstill | holds within 0.2 mm over 3 s | |
+| steering step to 0.3 rad at standstill | wheels there in about 0.1 s | |
+
 ### What is read from the model
 
-`Ego.read` queries the Chrono vehicle once, after it is built. Nothing below is typed in.
+`Ego.read` and `World._actuators` query the Chrono vehicle once, after it is built. Nothing below
+is typed in.
 
 | Quantity | Source | Sedan |
 | --- | --- | --- |
@@ -41,7 +91,12 @@ Three settings matter and are not the defaults:
 | rear axle position | rear spindle positions in the chassis frame | 1.388 m behind the reference point |
 | body outline | points of the chassis collision hull | 4.89 m long, 1.85 m wide |
 | rear overhang, front reach | hull extent relative to the rear axle | 1.065 m, 3.825 m |
-| curvature limit | `tan(GetMaxSteeringAngle()) / wheelbase` | 0.168 per metre, radius 5.95 m |
+| mass | `GetMass()` | 1684 kg |
+| wheel radius | `GetTire().GetRadius()` | 0.327 m |
+| driven axle | `GetDrivenAxleIndexes()` | front |
+| steering stop and angle to rack table | sweep of the rack at power-up, `GetSteeringAngle()` | 35.4 deg |
+| brake torque capacity | `GetBrakeTorque()` with the brakes fully applied | 8000 N m |
+| planning curvature limit | `tan(GetMaxSteeringAngle()) / wheelbase`, the declared 25 deg | 0.168 per metre, radius 5.95 m |
 
 The footprint and ride height of the parked cars come from the bounding boxes of their meshes in
 the same way.
@@ -92,6 +147,9 @@ One Irrlicht window, drawn by the script itself in several viewports per frame.
 | front or rear camera | at bumper height, switches with the gear, with the plan drawn in like a parking camera |
 | stall camera | beyond the back of the chosen stall, looking at the car coming in. A side view until a stall is chosen |
 
+The bottom left corner shows the three commands being sent to the car: steering angle in degrees,
+drive torque and brake torque in N m.
+
 Drawn into the 3D scene, on the ground:
 
 | Colour | Meaning |
@@ -117,10 +175,10 @@ The right-hand panel shows what the agent is doing, updated at the perception ra
    curvature (grey) and the steering limits (red), with the number of solver iterations.
 4. **Tracking error.** Lateral error in centimetres and heading error in degrees, last 16 s.
 5. **Speed.** Speed and the speed command.
-6. **Steering gain.** The identified gain forward and in reverse against the model value. This is
-   the trace to watch when the car first turns in a new direction.
-7. Counts: line tracks, stalls by status, the car dimensions read from the model, smallest
-   clearance so far, margin and segment count of the current plan.
+6. **Steering gain.** The identified gain forward and in reverse against the ideal bicycle value
+   `1 / L`. This is the trace to watch when the car first turns in a new direction.
+7. Counts: line tracks, stalls by status, what was read from the model (dimensions, mass, steering
+   stop, brake capacity), smallest clearance so far, margin and segment count of the current plan.
 
 `--no-panel` hides it.
 

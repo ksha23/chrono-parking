@@ -140,7 +140,11 @@ For a parallel stall the two "lines" are the short ticks painted across the park
 front and back, so the car ends up perpendicular to them.
 
 **Which end is the entrance.** The end of the line pair that is nearer to where the car has driven
-(its trail of past positions) is the lane side.
+(its trail of past positions) is the lane side. Only the drive along the lane counts: the trail
+stops growing once the car commits to a stall. A car that is parking drives inside the stall, and
+its track there says nothing about where the lane is. An earlier version kept extending the trail,
+and for a parallel stall entered from behind it flipped the entrance halfway through the maneuver,
+which moved the goal by 21 cm.
 
 **Perpendicular or angled.** With `in_a` and `in_b` the positions of the two entrance ends along
 the lines and `w` the separation, the skew is `|in_a - in_b| / w`. A 90 degree stall has skew

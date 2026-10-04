@@ -57,7 +57,7 @@ flowchart LR
     M --> D["Stall inference<br/>and choice"]
     D --> PL["Planning<br/>Hybrid A* + Reeds-Shepp"]
     PL --> C["Control<br/>MPC steering + PI speed<br/>50 Hz"]
-    C -->|steering, throttle, brake| V
+    C -->|"steering angle, drive torque, brake torque"| V
     M -. "stall estimate keeps improving" .-> C
 ```
 
@@ -67,7 +67,7 @@ flowchart LR
 | Mapping | weighted total least squares line tracks, occupancy grid where unseen space counts as blocked | [docs/perception-and-mapping.md](docs/perception-and-mapping.md) |
 | Decision | stalls from pairs of lines, free or occupied from the scan, first settled free stall wins | [docs/perception-and-mapping.md](docs/perception-and-mapping.md) |
 | Planning | configuration space by FFT, Hybrid A*, Reeds-Shepp and arc-line analytic expansions | [docs/planning.md](docs/planning.md) |
-| Control | linear MPC in the distance domain, constrained QP solved exactly, steering gain identified online | [docs/control.md](docs/control.md) |
+| Control | linear MPC in the distance domain, constrained QP solved exactly, steering gain identified online, commands in physical units | [docs/control.md](docs/control.md) |
 | Simulation | Chrono sedan, scenario generator, viewer, target placement by mouse | [docs/simulation-and-viewer.md](docs/simulation-and-viewer.md) |
 
 Start with [docs/architecture.md](docs/architecture.md) for the overall structure and the state
@@ -80,9 +80,13 @@ suspension, rack and pinion steering, a shaft-based driveline and brakes, and TM
 tires. That is a full multibody vehicle, a superset of the usual 14 degree of freedom model. The
 kinematic bicycle model appears only inside the planner and the MPC.
 
-Nothing about the car is hard-coded. Its wheelbase, axle position, body outline and steering limit
-are read from the Chrono model at start-up, and its steering response is identified online while
-it drives.
+The car is driven by physical commands, not pedal positions: a road-wheel steering angle in
+radians, a drive torque at the wheels and a brake torque in newton metres. The drive torque goes
+straight onto the half-shafts of the driven axle, with the gearbox in neutral.
+
+Nothing about the car is hard-coded. Its wheelbase, body outline, mass, wheel radius, steering
+stop and brake capacity are read from the Chrono model at start-up, and its steering response is
+identified online while it drives.
 
 ## Results
 
@@ -92,18 +96,20 @@ models, double perception noise and hand-placed targets.
 
 | | parked | lateral offset | heading error | smallest clearance |
 | --- | --- | --- | --- | --- |
-| perpendicular | 25 of 25 | at most 3.8 cm | at most 0.7 deg | 0.23 m |
-| angled | 24 of 24 | at most 2.0 cm | at most 2.0 deg | 0.38 m |
-| parallel | 24 of 24 | at most 2.8 cm | at most 0.3 deg | 0.21 m |
+| perpendicular | 25 of 25 | at most 4.4 cm | at most 0.5 deg | 0.12 m |
+| angled | 24 of 24 | at most 1.2 cm | at most 1.4 deg | 0.32 m |
+| parallel | 24 of 24 | at most 2.8 cm | at most 0.5 deg | 0.17 m |
 
 All offsets are measured against the ground-truth stall. No run needed a replan or a correction.
+The 0.12 m is a nose-in perpendicular plan at the planner's tightest margin. Every other
+perpendicular run kept at least 0.24 m.
 
 See [docs/results.md](docs/results.md) for the full table and for what was not tested.
 
 ## Layout
 
 ```
-parking_sim.py          the whole simulator, about 3000 lines
+parking_sim.py          the whole simulator, about 3200 lines
 tests/test_core.py      checks of the planner curves and the MPC solver
 docs/                   design documents and figures
 docs/make_figures.py    regenerates docs/img from real runs
