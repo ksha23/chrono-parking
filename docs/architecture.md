@@ -78,7 +78,7 @@ node expansions, not by a wall-clock budget, for the same reason.
 stateDiagram-v2
     [*] --> SETTLE
     SETTLE --> SEARCH: 1 s, wheels on the ground
-    SETTLE --> WAIT: --target drag
+    SETTLE --> WAIT: drag mode
     WAIT --> SEARCH: GO, target far down the lane
     WAIT --> BRAKE: GO, target nearby
     SEARCH --> BRAKE: a free stall has settled
