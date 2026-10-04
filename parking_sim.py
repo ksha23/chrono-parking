@@ -5,14 +5,19 @@
 # A Chrono::Vehicle sedan (full multibody model, TMeasy or Pacejka tires) cruises
 # down a parking aisle, builds a map of the stall lines and obstacles from noisy
 # simulated perception, decides which stall to take, plans a forward/reverse
-# maneuver into it and tracks that plan. One window shows four live views.
+# maneuver into it and tracks that plan with model predictive control. One
+# window shows four live camera views and a panel with the internals.
 #
 #   perception : noisy line-segment detections + a noisy 2D range scan
 #   mapping    : line tracks (total least squares) + occupancy grid
 #   decision   : stalls are inferred from pairs of tracked lines, classified
 #                free / occupied / unknown, and scored
 #   planning   : Hybrid A* with Reeds-Shepp and arc-line analytic expansions
-#   control    : rear-axle path tracking (forward and reverse) + PI speed control
+#   control    : linear MPC on the steering (QP solved by ADMM) with the steering
+#                gain identified online, and a PI loop on speed
+#
+# Nothing about the car is hard-coded: its geometry and steering limit are read
+# from the Chrono model at start-up. The design is documented in docs/.
 #
 # Examples (any Python with PyChrono's vehicle and irrlicht modules):
 #
@@ -28,6 +33,7 @@
 # =============================================================================
 
 import argparse
+import collections
 import glob
 import heapq
 import math
@@ -73,7 +79,7 @@ try:
     import pychrono.vehicle as veh
 except ImportError:
     _reexec_in_chrono_env()
-    sys.exit("PyChrono (with the vehicle module) is required, e.g.  conda activate chrono1187")
+    sys.exit("PyChrono with the vehicle and irrlicht modules is required (see docs/ for the setup)")
 
 # =============================================================================
 # Ego vehicle. Nothing about the car is hard-coded: its geometry and steering
@@ -187,23 +193,39 @@ def footprint_hits(poses, pts, margin):
 # Scenarios: ground truth layout of painted lines, stalls, parked cars and curbs
 # =============================================================================
 
-# Parked-car models. Frames follow the Chrono chassis meshes (x forward, z up);
-# x0/x1/hw is the mesh footprint, z the ride height of the mesh origin and
-# wheels the (x, y, z) of the front and rear left spindles.
+# Parked-car models, built from the vehicle meshes that ship with Chrono. Only the wheel hub
+# positions (x, y, z of the front and rear left hubs, from Chrono's vehicle definitions) are
+# listed here; the footprint and ride height come from the meshes themselves.
 PARKED = {
-    "audi": dict(mesh="audi/audi_chassis_%s.obj", x0=-2.547, x1=2.330, hw=1.093, z=0.207,
-                 wheels=((1.441, 0.798, 0.13), (-1.480, 0.798, 0.13)),
+    "audi": dict(mesh="audi/audi_chassis_%s.obj", wheels=((1.441, 0.798, 0.13), (-1.480, 0.798, 0.13)),
                  rim="audi/audi_rim.obj", tire="audi/audi_tire.obj",
                  colors=("black", "blue", "grey", "white")),
-    "suv": dict(mesh="Nissan_Patrol/suv_chassis_%s.obj", x0=-4.387, x1=0.946, hw=1.118, z=0.350,
-                wheels=((0.005, 0.960, 0.094), (-3.264, 1.010, 0.054)),
+    "suv": dict(mesh="Nissan_Patrol/suv_chassis_%s.obj", wheels=((0.005, 0.960, 0.094), (-3.264, 1.010, 0.054)),
                 rim="Nissan_Patrol/suv_rim.obj", tire="Nissan_Patrol/suv_tire.obj",
                 colors=("brown", "darkgrey", "red", "white")),
-    "van": dict(mesh="VW_microbus/van_chassis_%s.obj", x0=-3.653, x1=1.150, hw=1.110, z=0.343,
-                wheels=((-0.040, 0.698, -0.026), (-2.400, 0.728, 0.0)),
+    "van": dict(mesh="VW_microbus/van_chassis_%s.obj", wheels=((-0.040, 0.698, -0.026), (-2.400, 0.728, 0.0)),
                 rim="VW_microbus/van_rim.obj", tire="VW_microbus/van_tire.obj",
                 colors=("cream", "darkgrey", "lightgrey", "yellow")),
 }
+_PARKED_GEOMETRY = {}
+
+
+def parked_model(name):
+    """A parked-car model with its footprint (x0, x1, hw in the mesh frame) and ride height z."""
+    m = _PARKED_GEOMETRY.get(name)
+    if m is None:
+        m = dict(PARKED[name], x0=-2.45, x1=2.45, hw=1.05, z=0.25)
+        data = chrono.GetChronoDataPath() + "vehicle/"
+        body, tire = data + m["mesh"] % m["colors"][0], data + m["tire"]
+        if os.path.exists(body) and os.path.exists(tire):
+            box = chrono.ChTriangleMeshConnected.CreateFromWavefrontFile(body, False, False).GetBoundingBox()
+            wheel = chrono.ChTriangleMeshConnected.CreateFromWavefrontFile(tire, False, False).GetBoundingBox()
+            hub = sum(w[2] for w in m["wheels"]) / len(m["wheels"])
+            m.update(x0=box.min.x, x1=box.max.x, hw=max(-box.min.y, box.max.y),
+                     z=0.5 * (wheel.max.z - wheel.min.z) - hub)       # tires resting on the ground
+        _PARKED_GEOMETRY[name] = m
+    return m
+
 
 STALL_WIDTH = 2.7
 STALL_DEPTH = 5.5
@@ -225,7 +247,7 @@ class Scenario:
 
     def add_car(self, rng, cx, cy, yaw, models=("audi", "suv", "van")):
         model = models[int(rng.integers(len(models)))]
-        m = PARKED[model]
+        m = parked_model(model)
         color = m["colors"][int(rng.integers(len(m["colors"])))]
         half = 0.5 * (m["x1"] - m["x0"])
         poly = rect_poly(cx, cy, yaw, -half, half, m["hw"])
@@ -1321,6 +1343,7 @@ class Planner:
 
         self.stats = dict(iterations=it, nodes=len(nodes), time=time.time() - t0,
                           cost=best[0] if best is not None else float("inf"))
+        self.explored = np.array([(n[1], n[2]) for n in nodes.values()])    # for display only
         if best is None:
             return None
         chain = []
@@ -1480,7 +1503,7 @@ class LateralMPC:
             zr = 1.6 * zt - 0.6 * z
             zn = np.clip(zr + y / rho, lo, hi)
             y = y + rho * (zr - zn)
-            done = np.abs(zt - zn).max() < 1e-5 and np.abs(zn - z).max() < 1e-5
+            done = np.abs(zt - zn).max() < 1e-4 and np.abs(zn - z).max() < 1e-4
             z = zn
             if done:
                 break
@@ -1668,7 +1691,7 @@ class World:
     def _parked_cars(self, visual):
         data = chrono.GetChronoDataPath() + "vehicle/"
         for car in self.scn.cars:
-            m = PARKED[car["model"]]
+            m = parked_model(car["model"])
             half = 0.5 * (m["x1"] - m["x0"])
             mid = 0.5 * (m["x1"] + m["x0"])
             c, s = math.cos(car["yaw"]), math.sin(car["yaw"])
@@ -1756,6 +1779,7 @@ class ParkingSim:
         self.t_still = None
         self.replans = self.corrections = self.blocked = 0
         self.must_replan = False
+        self.plan_info = None          # statistics and search tree of the last plan
         self.plan_thread = self.plan_result = None
         self.plan_time = 0.0
         self.min_clearance = float("inf")
@@ -2100,7 +2124,8 @@ class ParkingSim:
             if any(footprint_hits(sg.poses(), pts, 0.03).any() for sg in segs):
                 continue
             if best is None or stats["cost"] < best["stats"]["cost"]:
-                best = dict(segments=segs, goal=goal, nominal=nominal, margin=m_lat, stats=stats)
+                best = dict(segments=segs, goal=goal, nominal=nominal, margin=m_lat, stats=stats,
+                            explored=self.planner.explored)
         return best
 
     def _plan_done(self):
@@ -2131,6 +2156,7 @@ class ParkingSim:
         segs = res["segments"]
         self.goal, self.nominal = res["goal"], res["nominal"]
         self.blocked, self.must_replan = 0, False
+        self.plan_info = dict(res["stats"], margin=res["margin"], explored=res["explored"])
         st = res["stats"]
         self.say("plan: %s  (%d expansions, %.1f s, margin %.2f m)" % (
             " + ".join("%s %.1f m" % ("fwd" if s.dir > 0 else "rev", s.length) for s in segs) or "already there",
@@ -2345,7 +2371,7 @@ class MouseKeys:
 class Viewer:
     COLORS = dict(det=(1.0, 0.9, 0.1), track=(0.1, 0.9, 1.0), free=(0.2, 1.0, 0.3), occupied=(1.0, 0.25, 0.2),
                   unknown=(0.6, 0.6, 0.6), fwd=(0.3, 0.55, 1.0), rev=(1.0, 0.35, 0.9), goal=(1.0, 1.0, 1.0),
-                  scan=(1.0, 0.45, 0.1), box=(1.0, 1.0, 1.0), box_bad=(1.0, 0.2, 0.2))
+                  scan=(1.0, 0.45, 0.1), box=(1.0, 1.0, 1.0), box_bad=(1.0, 0.2, 0.2), mpc=(1.0, 0.95, 0.2))
 
     def __init__(self, sim, args):
         global irr
@@ -2378,7 +2404,8 @@ class Viewer:
         vis.Render()
         vis.EndScene()
 
-        W, H, top = self.W, self.H, 30
+        self.PW = 0 if args.no_panel else 380          # width of the internals panel
+        W, H, top = self.W - self.PW, self.H, 30
         if args.layout == "wide":      # big top view on the left, three views stacked on the right
             xs, hh = int(0.64 * W), (H - top) // 3
             self.rects = [(0, top, xs, H), (xs, top, W, top + hh), (xs, top + hh, W, top + 2 * hh),
@@ -2401,6 +2428,10 @@ class Viewer:
         self.chase_th = sim.pose[2]
         self.items, self.items_step = [], -1
         self.rect_cache = {}
+        self.hist = collections.deque(maxlen=160)      # 16 s of signals for the strip charts
+        self.hist_step = -10 ** 9
+        self.map_img, self.map_time = None, -1.0       # cached raster of the planning map
+        self.panel_rects = None
         self.next_shot = 0.0
         self.t_done = None
 
@@ -2486,6 +2517,8 @@ class Viewer:
             self._line(np.stack([seg.x[i0::3], seg.y[i0::3]], axis=1), C["fwd"] if seg.dir > 0 else C["rev"], z=0.08)
         if sim.goal is not None and sim.path:
             self._line(ego_poly(sim.goal), C["goal"], z=0.08, closed=True)
+        if sim.state in ("DRIVE", "SEARCH") and len(sim.tracker.horizon):
+            self._line(sim.tracker.horizon, C["mpc"], z=0.11)
         if len(sim.scan):
             p = sim.scan
             cut = np.flatnonzero(np.hypot(*np.diff(p, axis=0).T) > 0.6) + 1
@@ -2566,6 +2599,12 @@ class Viewer:
         w, h = r[2] - r[0], r[3] - r[1]
         return np.array([self.top_c[0] + ((mx - r[0]) / w - 0.5) * 2.0 * self.top_half * w / h,
                          self.top_c[1] - ((my - r[1]) / h - 0.5) * 2.0 * self.top_half])
+
+    def _to_px(self, p):
+        r = self.rects[0]
+        w, h = r[2] - r[0], r[3] - r[1]
+        return (r[0] + ((p[0] - self.top_c[0]) / (2.0 * self.top_half * w / h) + 0.5) * w,
+                r[1] + (0.5 - (p[1] - self.top_c[1]) / (2.0 * self.top_half)) * h)
 
     def handle_input(self, m, dt):
         """Move the target box with the mouse state m (see MouseKeys.poll); returns the action taken."""
@@ -2668,6 +2707,14 @@ class Viewer:
         self._text(state, 12, 8, rgb=rgb)
         self._text(sim.message[:(self.W - 580) // 12], 300, 8, rgb=(190, 200, 210))
         self._text("T %5.1f S   %+.1f M/S" % (sim.time, sim.speed), W - 260, 8)
+        if sim.steps - self.hist_step >= int(round(PERCEPTION_DT / STEP)):
+            self.hist_step = sim.steps
+            trk = sim.tracker
+            driving = sim.state in ("DRIVE", "SEARCH") and trk.seg is not None
+            self.hist.append((trk.err[0] if driving else 0.0, trk.err[1] if driving else 0.0, sim.speed,
+                              trk.v_cmd * trk.seg.dir if driving else 0.0, sim.cmd[0],
+                              trk.gain.g[1], trk.gain.g[-1]))
+            self.panel_rects = None
 
         steer, throttle, brake = sim.cmd
         x0, y0 = 14, H - 54
@@ -2695,12 +2742,187 @@ class Viewer:
             self._text(name, x + 14, y, 1)
             x += 22 + 6 * len(name)
 
+        for sl in sim.slots:                           # label what the stall logic concluded
+            name = "TARGET" if sl is sim.target else ("FREE" if sl.status == Slot.FREE else None)
+            px, py = self._to_px(sl.center)
+            if name and r[0] + 30 < px < r[2] - 30 and r[1] + 40 < py < r[3] - 30:
+                self._rect(irr.SColor(170, 0, 0, 0), px - 3 * len(name) - 3, py - 6, px + 3 * len(name) + 3, py + 5)
+                self._text(name, px - 3 * len(name), py - 4, 1, rgb=(120, 255, 140))
+        if self.PW:
+            self._panel()
         if self.drag:
             for name, (bx0, by0, bx1, by1) in self.buttons:
                 go = name == "GO"
                 self._rect(irr.SColor(255, 40, 150, 70) if go else irr.SColor(255, 60, 66, 78), bx0, by0, bx1, by1)
                 self._text(name, (bx0 + bx1) // 2 - 6 * len(name), by0 + 7)
             self._text("DRAG THE BOX: LEFT MOUSE.  ROTATE: RIGHT-DRAG, Q/E OR < >.  GO: SPACE", r[0] + 262, r[1] + 40, 1)
+
+    # ---- internals panel -------------------------------------------------------
+    # Everything here is drawn with filled rectangles (the only 2D primitive the Python
+    # bindings expose reliably): pixel rasters are run-length encoded into rectangles.
+
+    PALETTE = {0: (62, 68, 80), 1: (22, 23, 27), 2: (235, 80, 60), 3: (52, 132, 160), 4: (130, 130, 130),
+               5: (90, 200, 110), 6: (60, 255, 90), 7: (90, 150, 255), 8: (255, 110, 235), 9: (255, 240, 60),
+               10: (240, 242, 246)}       # free, unseen, obstacle, searched, stall, free stall, target, fwd, rev, MPC, car
+
+    @staticmethod
+    def _stroke(img, a, b, value):
+        n = int(max(abs(b[0] - a[0]), abs(b[1] - a[1]))) + 1
+        xs = np.linspace(a[0], b[0], n).astype(int)
+        ys = np.linspace(a[1], b[1], n).astype(int)
+        ok = (xs >= 0) & (xs < img.shape[1]) & (ys >= 0) & (ys < img.shape[0])
+        img[ys[ok], xs[ok]] = value
+
+    def _map_image(self, w, h):
+        """Planning map as a small palette image: unseen space, obstacles, the search tree."""
+        sim, g = self.sim, self.sim.grid
+        scale = min(w / (g.nx * g.RES), h / (g.ny * g.RES))          # pixels per metre
+        pw, ph = int(g.nx * g.RES * scale), int(g.ny * g.RES * scale)
+        ix = np.minimum((np.arange(pw) / scale / g.RES).astype(int), g.nx - 1)
+        iy = np.minimum(((ph - 1 - np.arange(ph)) / scale / g.RES).astype(int), g.ny - 1)
+        occ = g.occupied()
+        fat = occ.copy()                                              # keep thin walls visible
+        fat[1:, :] |= occ[:-1, :]
+        fat[:, 1:] |= occ[:, :-1]
+        img = np.where(fat[np.ix_(iy, ix)], 2, np.where(g.blocked()[np.ix_(iy, ix)], 1, 0)).astype(np.uint8)
+        if sim.plan_info is not None and len(sim.plan_info["explored"]):
+            e = sim.plan_info["explored"]
+            ex = ((e[:, 0] - g.x0) * scale).astype(int)
+            ey = ph - 1 - ((e[:, 1] - g.y0) * scale).astype(int)
+            ok = (ex >= 0) & (ex < pw) & (ey >= 0) & (ey < ph)
+            free = img[ey[ok], ex[ok]] == 0
+            img[ey[ok][free], ex[ok][free]] = 3
+        self.map_scale = scale
+        return img
+
+    def _map_rects(self, x, y):
+        """The map with the stalls, plan, MPC horizon and car drawn in, as rectangles."""
+        sim, trk, g = self.sim, self.sim.tracker, self.sim.grid
+        img = self.map_img.copy()
+        ph, scale = img.shape[0], self.map_scale
+        px = lambda q: ((q[0] - g.x0) * scale, ph - 1 - (q[1] - g.y0) * scale)
+        for sl in sim.slots:
+            c = [px(q) for q in sl.corners]
+            val = 6 if sl is sim.target else (5 if sl.status == Slot.FREE else 4)
+            for k in range(4):
+                self._stroke(img, c[k], c[(k + 1) % 4], val)
+        if sim.state in ("DRIVE", "BRAKE", "PLAN"):
+            for seg in sim.path[sim.seg_i:]:
+                pts = [px((seg.x[k], seg.y[k])) for k in range(0, len(seg.x), 4)] + [px((seg.x[-1], seg.y[-1]))]
+                for k in range(len(pts) - 1):
+                    self._stroke(img, pts[k], pts[k + 1], 7 if seg.dir > 0 else 8)
+        if sim.state in ("DRIVE", "SEARCH") and len(trk.horizon) > 1:
+            pts = [px(q) for q in trk.horizon[::2]]
+            for k in range(len(pts) - 1):
+                self._stroke(img, pts[k], pts[k + 1], 9)
+        c = [px(q) for q in ego_poly(sim.pose)]
+        for k in range(4):
+            self._stroke(img, c[k], c[(k + 1) % 4], 10)
+        colors = {k: irr.SColor(255, *rgb) for k, rgb in self.PALETTE.items()}
+        rects = []
+        for row in range(ph):
+            line = img[row]
+            cuts = np.flatnonzero(np.diff(line)) + 1
+            for a, b in zip(np.concatenate([[0], cuts]), np.concatenate([cuts, [len(line)]])):
+                rects.append((colors[int(line[a])], x + int(a), y + row, x + int(b), y + row + 1))
+        return rects
+
+    def _trace(self, out, x, y, w, h, vals, lo, hi, rgb, slots=None):
+        """Queue one strip-chart trace as a chain of small rectangles."""
+        v = np.asarray(vals, dtype=float)
+        if len(v) < 2:
+            return
+        px = (x + np.arange(len(v) + 1) * w / (slots or self.hist.maxlen)).astype(int)
+        py = (y + h - 2 - (np.clip(v, lo, hi) - lo) / (hi - lo) * (h - 3)).astype(int)
+        col = irr.SColor(255, *rgb)
+        for k in range(len(v) - 1):
+            out.append((col, px[k], min(py[k], py[k + 1]), max(px[k + 1], px[k] + 1), max(py[k], py[k + 1]) + 2))
+
+    def _panel(self):
+        sim, trk = self.sim, self.sim.tracker
+        x, w = self.W - self.PW + 10, self.PW - 20
+        self._rect(irr.SColor(255, 24, 26, 31), self.W - self.PW, 30, self.W, self.H)
+        grey, white = (150, 158, 170), (235, 238, 242)
+        y = 40
+
+        # which stage of the pipeline is doing the work right now
+        stages = ("SENSE", "MAP", "DECIDE", "PLAN", "TRACK")
+        active = {"WAIT": (0, 1), "SEARCH": (0, 1, 4) if sim.manual is not None else (0, 1, 2, 4),
+                  "BRAKE": (0, 1), "PLAN": (3,), "DRIVE": (0, 1, 4)}.get(sim.state, ())
+        bw = (w - 16) // 5
+        for k, name in enumerate(stages):
+            on = k in active
+            self._rect(irr.SColor(255, 40, 150, 90) if on else irr.SColor(255, 48, 52, 60),
+                       x + k * (bw + 4), y, x + k * (bw + 4) + bw, y + 20)
+            self._text(name, x + k * (bw + 4) + (bw - 6 * len(name)) // 2, y + 7, 1, rgb=white if on else grey)
+        y += 32
+
+        # layout: map, then four charts
+        info = sim.plan_info
+        self._text("PLANNING MAP", x, y, 1, rgb=grey)
+        if info is not None:
+            self._text("%d EXPANSIONS  COST %.0f" % (info["iterations"], info["cost"]), x + 150, y, 1, rgb=grey)
+        map_y, map_h = y + 12, 132
+        self._rect(irr.SColor(255, 14, 15, 18), x, map_y, x + w, map_y + map_h)
+        y = map_y + map_h + 10
+        tops = []
+        for title, hgt in (("MPC HORIZON (CURVATURE OVER 4 M)", 52), ("TRACKING ERROR", 56), ("SPEED", 48), ("STEERING GAIN", 48)):
+            self._text(title, x, y, 1, rgb=grey)
+            self._rect(irr.SColor(255, 14, 15, 18), x, y + 12, x + w, y + 12 + hgt)
+            self._rect(irr.SColor(255, 44, 48, 56), x, y + 12 + hgt // 2, x + w, y + 13 + hgt // 2)
+            tops.append((y + 12, hgt))
+            y += hgt + 22
+
+        # the dynamic content is rebuilt at the perception rate and replayed in between
+        if sim.time - self.map_time > 0.5 or self.map_img is None:
+            self.map_time, self.map_img = sim.time, self._map_image(w, map_h)
+            self.panel_rects = None
+        g_now = trk.gain.g[trk.seg.dir] if trk.seg is not None else EGO.kappa
+        if self.panel_rects is None:
+            out = self._map_rects(x, map_y)
+            hz = np.array(self.hist) if self.hist else np.zeros((0, 7))
+            if sim.state in ("DRIVE", "SEARCH") and len(trk.k_plan):
+                lim, n = 1.25 * max(g_now, EGO.kappa), len(trk.k_plan)
+                ty, th = tops[0]
+                for vals, rgb, thick in ((np.full(n, g_now), (150, 60, 60), 1), (np.full(n, -g_now), (150, 60, 60), 1),
+                                         (trk.k_ref, (150, 158, 170), 1), (trk.k_plan, (255, 240, 60), 2)):
+                    py = (ty + th - 2 - (np.clip(vals, -lim, lim) + lim) / (2 * lim) * (th - 3)).astype(int)
+                    for k in range(n):
+                        out.append((irr.SColor(255, *rgb), x + k * w // n, py[k], x + (k + 1) * w // n, py[k] + thick))
+            if len(hz):
+                self._trace(out, x, tops[1][0], w, tops[1][1], 100.0 * hz[:, 0], -12.0, 12.0, (90, 220, 255))
+                self._trace(out, x, tops[1][0], w, tops[1][1], np.degrees(hz[:, 1]), -6.0, 6.0, (255, 170, 60))
+                self._trace(out, x, tops[2][0], w, tops[2][1], hz[:, 3], -2.6, 2.6, (120, 126, 138))
+                self._trace(out, x, tops[2][0], w, tops[2][1], hz[:, 2], -2.6, 2.6, (120, 255, 140))
+                self._trace(out, x, tops[3][0], w, tops[3][1], np.full(len(hz), EGO.kappa), 0.0, 2.0 * EGO.kappa, (120, 126, 138))
+                self._trace(out, x, tops[3][0], w, tops[3][1], hz[:, 5], 0.0, 2.0 * EGO.kappa, (90, 150, 255))
+                self._trace(out, x, tops[3][0], w, tops[3][1], hz[:, 6], 0.0, 2.0 * EGO.kappa, (255, 110, 235))
+            self.panel_rects = out
+        for col, x0, y0, x1, y1 in self.panel_rects:
+            self._rect(col, x0, y0, x1, y1)
+
+        e, psi = (trk.err[0], trk.err[1]) if sim.state in ("DRIVE", "SEARCH") else (0.0, 0.0)
+        self._text("PLAN", x + w - 150, tops[0][0] - 12, 1, rgb=(255, 240, 60))
+        self._text("PATH", x + w - 116, tops[0][0] - 12, 1, rgb=grey)
+        self._text("%3d ADMM IT" % trk.mpc.iters, x + w - 72, tops[0][0] - 12, 1, rgb=grey)
+        self._text("E %+5.1f CM" % (100.0 * e), x + w - 170, tops[1][0] - 12, 1, rgb=(90, 220, 255))
+        self._text("PSI %+4.1f DEG" % math.degrees(psi), x + w - 84, tops[1][0] - 12, 1, rgb=(255, 170, 60))
+        self._text("%+.2f M/S" % sim.speed, x + w - 60, tops[2][0] - 12, 1, rgb=(120, 255, 140))
+        self._text("FWD %.3f" % trk.gain.g[1], x + w - 196, tops[3][0] - 12, 1, rgb=(90, 150, 255))
+        self._text("REV %.3f" % trk.gain.g[-1], x + w - 132, tops[3][0] - 12, 1, rgb=(255, 110, 235))
+        self._text("MODEL %.3f" % EGO.kappa, x + w - 68, tops[3][0] - 12, 1, rgb=grey)
+
+        free = sum(sl.status == Slot.FREE for sl in sim.slots)
+        occ = sum(sl.status == Slot.OCCUPIED for sl in sim.slots)
+        rows = ["LINE TRACKS %d (%d CONFIRMED)" % (len(sim.lines.tracks), len(sim.lines.confirmed())),
+                "STALLS %d: %d FREE, %d OCCUPIED" % (len(sim.slots), free, occ),
+                "CAR %.2f X %.2f M, WHEELBASE %.2f M" % (EGO.length, 2.0 * EGO.half_width, EGO.wheelbase),
+                "MIN CLEARANCE SO FAR %.2f M" % (sim.min_clearance if sim.min_clearance < 1e9 else 0.0)]
+        if info is not None:
+            rows.append("PLAN MARGIN %.2f M, %d SEGMENTS" % (info["margin"], len(sim.path)))
+        for k, row in enumerate(rows):
+            if y + 12 * k + 10 < self.H:
+                self._text(row, x, y + 12 * k, 1, rgb=grey)
 
     def loop(self):
         sim, args = self.sim, self.args
@@ -2774,6 +2996,7 @@ def parse_args(argv=None):
     ap.add_argument("--layout", choices=("quad", "wide"), default=None,
                     help="2x2 views, or a large top view with three small ones (default with --target drag)")
     ap.add_argument("--window", default="1600x930", help="window size")
+    ap.add_argument("--no-panel", action="store_true", help="hide the internals panel next to the views")
     ap.add_argument("--speed", type=float, default=1.0, help="playback speed relative to real time")
     ap.add_argument("--exit-after", type=float, default=None,
                     help="close the window this many seconds after parking (default: stay open)")
@@ -2813,12 +3036,18 @@ def main():
             sim._finish(False, "timed out")
     else:
         viewer = Viewer(sim, args)
-        viewer.loop()
+        code = 1
+        try:
+            viewer.loop()
+            code = 0 if sim.result is not None and sim.result["ok"] else 1
+        except BaseException:
+            import traceback
+            traceback.print_exc()
         # Destroying the Irrlicht visual system from Python segfaults here (after the window
         # has closed), so keep it alive and leave without running destructors
         sys.stdout.flush()
         sys.stderr.flush()
-        os._exit(0 if sim.result is not None and sim.result["ok"] else 1)
+        os._exit(code)
     return 0 if sim.result is not None and sim.result["ok"] else 1
 
 
