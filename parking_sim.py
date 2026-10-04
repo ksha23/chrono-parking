@@ -13,8 +13,8 @@
 #   decision   : stalls are inferred from pairs of tracked lines, classified
 #                free / occupied / unknown, and scored
 #   planning   : Hybrid A* with Reeds-Shepp and arc-line analytic expansions
-#   control    : linear MPC on the steering (QP solved by ADMM) with the steering
-#                gain identified online, and a PI loop on speed
+#   control    : linear MPC on the steering (constrained QP, solved exactly) with
+#                the steering gain identified online, and a PI loop on speed
 #
 # Nothing about the car is hard-coded: its geometry and steering limit are read
 # from the Chrono model at start-up. The design is documented in docs/.
@@ -1431,6 +1431,36 @@ def split_segments(start, rows):
 # gain of the car identified online, and a PI loop on speed
 # =============================================================================
 
+def nnls(E, f, max_iter=200):
+    """Lawson-Hanson active-set method: minimise ||E x - f|| subject to x >= 0.
+    Returns x and the number of iterations."""
+    n = E.shape[1]
+    P = np.zeros(n, dtype=bool)                 # the passive set: variables allowed to be positive
+    x = np.zeros(n)
+    w = E.T @ f
+    tol = 1e-10 * E.shape[0] * max(np.abs(E).max() * np.abs(f).max(), 1e-30)
+    for it in range(max_iter):
+        cand = np.where(P, -np.inf, w)
+        j = int(np.argmax(cand))
+        if cand[j] <= tol:
+            break
+        P[j] = True
+        while True:
+            s = np.zeros(n)
+            s[P] = np.linalg.lstsq(E[:, P], f, rcond=None)[0]
+            if s[P].min() > 0.0:
+                break
+            neg = P & (s <= 0.0)                # step towards s until the first variable hits zero
+            x = x + np.min(x[neg] / (x[neg] - s[neg])) * (s - x)
+            P &= x > 1e-14
+            if not P.any():
+                s = np.zeros(n)
+                break
+        x = s
+        w = E.T @ (f - E @ x)
+    return x, it + 1
+
+
 class LateralMPC:
     """Linear MPC of the lateral motion along a path, written in travelled distance instead of
     time so that it stays well posed down to walking pace.
@@ -1444,21 +1474,21 @@ class LateralMPC:
 
     The decision variables are the N curvatures over the horizon. The cost penalises the
     errors, the deviation from the path curvature and curvature changes; the constraints are
-    the steering limit |kappa| <= kappa_max and the steering rate. The resulting QP has constant
-    matrices, so it is condensed once and solved with ADMM (operator splitting, as in OSQP)."""
+    the steering limit |kappa| <= kappa_max and the steering rate. The Hessian of the condensed
+    QP is constant, so it is factorised once; each solve turns the QP into a least-distance
+    problem and solves that exactly with a non-negative least squares active-set method."""
     N = 20                   # horizon steps
     H = 0.2                  # step [m]  -> 4 m look-ahead
     Q_E, Q_PSI = 10.0, 6.0   # error weights
     Q_END = 3.0              # extra weight on the last step
     R_K = 1.0                # weight on (kappa - kappa_ref)
     R_DK = 1.0               # weight on curvature changes
-    RHO = 10.0               # ADMM penalty, relative to the mean curvature of the cost
-    MAX_ITER = 150
 
     def __init__(self):
         N, h = self.N, self.H
         self.D = np.eye(N) - np.eye(N, k=-1)                 # (D K)_k = K_k - K_{k-1}
-        self.Ac = np.vstack([np.eye(N), self.D])             # box and rate constraints
+        Ac = np.vstack([np.eye(N), self.D])                  # rows: curvature, then curvature change
+        G = np.vstack([Ac, -Ac])                             # G K <= [hi; -lo]
         self.qp = {}
         for d in (1, -1):
             A = np.array([[1.0, d * h], [0.0, 1.0]])
@@ -1474,42 +1504,33 @@ class LateralMPC:
             w[-2:] *= self.Q_END
             GQ = Gam.T * w
             Hm = 2.0 * (GQ @ Gam + self.R_K * np.eye(N) + self.R_DK * self.D.T @ self.D)
-            rho = self.RHO * np.trace(Hm) / N
-            sigma = 1e-6 * np.trace(Hm) / N
-            Minv = np.linalg.inv(Hm + sigma * np.eye(N) + rho * self.Ac.T @ self.Ac)
-            self.qp[d] = dict(Phi=Phi, Gam=Gam, GQ=GQ, Minv=Minv, rho=rho, sigma=sigma)
-        self.x = np.zeros(N)
-        self.z = np.zeros(2 * N)
-        self.y = np.zeros(2 * N)
+            Linv = np.linalg.inv(np.linalg.cholesky(Hm))      # Hm = L L^T
+            self.qp[d] = dict(Phi=Phi, Gam=Gam, GQ=GQ, Linv=Linv, Gt=-G @ Linv.T, GHinv=G @ Linv.T @ Linv)
         self.iters = 0
-
-    def reset(self):
-        self.x[:], self.z[:], self.y[:] = 0.0, 0.0, 0.0
 
     def solve(self, d, e0, psi0, k_prev, k_ref, k_max, dk_max):
         """Returns the curvature sequence and the predicted (e, psi) over the horizon."""
-        q = self.qp[d]
+        q, N = self.qp[d], self.N
         x0 = np.array([e0, psi0])
-        c = np.zeros(self.N)
+        c = np.zeros(N)
         c[0] = k_prev
         f = 2.0 * (q["GQ"] @ (q["Phi"] @ x0 - q["Gam"] @ k_ref) - self.R_K * k_ref - self.R_DK * self.D.T @ c)
-        lo = np.concatenate([np.full(self.N, -k_max), c - dk_max])
-        hi = np.concatenate([np.full(self.N, k_max), c + dk_max])
-        x, z, y, rho, sigma, Ac, Minv = self.x, self.z, self.y, q["rho"], q["sigma"], self.Ac, q["Minv"]
-        for it in range(self.MAX_ITER):
-            xt = Minv @ (sigma * x - f + Ac.T @ (rho * z - y))
-            zt = Ac @ xt
-            x = 1.6 * xt - 0.6 * x
-            zr = 1.6 * zt - 0.6 * z
-            zn = np.clip(zr + y / rho, lo, hi)
-            y = y + rho * (zr - zn)
-            done = np.abs(zt - zn).max() < 1e-4 and np.abs(zn - z).max() < 1e-4
-            z = zn
-            if done:
-                break
-        self.x, self.z, self.y, self.iters = x, z, y, it + 1
-        K = np.clip(x, -k_max, k_max)
-        pred = (q["Phi"] @ x0 + q["Gam"] @ (K - k_ref)).reshape(self.N, 2)
+        hi = np.concatenate([np.full(N, k_max), c + dk_max])
+        lo = np.concatenate([np.full(N, -k_max), c - dk_max])
+        # With y = L^T K + L^-1 f the QP is "minimise |y| subject to Gt y >= ht", which Lawson and
+        # Hanson reduce to one non-negative least squares problem
+        ht = -(np.concatenate([hi, -lo]) + q["GHinv"] @ f)
+        E = np.vstack([q["Gt"].T, ht[None, :]])
+        rhs = np.zeros(N + 1)
+        rhs[-1] = 1.0
+        u, self.iters = nnls(E, rhs)
+        r = E @ u - rhs
+        if abs(r[-1]) > 1e-12:
+            K = q["Linv"].T @ (-r[:-1] / r[-1] - q["Linv"] @ f)
+        else:                 # only if the constraints contradict each other: fall back to clipping
+            K = -q["Linv"].T @ (q["Linv"] @ f)
+        K = np.clip(K, -k_max, k_max)
+        pred = (q["Phi"] @ x0 + q["Gam"] @ (K - k_ref)).reshape(N, 2)
         return K, pred
 
 
@@ -1559,7 +1580,6 @@ class MpcTracker:
         self.seg, self.i, self.done = seg, 0, False
         self.phase = "steer" if presteer else "go"
         self.t_phase, self.integ, self.v_cmd, self.t_still = t, 0.0, 0.0, None
-        self.mpc.reset()
 
     def stop(self):
         if self.phase in ("steer", "go"):
@@ -1914,7 +1934,10 @@ class ParkingSim:
         for s in self.slots:
             if s.status != Slot.FREE or s.hits < 8:
                 continue
-            if any(np.hypot(*(s.center - r)) < 1.5 for r in self.rejected):
+            # a stall the planner turned down is left alone until the car has moved on a few metres
+            # (its estimate may have been poor), and for good after three attempts
+            if any(np.hypot(*(s.center - c)) < 1.5 and (n >= 3 or np.hypot(*(ctr - at)) < 3.0)
+                   for c, at, n in self.rejected):
                 continue
             rel = s.center - ctr
             ahead, lat = rel @ fwd, rel @ left
@@ -2147,7 +2170,10 @@ class ParkingSim:
             if self.manual is not None:
                 self._finish(False, "cannot reach that spot (blocked, or not seen to be free yet)")
                 return
-            self.rejected.append(self.target.center.copy())
+            here = np.array(self.pose[:2]) + EGO.center * self.travel_dir
+            old = [r for r in self.rejected if np.hypot(*(self.target.center - r[0])) < 1.5]
+            self.rejected = [r for r in self.rejected if r not in old]
+            self.rejected.append((self.target.center.copy(), here, 1 + sum(r[2] for r in old)))
             self.target = None
             self.say("no feasible maneuver into that stall, searching on")
             self.state = "SEARCH"
@@ -2902,9 +2928,9 @@ class Viewer:
             self._rect(col, x0, y0, x1, y1)
 
         e, psi = (trk.err[0], trk.err[1]) if sim.state in ("DRIVE", "SEARCH") else (0.0, 0.0)
-        self._text("PLAN", x + w - 150, tops[0][0] - 12, 1, rgb=(255, 240, 60))
-        self._text("PATH", x + w - 116, tops[0][0] - 12, 1, rgb=grey)
-        self._text("%3d ADMM IT" % trk.mpc.iters, x + w - 72, tops[0][0] - 12, 1, rgb=grey)
+        self._text("PLAN", x + w - 138, tops[0][0] - 12, 1, rgb=(255, 240, 60))
+        self._text("PATH", x + w - 104, tops[0][0] - 12, 1, rgb=grey)
+        self._text("QP %2d IT" % trk.mpc.iters, x + w - 60, tops[0][0] - 12, 1, rgb=grey)
         self._text("E %+5.1f CM" % (100.0 * e), x + w - 170, tops[1][0] - 12, 1, rgb=(90, 220, 255))
         self._text("PSI %+4.1f DEG" % math.degrees(psi), x + w - 84, tops[1][0] - 12, 1, rgb=(255, 170, 60))
         self._text("%+.2f M/S" % sim.speed, x + w - 60, tops[2][0] - 12, 1, rgb=(120, 255, 140))
