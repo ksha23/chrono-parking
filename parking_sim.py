@@ -76,26 +76,43 @@ except ImportError:
     sys.exit("PyChrono (with the vehicle module) is required, e.g.  conda activate chrono1187")
 
 # =============================================================================
-# Ego vehicle (Chrono Sedan). Everything below is referenced to the centre of
-# the rear axle; the numbers were measured from the Chrono model.
+# Ego vehicle. Nothing about the car is hard-coded: its geometry and steering
+# limit are read from the Chrono model when the world is built, and its
+# steering response is identified online while it drives (see MpcTracker).
+# All planning and control is referenced to the centre of the rear axle.
 # =============================================================================
 
-WHEELBASE = 2.776
-REAR_OVERHANG = 1.092          # rear axle -> rear bumper
-FRONT_REACH = 3.797            # rear axle -> front bumper
-HALF_WIDTH = 0.925
-REF_TO_REAR = 1.385            # chassis reference frame -> rear axle
-CAR_LENGTH = FRONT_REACH + REAR_OVERHANG
-CENTER_OFFSET = 0.5 * (FRONT_REACH - REAR_OVERHANG)   # rear axle -> body centre
+class Ego:
+    def __init__(self):
+        self.wheelbase = self.rear = self.front = self.half_width = None
+        self.ref_to_rear = self.length = self.center = self.kappa = self.radius = None
 
-# Steering input -> steady-state path curvature [1/m] at parking speed
-STEER_IN = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
-KAPPA_FWD = (0.0, 0.0190, 0.0624, 0.1030, 0.1458, 0.1944)
-KAPPA_REV = (0.0, 0.0425, 0.0861, 0.1301, 0.1707, 0.2167)
+    def read(self, car):
+        """Query the Chrono vehicle: wheelbase, axle position, body outline, steering limit."""
+        body = car.GetChassisBody()
+        frame = body.GetFrameRefToAbs()
+        rear = [frame.TransformPointParentToLocal(car.GetSpindlePos(car.GetNumberAxles() - 1, side)).x
+                for side in (veh.LEFT, veh.RIGHT)]
+        self.wheelbase = car.GetWheelbase()
+        self.ref_to_rear = -0.5 * (rear[0] + rear[1])      # chassis reference frame -> rear axle
+        # body outline: the convex hull the chassis collides with, in the chassis reference frame
+        pts = []
+        model = body.GetCollisionModel()
+        for i in range(model.GetNumShapes()):
+            hull = chrono.CastToChCollisionShapeConvexHull(model.GetShapeInstance(i).shape)
+            pts += [(q.x, q.y) for q in hull.GetPoints()]
+        pts = np.array(pts)
+        self.rear = -self.ref_to_rear - pts[:, 0].min()     # rear axle -> rear bumper
+        self.front = pts[:, 0].max() + self.ref_to_rear     # rear axle -> front bumper
+        self.half_width = float(np.abs(pts[:, 1]).max())
+        self.length = self.front + self.rear
+        self.center = 0.5 * (self.front - self.rear)       # rear axle -> middle of the body
+        # kinematic (bicycle) curvature at the model's maximum steering angle
+        self.kappa = math.tan(car.GetMaxSteeringAngle()) / self.wheelbase
+        self.radius = 1.0 / self.kappa
 
-KAPPA_PLAN = 0.172             # curvature the planner may use (R = 5.8 m)
-KAPPA_PLAN_REV = 0.195         # the car turns tighter in reverse: R = 5.1 m for reverse arcs
-R_PLAN = 1.0 / KAPPA_PLAN
+
+EGO = Ego()
 
 STEP = 2e-3                    # simulation step [s]
 CONTROL_DT = 0.02              # controller period [s]
@@ -104,6 +121,7 @@ PERCEPTION_DT = 0.1            # perception / mapping period [s]
 V_SEARCH = 2.2                 # cruise speed while looking for a stall [m/s]
 V_FWD = 1.4                    # maneuver speed, forward [m/s]
 V_REV = 1.0                    # maneuver speed, reverse [m/s]
+STEER_RATE = 1.3               # limit on the steering input rate [1/s] (lock to lock in ~1.5 s)
 
 
 def wrap(a):
@@ -118,8 +136,8 @@ def rect_poly(x, y, yaw, x0, x1, hw):
 
 
 def ego_poly(pose, margin=0.0):
-    return rect_poly(pose[0], pose[1], pose[2], -REAR_OVERHANG - margin, FRONT_REACH + margin,
-                     HALF_WIDTH + margin)
+    return rect_poly(pose[0], pose[1], pose[2], -EGO.rear - margin, EGO.front + margin,
+                     EGO.half_width + margin)
 
 
 def _separated(a, b):
@@ -160,8 +178,8 @@ def footprint_hits(poses, pts, margin):
         dx, dy = px[None, :] - q[:, 0, None], py[None, :] - q[:, 1, None]
         lx = dx * c + dy * s
         ly = dy * c - dx * s
-        out[i:i + 16] = ((lx > -REAR_OVERHANG - margin) & (lx < FRONT_REACH + margin) &
-                         (np.abs(ly) < HALF_WIDTH + margin)).any(axis=1)
+        out[i:i + 16] = ((lx > -EGO.rear - margin) & (lx < EGO.front + margin) &
+                         (np.abs(ly) < EGO.half_width + margin)).any(axis=1)
     return out
 
 
@@ -369,8 +387,8 @@ class Perception:
         """Returns (origin, ray angles, measured ranges, line detections).
         Ranges are NaN where a ray was dropped and inf where nothing was hit."""
         rng, k = self.rng, self.noise
-        ox = pose[0] + CENTER_OFFSET * math.cos(pose[2])
-        oy = pose[1] + CENTER_OFFSET * math.sin(pose[2])
+        ox = pose[0] + EGO.center * math.cos(pose[2])
+        oy = pose[1] + EGO.center * math.sin(pose[2])
         ang = pose[2] + np.arange(self.N_RAYS) * (2.0 * math.pi / self.N_RAYS)
         dx, dy = np.cos(ang), np.sin(ang)
 
@@ -639,8 +657,8 @@ class Slot:
             th = math.atan2(t[1], t[0])
         else:
             th = math.atan2(self.u_in[1], self.u_in[0]) + (0.0 if nose_in else math.pi)
-        return (self.center[0] - CENTER_OFFSET * math.cos(th),
-                self.center[1] - CENTER_OFFSET * math.sin(th), wrap(th))
+        return (self.center[0] - EGO.center * math.cos(th),
+                self.center[1] - EGO.center * math.sin(th), wrap(th))
 
 
 def find_slots(tracks, trail, grid):
@@ -733,7 +751,7 @@ def _align_with_kerb(slot, grid, s1, l0, l1):
     if u_k @ u < 0.0:
         u_k = -u_k
     # the fitted line runs through the middle of the kerb's hit cells; its face is ~half a cell nearer
-    slot.center = u * (a - 0.05) + nu * mid - u_k * (HALF_WIDTH + 0.30)
+    slot.center = u * (a - 0.05) + nu * mid - u_k * (EGO.half_width + 0.30)
     slot.u_in, slot.along = u_k, along
 
 
@@ -971,7 +989,7 @@ class CSpace:
     def __init__(self, occ, x0, y0, res, m_lat, m_lon):
         self.x0, self.y0, self.res = x0, y0, res
         self.ny, self.nx = occ.shape
-        pad = int((FRONT_REACH + m_lon + self.SOFT_BAND) / res) + 4
+        pad = int((EGO.front + m_lon + self.SOFT_BAND) / res) + 4
         fy, fx = _fast_len(self.ny + pad), _fast_len(self.nx + pad)
         O = np.fft.rfft2(occ.astype(np.float64), s=(fy, fx))
         r = pad - 2
@@ -985,11 +1003,11 @@ class CSpace:
             lx = (ox * c + oy * s) * res
             ly = (-ox * s + oy * c) * res
             e = 0.5 * res
-            hard = ((lx > -REAR_OVERHANG - m_lon - e) & (lx < FRONT_REACH + m_lon + e) &
-                    (np.abs(ly) < HALF_WIDTH + m_lat + e))
+            hard = ((lx > -EGO.rear - m_lon - e) & (lx < EGO.front + m_lon + e) &
+                    (np.abs(ly) < EGO.half_width + m_lat + e))
             b = self.SOFT_BAND
-            soft = ((lx > -REAR_OVERHANG - m_lon - b) & (lx < FRONT_REACH + m_lon + b) &
-                    (np.abs(ly) < HALF_WIDTH + m_lat + b))
+            soft = ((lx > -EGO.rear - m_lon - b) & (lx < EGO.front + m_lon + b) &
+                    (np.abs(ly) < EGO.half_width + m_lat + b))
             K = np.zeros((fy, fx))
             K[oy[soft] % fy, ox[soft] % fx] = 1.0
             K[oy[hard] % fy, ox[hard] % fx] = big
@@ -1073,7 +1091,7 @@ class Planner:
         self.max_iter = 30000       # expansion limit for one search (keeps runs repeatable)
         self.prims = []
         for d in (1, -1):
-            kmax = KAPPA_PLAN if d > 0 else KAPPA_PLAN_REV
+            kmax = EGO.kappa
             for k in (-kmax, -0.5 * kmax, 0.0, 0.5 * kmax, kmax):
                 subs = []
                 for frac in (0.5, 1.0):
@@ -1087,10 +1105,10 @@ class Planner:
     def table(self):
         if self._tab is None:
             n = int(round(self.TAB_RANGE / self.TAB_RES))
-            ax = np.arange(-n, n + 1) * self.TAB_RES / R_PLAN
+            ax = np.arange(-n, n + 1) * self.TAB_RES / EGO.radius
             ph = np.arange(self.TAB_NPHI) * 2.0 * math.pi / self.TAB_NPHI
             ph = np.where(ph > math.pi, ph - 2.0 * math.pi, ph)
-            self._tab = (rs_length_table(ax, ax, ph) * R_PLAN).astype(np.float32)
+            self._tab = (rs_length_table(ax, ax, ph) * EGO.radius).astype(np.float32)
         return self._tab
 
     def _rs_shot(self, pose, d0, goal, cs):
@@ -1099,21 +1117,21 @@ class Planner:
         dx, dy = goal[0] - x, goal[1] - y
         c, s = math.cos(th), math.sin(th)
         cands = []
-        for word, lens in rs_paths((dx * c + dy * s) / R_PLAN, (-dx * s + dy * c) / R_PLAN,
+        for word, lens in rs_paths((dx * c + dy * s) / EGO.radius, (-dx * s + dy * c) / EGO.radius,
                                    wrap(goal[2] - th)):
             cost, prev = 0.0, d0
             for l in lens:
-                if abs(l) * R_PLAN < 1e-4:
+                if abs(l) * EGO.radius < 1e-4:
                     continue
                 d = 1 if l > 0 else -1
-                cost += abs(l) * R_PLAN * (1.0 if d > 0 else self.W_REV)
+                cost += abs(l) * EGO.radius * (1.0 if d > 0 else self.W_REV)
                 if prev != 0 and d != prev:
                     cost += self.W_SWITCH
                 prev = d
             cands.append((cost, word, lens, prev))
         cands.sort(key=lambda q: q[0])
         for cost, word, lens, last in cands[:6]:
-            rows = rs_sample(pose, word, lens, R_PLAN, 0.1)
+            rows = rs_sample(pose, word, lens, EGO.radius, 0.1)
             if len(rows) == 0:
                 return 0.0, rows, d0
             if (math.hypot(rows[-1, 0] - goal[0], rows[-1, 1] - goal[1]) > 0.03 or
@@ -1136,7 +1154,7 @@ class Planner:
         lth = wrap(th - gth)
         if abs(lth) > 1.75:
             return None
-        kmax = 1.05 * KAPPA_PLAN if sg > 0 else KAPPA_PLAN_REV
+        kmax = EGO.kappa
         if abs(lth) < 0.004:
             options = [(0.0, 0.0)] if abs(ly) < 0.02 else []
         else:
@@ -1158,7 +1176,7 @@ class Planner:
             run = -sg * x1                  # straight left to drive along the stall axis
             if run < 1.0 or run > 40.0:
                 continue
-            cost = (lead + abs(s_arc) + run) * wdir + self.W_DSTEER * abs(k) / KAPPA_PLAN
+            cost = (lead + abs(s_arc) + run) * wdir + self.W_DSTEER * abs(k) / EGO.kappa
             if best is not None and cost >= best[0]:
                 continue
             rows = []
@@ -1289,7 +1307,7 @@ class Planner:
                 nk = key(X, Y, TH)
                 if nk in closed:
                     continue
-                ng = g + base + self.W_DSTEER * abs(pk - k0) / KAPPA_PLAN
+                ng = g + base + self.W_DSTEER * abs(pk - k0) / EGO.kappa
                 if d0 != 0 and pd != d0:
                     ng += self.W_SWITCH
                 if soft:
@@ -1337,13 +1355,14 @@ class Segment:
         self.v_max = v_max
         self.s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(self.x), np.diff(self.y)))])
         self.length = float(self.s[-1])
-        kappa = np.asarray(kappa, dtype=float)
-        n = max(1, min(5, (len(kappa) - 1) // 2))          # ~1 m moving average
-        pad = np.concatenate([np.full(n, kappa[0]), kappa, np.full(n, kappa[-1])])
-        self.kappa = np.convolve(pad, np.ones(2 * n + 1) / (2 * n + 1), mode="valid")
-        dk = np.abs(np.gradient(self.kappa, np.maximum(self.s, 1e-9))) if len(kappa) > 2 else np.zeros(len(kappa))
-        # slow down where the steering has to move quickly, and towards the end of the segment
-        self.v_ref = np.minimum(v_max, np.clip(0.2 / np.maximum(dk, 1e-6), 0.5, v_max))
+        self.kappa = np.asarray(kappa, dtype=float)
+        # Speed limit from the steering actuator: where the path curvature changes by dk/ds, the
+        # steering must move at v * dk/ds, which may not exceed what STEER_RATE allows.
+        n = max(1, min(5, (len(self.kappa) - 1) // 2))     # ~1 m moving average
+        pad = np.concatenate([np.full(n, self.kappa[0]), self.kappa, np.full(n, self.kappa[-1])])
+        smooth = np.convolve(pad, np.ones(2 * n + 1) / (2 * n + 1), mode="valid")
+        dk = np.abs(np.gradient(smooth, np.maximum(self.s, 1e-9))) if len(smooth) > 2 else np.zeros(len(smooth))
+        self.v_ref = np.minimum(v_max, np.clip(STEER_RATE * EGO.kappa / np.maximum(dk, 1e-6), 0.5, v_max))
 
     def reanchor(self, old, new, beyond=0.0, full=4.0, fade=9.0):
         """Move the path by the rigid transform that takes pose 'old' to pose 'new'. Points
@@ -1385,19 +1404,118 @@ def split_segments(start, rows):
 
 
 # =============================================================================
-# Path tracking: rear-axle feedback steering (valid forward and in reverse)
-# and PI speed control with a stop at the end of every segment
+# Path tracking: model predictive control of the steering, with the steering
+# gain of the car identified online, and a PI loop on speed
 # =============================================================================
 
-def steer_for_curvature(kappa, direction):
-    tab = KAPPA_FWD if direction > 0 else KAPPA_REV
-    return math.copysign(float(np.interp(abs(kappa), tab, STEER_IN)), kappa)
+class LateralMPC:
+    """Linear MPC of the lateral motion along a path, written in travelled distance instead of
+    time so that it stays well posed down to walking pace.
+
+    State x = (e, psi): lateral and heading error of the rear axle w.r.t. the path. Over one
+    step of length h, driving in direction d = +-1 with curvature kappa where the path has
+    curvature kappa_ref, the kinematic bicycle gives (to first order in the errors)
+
+        e'   = e + d h psi + h^2/2 (kappa - kappa_ref)
+        psi' = psi + d h (kappa - kappa_ref)
+
+    The decision variables are the N curvatures over the horizon. The cost penalises the
+    errors, the deviation from the path curvature and curvature changes; the constraints are
+    the steering limit |kappa| <= kappa_max and the steering rate. The resulting QP has constant
+    matrices, so it is condensed once and solved with ADMM (operator splitting, as in OSQP)."""
+    N = 20                   # horizon steps
+    H = 0.2                  # step [m]  -> 4 m look-ahead
+    Q_E, Q_PSI = 10.0, 6.0   # error weights
+    Q_END = 3.0              # extra weight on the last step
+    R_K = 1.0                # weight on (kappa - kappa_ref)
+    R_DK = 1.0               # weight on curvature changes
+    RHO = 10.0               # ADMM penalty, relative to the mean curvature of the cost
+    MAX_ITER = 150
+
+    def __init__(self):
+        N, h = self.N, self.H
+        self.D = np.eye(N) - np.eye(N, k=-1)                 # (D K)_k = K_k - K_{k-1}
+        self.Ac = np.vstack([np.eye(N), self.D])             # box and rate constraints
+        self.qp = {}
+        for d in (1, -1):
+            A = np.array([[1.0, d * h], [0.0, 1.0]])
+            B = np.array([0.5 * h * h, d * h])
+            Phi, Gam = np.zeros((2 * N, 2)), np.zeros((2 * N, N))
+            Ak = np.eye(2)
+            for k in range(N):
+                Ak = A @ Ak
+                Phi[2 * k:2 * k + 2] = Ak
+                for j in range(k + 1):
+                    Gam[2 * k:2 * k + 2, j] = np.linalg.matrix_power(A, k - j) @ B
+            w = np.tile([float(self.Q_E), float(self.Q_PSI)], N)
+            w[-2:] *= self.Q_END
+            GQ = Gam.T * w
+            Hm = 2.0 * (GQ @ Gam + self.R_K * np.eye(N) + self.R_DK * self.D.T @ self.D)
+            rho = self.RHO * np.trace(Hm) / N
+            sigma = 1e-6 * np.trace(Hm) / N
+            Minv = np.linalg.inv(Hm + sigma * np.eye(N) + rho * self.Ac.T @ self.Ac)
+            self.qp[d] = dict(Phi=Phi, Gam=Gam, GQ=GQ, Minv=Minv, rho=rho, sigma=sigma)
+        self.x = np.zeros(N)
+        self.z = np.zeros(2 * N)
+        self.y = np.zeros(2 * N)
+        self.iters = 0
+
+    def reset(self):
+        self.x[:], self.z[:], self.y[:] = 0.0, 0.0, 0.0
+
+    def solve(self, d, e0, psi0, k_prev, k_ref, k_max, dk_max):
+        """Returns the curvature sequence and the predicted (e, psi) over the horizon."""
+        q = self.qp[d]
+        x0 = np.array([e0, psi0])
+        c = np.zeros(self.N)
+        c[0] = k_prev
+        f = 2.0 * (q["GQ"] @ (q["Phi"] @ x0 - q["Gam"] @ k_ref) - self.R_K * k_ref - self.R_DK * self.D.T @ c)
+        lo = np.concatenate([np.full(self.N, -k_max), c - dk_max])
+        hi = np.concatenate([np.full(self.N, k_max), c + dk_max])
+        x, z, y, rho, sigma, Ac, Minv = self.x, self.z, self.y, q["rho"], q["sigma"], self.Ac, q["Minv"]
+        for it in range(self.MAX_ITER):
+            xt = Minv @ (sigma * x - f + Ac.T @ (rho * z - y))
+            zt = Ac @ xt
+            x = 1.6 * xt - 0.6 * x
+            zr = 1.6 * zt - 0.6 * z
+            zn = np.clip(zr + y / rho, lo, hi)
+            y = y + rho * (zr - zn)
+            done = np.abs(zt - zn).max() < 1e-5 and np.abs(zn - z).max() < 1e-5
+            z = zn
+            if done:
+                break
+        self.x, self.z, self.y, self.iters = x, z, y, it + 1
+        K = np.clip(x, -k_max, k_max)
+        pred = (q["Phi"] @ x0 + q["Gam"] @ (K - k_ref)).reshape(self.N, 2)
+        return K, pred
 
 
-class Tracker:
-    K_E = 0.8            # lateral error gain  [1/m^2]
-    K_PSI = 1.6          # heading error gain  [1/m]
-    STEER_RATE = 1.3     # steering input units per second (lock to lock in ~1.5 s)
+class SteeringGain:
+    """Online estimate of the car's steering gain g in  curvature = g * steering input,
+    separately for forward and reverse, by recursive least squares on the measured curvature
+    (yaw rate / speed). It starts from the kinematic value of the Chrono model, so no
+    calibration data is needed."""
+    FORGET = 0.995
+
+    def __init__(self):
+        self.g = {1: EGO.kappa, -1: EGO.kappa}
+        self.P = {1: 0.5, -1: 0.5}
+        self.prev = 0.0
+
+    def update(self, d, steer, v, yaw_rate, dt):
+        settled = abs(steer - self.prev) < 0.5 * dt          # the yaw response lags a moving wheel
+        self.prev = steer
+        if abs(v) < 0.5 or abs(steer) < 0.15 or not settled:
+            return
+        P = self.P[d]
+        gain = P * steer / (self.FORGET + steer * P * steer)
+        g = self.g[d] + gain * (yaw_rate / v - self.g[d] * steer)
+        self.g[d] = min(max(g, 0.4 * EGO.kappa), 2.5 * EGO.kappa)
+        self.P[d] = min((P - gain * steer * P) / self.FORGET, 0.5)
+
+
+class MpcTracker:
+    """Follows one path segment at a time: turn the wheels while standing, drive, stop."""
     A_DEC = 0.5          # deceleration used to approach the end of a segment [m/s^2]
     A_ACC = 0.7
     V_CREEP = 0.15
@@ -1408,17 +1526,23 @@ class Tracker:
         self.phase = "idle"
         self.done = True
         self.err = (0.0, 0.0, 0.0)       # lateral, heading, remaining distance
+        self.mpc = LateralMPC()
+        self.gain = SteeringGain()
+        self.horizon = np.zeros((0, 2))  # predicted rear-axle positions, for display
+        self.k_plan = np.zeros(0)        # planned curvatures over the horizon
+        self.k_ref = np.zeros(0)
 
     def start(self, seg, t, presteer=True):
         self.seg, self.i, self.done = seg, 0, False
         self.phase = "steer" if presteer else "go"
         self.t_phase, self.integ, self.v_cmd, self.t_still = t, 0.0, 0.0, None
+        self.mpc.reset()
 
     def stop(self):
         if self.phase in ("steer", "go"):
             self.phase, self.t_still = "stop", None
 
-    def update(self, pose, v, t, dt):
+    def update(self, pose, v, yaw_rate, t, dt):
         seg = self.seg
         x, y, th = pose
         i1 = min(len(seg.x), self.i + 40)
@@ -1431,13 +1555,20 @@ class Tracker:
             s_rem = d * ((seg.x[-1] - x) * math.cos(seg.th[-1]) + (seg.y[-1] - y) * math.sin(seg.th[-1]))
         self.err = (e, psi, s_rem)
 
-        # steering: curvature feed-forward (looking ahead by the steering lag) + feedback
-        j = min(len(seg.x) - 1, i + 1 + int(abs(v) * 0.25 / 0.1))
-        kff = seg.kappa[j]
-        sinc = math.sin(psi) / psi if abs(psi) > 1e-6 else 1.0
-        kappa = kff * math.cos(psi) / max(1.0 - kff * e, 0.5) - d * self.K_PSI * psi - self.K_E * e * sinc
-        target = steer_for_curvature(kappa, d)
-        self.steer += max(-self.STEER_RATE * dt, min(self.STEER_RATE * dt, target - self.steer))
+        # steering: MPC over the next few metres of path, with the current estimate of the gain
+        self.gain.update(d, self.steer, v, yaw_rate, dt)
+        g = self.gain.g[d]
+        mpc = self.mpc
+        ahead = seg.s[i] + (np.arange(mpc.N) + 0.5) * mpc.H
+        k_ref = np.interp(ahead, seg.s, seg.kappa)           # holds the last curvature past the end
+        dk_max = min(STEER_RATE * g * mpc.H / max(abs(v), 0.3), 2.0 * g)
+        K, pred = mpc.solve(d, e, psi, g * self.steer, k_ref, g, dk_max)
+        target = min(max(K[0] / g, -1.0), 1.0)
+        self.steer += max(-STEER_RATE * dt, min(STEER_RATE * dt, target - self.steer))
+        j = np.minimum(np.searchsorted(seg.s, seg.s[i] + (np.arange(mpc.N) + 1.0) * mpc.H), len(seg.x) - 1)
+        self.horizon = np.stack([seg.x[j] - pred[:, 0] * np.sin(seg.th[j]),
+                                 seg.y[j] + pred[:, 0] * np.cos(seg.th[j])], axis=1)
+        self.k_plan, self.k_ref = K, k_ref
 
         va = v * d
         if self.phase == "steer":      # stationary: turn the wheels before moving off
@@ -1480,9 +1611,7 @@ class World:
         sedan.SetContactMethod(chrono.ChContactMethod_SMC)
         sedan.SetChassisCollisionType(veh.CollisionType_HULLS)    # so that hitting a parked car is physical
         sedan.SetChassisFixed(False)
-        sedan.SetInitPosition(chrono.ChCoordsysd(
-            chrono.ChVector3d(x + REF_TO_REAR * math.cos(th), y + REF_TO_REAR * math.sin(th), 0.25),
-            chrono.QuatFromAngleZ(th)))
+        sedan.SetInitPosition(chrono.ChCoordsysd(chrono.ChVector3d(x, y, 0.25), chrono.QuatFromAngleZ(th)))
         sedan.SetTireType(veh.TireModelType_PAC02 if tire == "pac02" else veh.TireModelType_TMEASY)
         sedan.SetTireStepSize(1e-3)
         sedan.SetBrakeType(veh.BrakeType_SHAFTS)     # the simple brake cannot hold the car still
@@ -1496,6 +1625,7 @@ class World:
         self.sedan = sedan
         self.car = sedan.GetVehicle()
         self.system = sedan.GetSystem()
+        EGO.read(self.car)
         self.system.SetCollisionSystemType(chrono.ChCollisionSystem.Type_BULLET)
         self.gearbox = self.car.GetTransmission().asAutomatic()
         self.inputs = veh.DriverInputs()
@@ -1567,12 +1697,15 @@ class World:
             self.system.Add(body)
 
     def state(self):
-        """Rear-axle pose (x, y, heading), signed forward speed and the chassis frame."""
+        """Rear-axle pose (x, y, heading) and signed forward speed."""
         frame = self.car.GetChassisBody().GetFrameRefToAbs()
         p = frame.GetPos()
         ax = frame.GetRotMat().GetAxisX()
         th = math.atan2(ax.y, ax.x)
-        return (p.x - REF_TO_REAR * math.cos(th), p.y - REF_TO_REAR * math.sin(th), th), self.car.GetSpeed()
+        return (p.x - EGO.ref_to_rear * math.cos(th), p.y - EGO.ref_to_rear * math.sin(th), th), self.car.GetSpeed()
+
+    def yaw_rate(self):
+        return self.car.GetYawRate()
 
     def set_direction(self, d):
         AT = veh.ChAutomaticTransmission
@@ -1605,7 +1738,7 @@ class ParkingSim:
         self.lines = LineMap()
         self.planner = Planner()
         self.planner.table()          # tabulate the Reeds-Shepp heuristic up front (~1 s)
-        self.tracker = Tracker()
+        self.tracker = MpcTracker()
         self.obstacles = self.scn.obstacle_polys()
 
         self.state = "SETTLE"
@@ -1691,7 +1824,7 @@ class ParkingSim:
                 self._follow(self._search_route(), presteer=False)
                 self.say("searching for a free stall (%s, cars: %s)" % (self.scn.name, self.args.cars))
         elif self.state in ("SEARCH", "DRIVE"):
-            self.cmd = self.tracker.update(self.pose, v, t, CONTROL_DT)
+            self.cmd = self.tracker.update(self.pose, v, self.world.yaw_rate(), t, CONTROL_DT)
             if self.tracker.done:
                 if self.state == "SEARCH" and self.manual is not None:
                     self.state, self.t_still = "BRAKE", None
@@ -1752,7 +1885,7 @@ class ParkingSim:
         """Pick a stall: confirmed free, close enough to be well observed, best score."""
         fwd = self.travel_dir
         left = np.array([-fwd[1], fwd[0]])
-        ctr = np.array(self.pose[:2]) + CENTER_OFFSET * fwd
+        ctr = np.array(self.pose[:2]) + EGO.center * fwd
         best = None
         for s in self.slots:
             if s.status != Slot.FREE or s.hits < 8:
@@ -1837,8 +1970,8 @@ class ParkingSim:
             return None
         X, Y, sl = win
         c, s = math.cos(th), math.sin(th)
-        inside = ((np.abs((X - x) * c + (Y - y) * s) < 0.5 * CAR_LENGTH + grow) &
-                  (np.abs(-(X - x) * s + (Y - y) * c) < HALF_WIDTH + grow))
+        inside = ((np.abs((X - x) * c + (Y - y) * s) < 0.5 * EGO.length + grow) &
+                  (np.abs(-(X - x) * s + (Y - y) * c) < EGO.half_width + grow))
         return inside, sl
 
     def _approach(self):
@@ -1874,7 +2007,7 @@ class ParkingSim:
                                       for b in np.arange(0.0, 0.61, 0.15)),
                         margins=((0.25, 0.30), (0.15, 0.20), (0.08, 0.12)))
         x, y, th = self.manual
-        nominal = (x - CENTER_OFFSET * math.cos(th), y - CENTER_OFFSET * math.sin(th), th)
+        nominal = (x - EGO.center * math.cos(th), y - EGO.center * math.sin(th), th)
         return dict(kind="manual", nominal=nominal, u=np.array([math.cos(th), math.sin(th)]),
                     signs=(1.0, -1.0), runs=(3.0, 2.0, 1.2, 0.6, 0.0),
                     trials=sorted((abs(a) + abs(b), a, b) for a in np.arange(-0.2, 0.21, 0.1)
@@ -2089,13 +2222,13 @@ class ParkingSim:
         res = dict(ok=ok, time=self.time, plan_time=self.plan_time, gear_changes=self.gear_changes,
                    replans=self.replans, corrections=self.corrections, min_clearance=self.min_clearance)
         if ok and self.manual is not None and self.target is None:
-            lon, lat, dth = self._pose_error((self.manual[0] - CENTER_OFFSET * math.cos(self.manual[2]),
-                                              self.manual[1] - CENTER_OFFSET * math.sin(self.manual[2]), self.manual[2]))
+            lon, lat, dth = self._pose_error((self.manual[0] - EGO.center * math.cos(self.manual[2]),
+                                              self.manual[1] - EGO.center * math.sin(self.manual[2]), self.manual[2]))
             res.update(kind="manual", lateral=lat, depth=lon, heading_deg=math.degrees(abs(dth)))
             res["ok"] = bool(self.min_clearance > 0.0 and math.hypot(lon, lat) < 0.5)
         elif ok:
             # score against the ground-truth stall the car ended up in
-            c = np.array(self.pose[:2]) + CENTER_OFFSET * np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
+            c = np.array(self.pose[:2]) + EGO.center * np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
             stall = min(self.scn.stalls, key=lambda s: np.hypot(*(s["center"] - c)))
             u = stall["u_in"]
             nu = np.array([-u[1], u[0]])
@@ -2363,8 +2496,8 @@ class Viewer:
     def _box_items(self):
         x, y, th = self.box
         col = self.COLORS["box"] if self.box_ok else self.COLORS["box_bad"]
-        half = 0.5 * CAR_LENGTH
-        poly = rect_poly(x, y, th, -half, half, HALF_WIDTH)
+        half = 0.5 * EGO.length
+        poly = rect_poly(x, y, th, -half, half, EGO.half_width)
         c, s = math.cos(th), math.sin(th)
         nose = [(x + (half - 1.2) * c - 0.6 * s, y + (half - 1.2) * s + 0.6 * c), (x + half * c, y + half * s),
                 (x + (half - 1.2) * c + 0.6 * s, y + (half - 1.2) * s - 0.6 * c)]
@@ -2381,7 +2514,7 @@ class Viewer:
         sim = self.sim
         x, y, th = sim.pose
         c, s = math.cos(th), math.sin(th)
-        cx, cy = x + CENTER_OFFSET * c, y + CENTER_OFFSET * s
+        cx, cy = x + EGO.center * c, y + EGO.center * s
         V = irr.vector3df
 
         if not self.drag:
@@ -2402,11 +2535,11 @@ class Viewer:
         reverse = sim.state == "DRIVE" and sim.tracker.seg is not None and sim.tracker.seg.dir < 0
         self.labels[2] = "REAR CAMERA" if reverse else "FRONT CAMERA"
         if reverse:
-            ex, ey = x - (REAR_OVERHANG + 0.05) * c, y - (REAR_OVERHANG + 0.05) * s
+            ex, ey = x - (EGO.rear + 0.05) * c, y - (EGO.rear + 0.05) * s
             cam.setPosition(V(ex, ey, 1.0))
             cam.setTarget(V(ex - 4.0 * c, ey - 4.0 * s, -0.4))
         else:
-            ex, ey = x + (FRONT_REACH + 0.05) * c, y + (FRONT_REACH + 0.05) * s
+            ex, ey = x + (EGO.front + 0.05) * c, y + (EGO.front + 0.05) * s
             cam.setPosition(V(ex, ey, 0.85))
             cam.setTarget(V(ex + 5.0 * c, ey + 5.0 * s, 0.0))
         cam.setFOV(1.25)
@@ -2483,8 +2616,8 @@ class Viewer:
         if self.grab is not None or hit or m["right"] or m["keys"]:
             self.box_t = time.time()
         pts = sim.grid.occupied_points()
-        pose = np.array([[self.box[0] - CENTER_OFFSET * math.cos(self.box[2]),
-                          self.box[1] - CENTER_OFFSET * math.sin(self.box[2]), self.box[2]]])
+        pose = np.array([[self.box[0] - EGO.center * math.cos(self.box[2]),
+                          self.box[1] - EGO.center * math.sin(self.box[2]), self.box[2]]])
         self.box_ok = not footprint_hits(pose, pts, 0.05)[0]
         if action == "go" and sim.state != "PLAN":
             sim.go_to(tuple(self.box))
