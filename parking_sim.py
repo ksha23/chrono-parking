@@ -16,7 +16,9 @@
 #   control    : linear MPC on the steering (constrained QP, solved exactly) with
 #                the steering gain identified online, and a PI loop on speed
 #
-# Nothing about the car is hard-coded: its geometry and steering limit are read
+# The car is driven by physical commands, not pedal positions: road-wheel steering
+# angle [rad], drive torque at the wheels [N m] and brake torque [N m]. Nothing
+# about the car is hard-coded: its geometry, mass and actuator limits are read
 # from the Chrono model at start-up. The design is documented in docs/.
 #
 # Examples (any Python with PyChrono's vehicle and irrlicht modules):
@@ -92,6 +94,7 @@ class Ego:
     def __init__(self):
         self.wheelbase = self.rear = self.front = self.half_width = None
         self.ref_to_rear = self.length = self.center = self.kappa = self.radius = None
+        self.mass = self.wheel_radius = self.steer_max = self.brake_torque_max = None
 
     def read(self, car):
         """Query the Chrono vehicle: wheelbase, axle position, body outline, steering limit."""
@@ -113,9 +116,16 @@ class Ego:
         self.half_width = float(np.abs(pts[:, 1]).max())
         self.length = self.front + self.rear
         self.center = 0.5 * (self.front - self.rear)       # rear axle -> middle of the body
-        # kinematic (bicycle) curvature at the model's maximum steering angle
+        # kinematic (bicycle) curvature at the model's declared maximum steering angle: the
+        # planner stays within this
         self.kappa = math.tan(car.GetMaxSteeringAngle()) / self.wheelbase
         self.radius = 1.0 / self.kappa
+        self.mass = car.GetMass()
+        self.wheel_radius = car.GetTire(0, veh.LEFT).GetRadius()
+
+    def torque(self, accel):
+        """Wheel torque that gives the car this acceleration on level ground."""
+        return self.mass * accel * self.wheel_radius
 
 
 EGO = Ego()
@@ -127,7 +137,9 @@ PERCEPTION_DT = 0.1            # perception / mapping period [s]
 V_SEARCH = 2.2                 # cruise speed while looking for a stall [m/s]
 V_FWD = 1.4                    # maneuver speed, forward [m/s]
 V_REV = 1.0                    # maneuver speed, reverse [m/s]
-STEER_RATE = 1.3               # limit on the steering input rate [1/s] (lock to lock in ~1.5 s)
+STEER_RATE = 0.8               # limit on the road-wheel steering rate [rad/s] (lock to lock in ~1.5 s)
+A_DRIVE_MAX = 2.5              # acceleration the drive torque may ask for [m/s^2]
+A_BRAKE = 2.5                  # deceleration used to stop [m/s^2]
 
 
 def wrap(a):
@@ -1385,7 +1397,7 @@ class Segment:
         pad = np.concatenate([np.full(n, self.kappa[0]), self.kappa, np.full(n, self.kappa[-1])])
         smooth = np.convolve(pad, np.ones(2 * n + 1) / (2 * n + 1), mode="valid")
         dk = np.abs(np.gradient(smooth, np.maximum(self.s, 1e-9))) if len(smooth) > 2 else np.zeros(len(smooth))
-        self.v_ref = np.minimum(v_max, np.clip(STEER_RATE * EGO.kappa / np.maximum(dk, 1e-6), 0.5, v_max))
+        self.v_ref = np.minimum(v_max, np.clip(STEER_RATE / EGO.wheelbase / np.maximum(dk, 1e-6), 0.5, v_max))
 
     def reanchor(self, old, new, beyond=0.0, full=4.0, fade=9.0):
         """Move the path by the rigid transform that takes pose 'old' to pose 'new'. Points
@@ -1535,41 +1547,67 @@ class LateralMPC:
 
 
 class SteeringGain:
-    """Online estimate of the car's steering gain g in  curvature = g * steering input,
-    separately for forward and reverse, by recursive least squares on the measured curvature
-    (yaw rate / speed). It starts from the kinematic value of the Chrono model, so no
-    calibration data is needed."""
-    FORGET = 0.995
+    """Online estimate of the gain g in
+
+        curvature = g * tan(road-wheel steering angle)
+
+    separately for forward and reverse, by recursive least squares. For an ideal bicycle
+    g = 1 / wheelbase, which is the starting value. The real car turns less than that (tire slip,
+    compliance in the steering, front wheels that do not follow Ackermann geometry), and how much
+    less is what this identifies.
+
+    The measurement comes from the car's own track over the last half second. Integrating the
+    model along the distance driven gives
+
+        change of heading = g * integral of tan(steering angle) d(distance)
+
+    so the heading change is regressed on that integral. This holds while the steering is
+    moving, which it nearly always is. (Yaw rate over speed would be the obvious instantaneous
+    measurement, but in this simulation it is too noisy at low speed.)"""
+    FORGET = 0.98        # per control tick: the estimate follows a change within about a second
+    WINDOW = 25          # control ticks, 0.5 s
 
     def __init__(self):
-        self.g = {1: EGO.kappa, -1: EGO.kappa}
-        self.P = {1: 0.5, -1: 0.5}
-        self.prev = 0.0
+        self.g = {1: 1.0 / EGO.wheelbase, -1: 1.0 / EGO.wheelbase}
+        self.P = {1: 2.0, -1: 2.0}
+        self.track = collections.deque(maxlen=self.WINDOW)     # (x, y, heading, tan(angle), direction)
 
-    def update(self, d, steer, v, yaw_rate, dt):
-        settled = abs(steer - self.prev) < 0.5 * dt          # the yaw response lags a moving wheel
-        self.prev = steer
-        if abs(v) < 0.5 or abs(steer) < 0.15 or not settled:
+    def update(self, d, delta, pose):
+        self.track.append((pose[0], pose[1], pose[2], math.tan(delta), d))
+        if len(self.track) < self.WINDOW or self.track[0][4] != d:
             return
+        q = np.array(self.track)
+        ds = np.hypot(np.diff(q[:, 0]), np.diff(q[:, 1]))
+        dist = ds.sum()
+        if dist < 0.25:
+            return
+        x = float((0.5 * (q[1:, 3] + q[:-1, 3]) * ds).sum() / dist)      # distance average of tan(angle)
+        if abs(x) < 0.05:
+            return
+        kappa = wrap(pose[2] - q[0, 2]) / (d * dist)
         P = self.P[d]
-        gain = P * steer / (self.FORGET + steer * P * steer)
-        g = self.g[d] + gain * (yaw_rate / v - self.g[d] * steer)
-        self.g[d] = min(max(g, 0.4 * EGO.kappa), 2.5 * EGO.kappa)
-        self.P[d] = min((P - gain * steer * P) / self.FORGET, 0.5)
+        gain = P * x / (self.FORGET + x * P * x)
+        g = self.g[d] + gain * (kappa - self.g[d] * x)
+        self.g[d] = min(max(g, 0.4 / EGO.wheelbase), 1.5 / EGO.wheelbase)
+        self.P[d] = min((P - gain * x * P) / self.FORGET, 2.0)
 
 
 class MpcTracker:
-    """Follows one path segment at a time: turn the wheels while standing, drive, stop."""
+    """Follows one path segment at a time: turn the wheels while standing, drive, stop.
+    Its outputs are physical: road-wheel steering angle [rad], drive torque at the wheels [N m,
+    negative for reverse] and brake torque [N m]."""
     A_DEC = 0.5          # deceleration used to approach the end of a segment [m/s^2]
     A_ACC = 0.7
     V_CREEP = 0.15
+    KP, KI = 4.0, 2.0    # speed loop: acceleration per speed error [1/s], and its integral [1/s^2]
 
     def __init__(self):
         self.seg = None
-        self.steer = 0.0
+        self.delta = 0.0                 # commanded road-wheel angle [rad]
         self.phase = "idle"
         self.done = True
         self.err = (0.0, 0.0, 0.0)       # lateral, heading, remaining distance
+        self.v_cmd = 0.0
         self.mpc = LateralMPC()
         self.gain = SteeringGain()
         self.horizon = np.zeros((0, 2))  # predicted rear-axle positions, for display
@@ -1585,52 +1623,67 @@ class MpcTracker:
         if self.phase in ("steer", "go"):
             self.phase, self.t_still = "stop", None
 
-    def update(self, pose, v, yaw_rate, t, dt):
+    def update(self, pose, v, t, dt):
+        """Returns (steering angle, drive torque, brake torque)."""
         seg = self.seg
         x, y, th = pose
         i1 = min(len(seg.x), self.i + 40)
         self.i += int(np.argmin((seg.x[self.i:i1] - x) ** 2 + (seg.y[self.i:i1] - y) ** 2))
         i, d = self.i, seg.dir
-        e = -math.sin(seg.th[i]) * (x - seg.x[i]) + math.cos(seg.th[i]) * (y - seg.y[i])
-        psi = wrap(th - seg.th[i])
-        s_rem = seg.length - seg.s[i]
+        # the reference is the path between its samples, not the nearest sample: otherwise the
+        # reference heading jumps every 10 cm and the steering follows it
+        a = max(min(i, len(seg.x) - 2), 0)
+        if a > 0 and (x - seg.x[a]) * (seg.x[a + 1] - seg.x[a]) + (y - seg.y[a]) * (seg.y[a + 1] - seg.y[a]) < 0.0:
+            a -= 1
+        ux, uy = seg.x[a + 1] - seg.x[a], seg.y[a + 1] - seg.y[a]
+        f = min(max(((x - seg.x[a]) * ux + (y - seg.y[a]) * uy) / max(ux * ux + uy * uy, 1e-12), 0.0), 1.0)
+        th_ref = seg.th[a] + f * wrap(seg.th[a + 1] - seg.th[a])
+        s_ref = seg.s[a] + f * (seg.s[a + 1] - seg.s[a])
+        e = -math.sin(th_ref) * (x - seg.x[a] - f * ux) + math.cos(th_ref) * (y - seg.y[a] - f * uy)
+        psi = wrap(th - th_ref)
+        s_rem = seg.length - s_ref
         if s_rem < 1.5:        # near the end, measure what is left along the final heading
             s_rem = d * ((seg.x[-1] - x) * math.cos(seg.th[-1]) + (seg.y[-1] - y) * math.sin(seg.th[-1]))
         self.err = (e, psi, s_rem)
 
         # steering: MPC over the next few metres of path, with the current estimate of the gain
-        self.gain.update(d, self.steer, v, yaw_rate, dt)
+        self.gain.update(d, self.delta, pose)
         g = self.gain.g[d]
         mpc = self.mpc
-        ahead = seg.s[i] + (np.arange(mpc.N) + 0.5) * mpc.H
+        ahead = s_ref + (np.arange(mpc.N) + 0.5) * mpc.H
         k_ref = np.interp(ahead, seg.s, seg.kappa)           # holds the last curvature past the end
-        dk_max = min(STEER_RATE * g * mpc.H / max(abs(v), 0.3), 2.0 * g)
-        K, pred = mpc.solve(d, e, psi, g * self.steer, k_ref, g, dk_max)
-        target = min(max(K[0] / g, -1.0), 1.0)
-        self.steer += max(-STEER_RATE * dt, min(STEER_RATE * dt, target - self.steer))
-        j = np.minimum(np.searchsorted(seg.s, seg.s[i] + (np.arange(mpc.N) + 1.0) * mpc.H), len(seg.x) - 1)
+        k_now = g * math.tan(self.delta)
+        k_max = g * math.tan(EGO.steer_max)
+        # d(kappa)/dt = g (1 + tan^2 delta) d(delta)/dt, and one step takes h / |v|
+        dk_max = min(g * (1.0 + math.tan(self.delta) ** 2) * STEER_RATE * mpc.H / max(abs(v), 0.3), 2.0 * k_max)
+        K, pred = mpc.solve(d, e, psi, min(max(k_now, -k_max), k_max), k_ref, k_max, dk_max)
+        target = math.atan(K[0] / g)
+        self.delta += max(-STEER_RATE * dt, min(STEER_RATE * dt, target - self.delta))
+        j = np.minimum(np.searchsorted(seg.s, s_ref + (np.arange(mpc.N) + 1.0) * mpc.H), len(seg.x) - 1)
         self.horizon = np.stack([seg.x[j] - pred[:, 0] * np.sin(seg.th[j]),
                                  seg.y[j] + pred[:, 0] * np.cos(seg.th[j])], axis=1)
         self.k_plan, self.k_ref = K, k_ref
 
         va = v * d
+        hold = EGO.torque(A_BRAKE)
         if self.phase == "steer":      # stationary: turn the wheels before moving off
-            if (abs(target - self.steer) < 0.03 and t - self.t_phase > 0.3) or t - self.t_phase > 2.5:
+            if (abs(target - self.delta) < 0.02 and t - self.t_phase > 0.3) or t - self.t_phase > 2.5:
                 self.phase = "go"
-            return self.steer, 0.0, 0.6
+            return self.delta, 0.0, hold
         if self.phase == "go":
             if s_rem <= 0.015 + 0.06 * max(va, 0.0):
                 self.phase, self.t_still = "stop", None
             else:
                 v_tgt = max(min(seg.v_ref[i], math.sqrt(2.0 * self.A_DEC * max(s_rem, 0.0))), self.V_CREEP)
-                self.v_cmd = min(v_tgt, self.v_cmd + self.A_ACC * dt)
+                v_new = min(v_tgt, self.v_cmd + self.A_ACC * dt)
+                feedforward = min(max((v_new - self.v_cmd) / dt, -1.0), 1.0)     # slope of the speed profile
+                self.v_cmd = v_new
                 err = self.v_cmd - va
-                self.integ = min(max(self.integ + 0.5 * err * dt, 0.0), 0.5)
-                throttle = min(max(0.5 * err + self.integ, 0.0), 0.7)
-                brake = min(max(1.5 * (-err - 0.08), 0.0), 0.8)
-                if brake > 0.0:
-                    throttle, self.integ = 0.0, 0.8 * self.integ
-                return self.steer, throttle, brake
+                self.integ = min(max(self.integ + self.KI * err * dt, -0.5), 1.0)
+                accel = feedforward + self.KP * err + self.integ   # wanted acceleration along the path
+                if accel >= 0.0:
+                    return self.delta, d * EGO.torque(min(accel, A_DRIVE_MAX)), 0.0
+                return self.delta, 0.0, EGO.torque(min(max(-accel - 0.1, 0.0), A_BRAKE))
         # stop: hold the brake until the car has been still for a moment
         if abs(v) < 0.03:
             if self.t_still is None:
@@ -1639,7 +1692,7 @@ class MpcTracker:
                 self.done, self.phase = True, "idle"
         else:
             self.t_still = None
-        return self.steer, 0.0, 0.6
+        return self.delta, 0.0, hold
 
 
 # =============================================================================
@@ -1670,7 +1723,6 @@ class World:
         self.system = sedan.GetSystem()
         EGO.read(self.car)
         self.system.SetCollisionSystemType(chrono.ChCollisionSystem.Type_BULLET)
-        self.gearbox = self.car.GetTransmission().asAutomatic()
         self.inputs = veh.DriverInputs()
 
         mat = chrono.ChContactMaterialSMC()
@@ -1687,6 +1739,52 @@ class World:
         self.contact_mat = mat
         self._decor(visual)
         self._parked_cars(visual)
+        self._actuators()
+
+    # ---- actuators: the car is driven by physical commands, not by pedal positions -------------
+
+    def _actuators(self):
+        """Set the car up for direct actuation and learn the actuator limits from the model.
+
+        Drive torque is applied to the half-shafts of the driven axle, with the gearbox in
+        neutral so that the engine is out of the loop. The steering command is a road-wheel
+        angle; at power-up the steering is run through its travel once to read which rack
+        position gives which angle, and the brakes are applied fully to read their capacity."""
+        car = self.car
+        car.GetTransmission().asAutomatic().SetDriveMode(veh.ChAutomaticTransmission.DriveMode_NEUTRAL)
+        self.driven = [car.GetSuspension(int(i)) for i in car.GetDriveline().GetDrivenAxleIndexes()]
+        self.brakes = [car.GetBrake(a, side) for a in range(car.GetNumberAxles()) for side in (veh.LEFT, veh.RIGHT)]
+        racks, angles = [0.0], [0.0]
+        for rack in (0.2, 0.4, 0.6, 0.8, 1.0, 0.5, 0.0):
+            for _ in range(int(0.15 / STEP)):
+                self._advance(rack, 1.0, 0.0)
+            if rack > racks[-1]:
+                racks.append(rack)
+                angles.append(self.steer_angle())
+        self.rack_of_angle = (np.array(angles), np.array(racks))
+        EGO.steer_max = angles[-1]
+        EGO.brake_torque_max = sum(b.GetBrakeTorque() for b in self.brakes)
+
+    def steer_angle(self):
+        """Measured road-wheel steering angle: mean of the two front wheels [rad]."""
+        return 0.5 * (self.car.GetSteeringAngle(0, veh.LEFT) + self.car.GetSteeringAngle(0, veh.RIGHT))
+
+    def _advance(self, rack, braking, drive_torque):
+        t = self.system.GetChTime()
+        self.inputs.m_steering, self.inputs.m_throttle, self.inputs.m_braking = rack, 0.0, braking
+        self.terrain.Synchronize(t)
+        self.sedan.Synchronize(t, self.inputs, self.terrain)
+        for axle in self.driven:                 # Chrono's half-shafts turn opposite to the wheels
+            for side in (veh.LEFT, veh.RIGHT):
+                axle.ApplyAxleTorque(side, -drive_torque / (2 * len(self.driven)))
+        self.terrain.Advance(STEP)
+        self.sedan.Advance(STEP)
+
+    def step(self, steer_angle, drive_torque, brake_torque):
+        """Advance one step under physical commands: road-wheel steering angle [rad], total drive
+        torque at the wheels [N m, negative drives backwards], total brake torque [N m]."""
+        rack = math.copysign(float(np.interp(abs(steer_angle), *self.rack_of_angle)), steer_angle)
+        self._advance(rack, min(max(brake_torque / EGO.brake_torque_max, 0.0), 1.0), drive_torque)
 
     def _box(self, body, lx, ly, lz, pos, yaw, rgb):
         shape = chrono.ChVisualShapeBox(lx, ly, lz)
@@ -1747,21 +1845,6 @@ class World:
         th = math.atan2(ax.y, ax.x)
         return (p.x - EGO.ref_to_rear * math.cos(th), p.y - EGO.ref_to_rear * math.sin(th), th), self.car.GetSpeed()
 
-    def yaw_rate(self):
-        return self.car.GetYawRate()
-
-    def set_direction(self, d):
-        AT = veh.ChAutomaticTransmission
-        self.gearbox.SetDriveMode(AT.DriveMode_FORWARD if d > 0 else AT.DriveMode_REVERSE)
-
-    def step(self, steer, throttle, brake):
-        t = self.system.GetChTime()
-        self.inputs.m_steering, self.inputs.m_throttle, self.inputs.m_braking = steer, throttle, brake
-        self.terrain.Synchronize(t)
-        self.sedan.Synchronize(t, self.inputs, self.terrain)
-        self.terrain.Advance(STEP)
-        self.sedan.Advance(STEP)
-
 
 # =============================================================================
 # The parking agent: perception -> map -> stall decision -> plan -> track
@@ -1794,7 +1877,7 @@ class ParkingSim:
         self.nose_in = False
         self.trail = [np.array(self.scn.start[:2])]
         self.dets, self.scan = [], np.zeros((0, 2))
-        self.cmd = (0.0, 0.0, 1.0)
+        self.cmd = (0.0, 0.0, EGO.torque(A_BRAKE))     # steering angle, drive torque, brake torque
         self.steps = 0
         self.t_still = None
         self.replans = self.corrections = self.blocked = 0
@@ -1845,7 +1928,6 @@ class ParkingSim:
         return True
 
     def _follow(self, seg, presteer=True):
-        self.world.set_direction(seg.dir)
         self.tracker.start(seg, self.time, presteer)
 
     def _search_route(self):
@@ -1857,7 +1939,7 @@ class ParkingSim:
     def _control(self):
         t, v = self.time, self.speed
         if self.state == "SETTLE":
-            self.cmd = (0.0, 0.0, 1.0)
+            self.cmd = (0.0, 0.0, EGO.torque(A_BRAKE))
             if t > 1.0 and self.args.target == "drag":
                 self.state = "WAIT"
                 self.say("drag the box onto a spot and press GO")
@@ -1868,7 +1950,7 @@ class ParkingSim:
                 self._follow(self._search_route(), presteer=False)
                 self.say("searching for a free stall (%s, cars: %s)" % (self.scn.name, self.args.cars))
         elif self.state in ("SEARCH", "DRIVE"):
-            self.cmd = self.tracker.update(self.pose, v, self.world.yaw_rate(), t, CONTROL_DT)
+            self.cmd = self.tracker.update(self.pose, v, t, CONTROL_DT)
             if self.tracker.done:
                 if self.state == "SEARCH" and self.manual is not None:
                     self.state, self.t_still = "BRAKE", None
@@ -1877,7 +1959,7 @@ class ParkingSim:
                 else:
                     self._segment_done()
         elif self.state == "BRAKE":
-            self.cmd = (self.tracker.steer, 0.0, 0.45)
+            self.cmd = (self.tracker.delta, 0.0, EGO.torque(A_BRAKE))
             if abs(v) < 0.03:
                 if self.t_still is None:
                     self.t_still = t
@@ -1886,9 +1968,9 @@ class ParkingSim:
             else:
                 self.t_still = None
         else:   # WAIT / PARKED / FAILED: straighten the wheels and hold the brake
-            s = self.tracker.steer
-            self.tracker.steer = s - max(-0.02, min(0.02, s))
-            self.cmd = (self.tracker.steer, 0.0, 1.0)
+            a = self.tracker.delta
+            self.tracker.delta = a - max(-STEER_RATE * CONTROL_DT, min(STEER_RATE * CONTROL_DT, a))
+            self.cmd = (self.tracker.delta, 0.0, EGO.torque(A_BRAKE))
 
     def _perceive(self):
         origin, ang, r, dets = self.sensor.sense(self.pose)
@@ -1897,8 +1979,10 @@ class ParkingSim:
         ok = np.isfinite(r)
         self.scan = np.stack([origin[0] + r[ok] * np.cos(ang[ok]), origin[1] + r[ok] * np.sin(ang[ok])], axis=1)
         self.dets = dets
+        # The trail tells the stall inference which end of a stall faces the lane. Only the drive
+        # along the lane counts: once the car is parking, its track runs inside the stall.
         p = np.array(self.pose[:2])
-        if np.hypot(*(p - self.trail[-1])) > 0.5:
+        if self.state in ("SETTLE", "WAIT", "SEARCH") and np.hypot(*(p - self.trail[-1])) > 0.5:
             self.trail.append(p)
         self.slots = find_slots(self.lines.confirmed(), self.trail, self.grid)
 
@@ -2255,7 +2339,7 @@ class ParkingSim:
             self._follow(self.path[self.seg_i])
             return
         lon, lat, dth = self._pose_error(self.goal)
-        if (abs(lat) > 0.12 or abs(dth) > math.radians(2.5) or abs(lon) > 0.3) and \
+        if (abs(lat) > 0.08 or abs(dth) > math.radians(1.5) or abs(lon) > 0.3) and \
                 self.corrections < self.MAX_CORRECTIONS:
             self.corrections += 1
             self.say("off the stall centre by %.2f m / %.1f deg, correcting" % (lat, math.degrees(dth)))
@@ -2742,18 +2826,21 @@ class Viewer:
                               trk.gain.g[1], trk.gain.g[-1]))
             self.panel_rects = None
 
-        steer, throttle, brake = sim.cmd
+        # the three commands sent to the car, in physical units
+        steer, drive, brake = sim.cmd
         x0, y0 = 14, H - 54
-        self._rect(irr.SColor(150, 0, 0, 0), x0 - 6, y0 - 6, x0 + 250, y0 + 46)
-        self._text("STEER", x0, y0, 1)
-        self._rect(irr.SColor(255, 70, 70, 70), x0 + 50, y0, x0 + 240, y0 + 8)
-        mid = x0 + 145
-        self._rect(irr.SColor(255, 80, 170, 255), min(mid, mid - 95 * steer), y0, max(mid, mid - 95 * steer) + 1, y0 + 8)
-        for k, (name, val, col) in enumerate((("GAS", throttle, (90, 230, 110)), ("BRAKE", brake, (240, 80, 70)))):
-            y = y0 + 14 + 14 * k
+        self._rect(irr.SColor(150, 0, 0, 0), x0 - 6, y0 - 6, x0 + 330, y0 + 46)
+        rows = (("STEER", steer / EGO.steer_max, (80, 170, 255), "%+5.1f DEG" % math.degrees(steer)),
+                ("DRIVE", -drive / EGO.torque(A_DRIVE_MAX), (90, 230, 110) if drive >= 0 else (255, 110, 235),
+                 "%+5.0f NM" % drive),
+                ("BRAKE", -brake / EGO.torque(A_BRAKE), (240, 80, 70), "%5.0f NM" % brake))
+        for k, (name, frac, col, text) in enumerate(rows):        # bars grow from the middle, left = positive
+            y, mid = y0 + 14 * k, x0 + 145
             self._text(name, x0, y, 1)
             self._rect(irr.SColor(255, 70, 70, 70), x0 + 50, y, x0 + 240, y + 8)
-            self._rect(irr.SColor(255, *col), x0 + 50, y, x0 + 50 + 190 * min(max(val, 0.0), 1.0), y + 8)
+            end = mid - 95 * min(max(frac, -1.0), 1.0)
+            self._rect(irr.SColor(255, *col), min(mid, end), y, max(mid, end) + 1, y + 8)
+            self._text(text, x0 + 248, y, 1)
 
         r = self.rects[0]
         legend = (("LINE DETECTIONS", "det"), ("LINE MAP", "track"), ("FREE STALL", "free"), ("OCCUPIED", "occupied"),
@@ -2903,14 +2990,15 @@ class Viewer:
         if sim.time - self.map_time > 0.5 or self.map_img is None:
             self.map_time, self.map_img = sim.time, self._map_image(w, map_h)
             self.panel_rects = None
-        g_now = trk.gain.g[trk.seg.dir] if trk.seg is not None else EGO.kappa
+        k_max = math.tan(EGO.steer_max) * (trk.gain.g[trk.seg.dir] if trk.seg is not None else 1.0 / EGO.wheelbase)
+        g_ideal = 1.0 / EGO.wheelbase
         if self.panel_rects is None:
             out = self._map_rects(x, map_y)
             hz = np.array(self.hist) if self.hist else np.zeros((0, 7))
             if sim.state in ("DRIVE", "SEARCH") and len(trk.k_plan):
-                lim, n = 1.25 * max(g_now, EGO.kappa), len(trk.k_plan)
+                lim, n = 1.25 * max(k_max, EGO.kappa), len(trk.k_plan)
                 ty, th = tops[0]
-                for vals, rgb, thick in ((np.full(n, g_now), (150, 60, 60), 1), (np.full(n, -g_now), (150, 60, 60), 1),
+                for vals, rgb, thick in ((np.full(n, k_max), (150, 60, 60), 1), (np.full(n, -k_max), (150, 60, 60), 1),
                                          (trk.k_ref, (150, 158, 170), 1), (trk.k_plan, (255, 240, 60), 2)):
                     py = (ty + th - 2 - (np.clip(vals, -lim, lim) + lim) / (2 * lim) * (th - 3)).astype(int)
                     for k in range(n):
@@ -2920,9 +3008,9 @@ class Viewer:
                 self._trace(out, x, tops[1][0], w, tops[1][1], np.degrees(hz[:, 1]), -6.0, 6.0, (255, 170, 60))
                 self._trace(out, x, tops[2][0], w, tops[2][1], hz[:, 3], -2.6, 2.6, (120, 126, 138))
                 self._trace(out, x, tops[2][0], w, tops[2][1], hz[:, 2], -2.6, 2.6, (120, 255, 140))
-                self._trace(out, x, tops[3][0], w, tops[3][1], np.full(len(hz), EGO.kappa), 0.0, 2.0 * EGO.kappa, (120, 126, 138))
-                self._trace(out, x, tops[3][0], w, tops[3][1], hz[:, 5], 0.0, 2.0 * EGO.kappa, (90, 150, 255))
-                self._trace(out, x, tops[3][0], w, tops[3][1], hz[:, 6], 0.0, 2.0 * EGO.kappa, (255, 110, 235))
+                self._trace(out, x, tops[3][0], w, tops[3][1], np.full(len(hz), g_ideal), 0.0, 1.5 * g_ideal, (120, 126, 138))
+                self._trace(out, x, tops[3][0], w, tops[3][1], hz[:, 5], 0.0, 1.5 * g_ideal, (90, 150, 255))
+                self._trace(out, x, tops[3][0], w, tops[3][1], hz[:, 6], 0.0, 1.5 * g_ideal, (255, 110, 235))
             self.panel_rects = out
         for col, x0, y0, x1, y1 in self.panel_rects:
             self._rect(col, x0, y0, x1, y1)
@@ -2934,15 +3022,16 @@ class Viewer:
         self._text("E %+5.1f CM" % (100.0 * e), x + w - 170, tops[1][0] - 12, 1, rgb=(90, 220, 255))
         self._text("PSI %+4.1f DEG" % math.degrees(psi), x + w - 84, tops[1][0] - 12, 1, rgb=(255, 170, 60))
         self._text("%+.2f M/S" % sim.speed, x + w - 60, tops[2][0] - 12, 1, rgb=(120, 255, 140))
-        self._text("FWD %.3f" % trk.gain.g[1], x + w - 196, tops[3][0] - 12, 1, rgb=(90, 150, 255))
-        self._text("REV %.3f" % trk.gain.g[-1], x + w - 132, tops[3][0] - 12, 1, rgb=(255, 110, 235))
-        self._text("MODEL %.3f" % EGO.kappa, x + w - 68, tops[3][0] - 12, 1, rgb=grey)
+        self._text("FWD %.3f" % trk.gain.g[1], x + w - 184, tops[3][0] - 12, 1, rgb=(90, 150, 255))
+        self._text("REV %.3f" % trk.gain.g[-1], x + w - 120, tops[3][0] - 12, 1, rgb=(255, 110, 235))
+        self._text("1/L %.3f" % g_ideal, x + w - 56, tops[3][0] - 12, 1, rgb=grey)
 
         free = sum(sl.status == Slot.FREE for sl in sim.slots)
         occ = sum(sl.status == Slot.OCCUPIED for sl in sim.slots)
         rows = ["LINE TRACKS %d (%d CONFIRMED)" % (len(sim.lines.tracks), len(sim.lines.confirmed())),
                 "STALLS %d: %d FREE, %d OCCUPIED" % (len(sim.slots), free, occ),
                 "CAR %.2f X %.2f M, WHEELBASE %.2f M" % (EGO.length, 2.0 * EGO.half_width, EGO.wheelbase),
+                "%.0f KG, STEERING +-%.1f DEG, BRAKES %.0f NM" % (EGO.mass, math.degrees(EGO.steer_max), EGO.brake_torque_max),
                 "MIN CLEARANCE SO FAR %.2f M" % (sim.min_clearance if sim.min_clearance < 1e9 else 0.0)]
         if info is not None:
             rows.append("PLAN MARGIN %.2f M, %d SEGMENTS" % (info["margin"], len(sim.path)))
