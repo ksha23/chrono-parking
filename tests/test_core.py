@@ -17,6 +17,8 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 from parking.control import LateralMPC
 from parking.draw import RAMP, resample
 from parking.geometry import footprint_hits, poly_distance, rect_poly, wrap
+from parking.ground import Ground
+from parking.localization import Localization
 from parking.mapping import GridMap, LineMap, LineTrack
 from parking.perception import _rot_y, paint_segments, pinhole_rays, planar_scan
 from parking.reeds_shepp import rs_length_table, rs_paths, rs_sample
@@ -409,6 +411,56 @@ def test_half_seen_stall():
     print("a half-seen stall in an angled lot: ok")
 
 
+def test_own_pose():
+    """What the car believes about its own pose, and the road it stands on."""
+    path = [(0.0, 0.0, 0.0)]                                             # 40 s at 1 m/s along a gentle curve
+    for k in range(399):
+        x, y, th = path[-1]
+        path.append((x + 0.1 * math.cos(th + 0.001), y + 0.1 * math.sin(th + 0.001), th + 0.002))
+    exact = Localization(path[0], np.random.default_rng(0), "gps", 0.0)
+    assert all(exact.update(q, 0.1 * k) == q for k, q in enumerate(path)) and exact.tilt is None
+    assert exact.as_believed([(0.1, (1.0, 2.0), np.zeros(3), np.zeros(3), np.zeros(3))], [(0, 0, 1, 1, 5.0, 0.1)])[1] == [(0, 0, 1, 1, 5.0, 0.1)]
+    err, step = [], []
+    for seed in range(40):
+        loc, last = Localization(path[0], np.random.default_rng(seed), "gps", 1.0), None
+        for k, q in enumerate(path):
+            e = np.array(loc.update(q, 0.1 * k)[:2]) - q[:2]
+            if last is not None:
+                step.append(np.hypot(*(e - last)))
+            err.append(np.hypot(*e))
+            last = e
+        assert abs(math.degrees(wrap(loc.pose[2] - path[-1][2]))) < 1.5 and max(abs(math.degrees(a)) for a in loc.tilt) < 1.0
+    # off by about 14 cm in all (10 cm per axis), never wildly, and smooth from one moment to the next
+    assert 0.08 < np.mean(err) < 0.20 and max(err) < 0.6 and max(step) < 0.02, (np.mean(err), max(err), max(step))
+    drift = []
+    for seed in range(40):           # dead reckoning: nothing at the start, and it grows
+        loc = Localization(path[0], np.random.default_rng(seed), "odometry", 1.0)
+        off = [np.hypot(*(np.array(loc.update(q, 0.1 * k)[:2]) - q[:2])) for k, q in enumerate(path)]
+        drift.append((off[0], off[100], off[-1]))
+    drift = np.array(drift).mean(axis=0)
+    assert drift[0] == 0.0 and 0.01 < drift[1] < 0.15 and drift[2] > 2.5 * drift[1], drift
+    # a sensor reading taken at the true pose lands where the car thinks it is: same place relative to the car
+    loc = Localization((3.0, 1.0, 0.5), np.random.default_rng(1), "gps", 3.0)
+    loc.update((3.0, 1.0, 0.5), 0.0)
+    scans, dets = loc.as_believed([(0.1, (3.0, 1.0), np.array([0.5]), np.array([2.0]), np.array([2.0]))], [(4.0, 1.0, 5.0, 1.0, 1.5, 0.1)])
+    assert np.allclose(scans[0][1], loc.pose[:2]) and abs(scans[0][2][0] - loc.pose[2]) < 1e-12
+    assert abs(math.hypot(dets[0][2] - dets[0][0], dets[0][3] - dets[0][1]) - 1.0) < 1e-9
+    assert abs(math.hypot(dets[0][0] - loc.pose[0], dets[0][1] - loc.pose[1]) - 1.0) < 1e-9
+
+    flat = Ground((0.0, -10.0, 30.0, 10.0))
+    assert flat.height(3.0, 4.0) == 0.0 and flat.slope(3.0, 4.0) == (0.0, 0.0)
+    g = Ground((0.0, -10.0, 30.0, 10.0), 0.015, seed=3)
+    x, y = np.meshgrid(np.arange(-20.0, 50.0, 0.37), np.arange(-30.0, 30.0, 0.37))
+    h = g.height(x, y)
+    assert abs(np.abs(h).max() - 0.015) < 0.002 and abs(h.mean()) < 0.004
+    gx, gy = np.gradient(h, 0.37, axis=1), np.gradient(h, 0.37, axis=0)
+    assert np.hypot(gx, gy).max() < 0.02, "slopes of at most 2 percent"            # waves of 6 m and longer
+    sx, sy = g.slope(10.0, 2.0)
+    assert abs(sx - (g.height(11.5, 2.0) - g.height(8.5, 2.0)) / 3.0) < 1e-12 and abs(sy) < 0.02
+    assert not np.array_equal(h, Ground((0.0, -10.0, 30.0, 10.0), 0.015, seed=4).height(x, y))
+    print("the car's own pose and the uneven road: ok")
+
+
 def test_surfaces():
     """The road surface images exist, are PNG files and have the reflectance of asphalt."""
     files = surface_textures()
@@ -437,5 +489,6 @@ if __name__ == "__main__":
     test_evidence_in_seconds()
     test_lines_in_pieces()
     test_half_seen_stall()
+    test_own_pose()
     test_surfaces()
     print("all checks passed")

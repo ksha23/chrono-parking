@@ -645,9 +645,19 @@ made of that data shows up in three more places:
 
 ## Limits
 
-- **The pose is exact.** The car knows where it is from the simulation. Odometry or visual
-  localization is not modelled, and every range and every line is placed with the true pose,
-  including the true pitch of the car under braking.
+- **By default the pose is exact, the road is a plane and all paint is equally good.** Then
+  every range and every line is placed with the true pose, including the true pitch of the car
+  under braking, which is the main reason the car ends up within a centimetre or two of the
+  stall's middle. Three switches take that away: `--pose-noise 1` (the car goes by a pose that
+  is off by a slowly wandering 10 cm and 0.3 degrees, as from a satellite receiver with an
+  inertial unit, and by a pitch and roll that are off by 0.15 degrees: `parking/localization.py`),
+  `--bumps 1.5` (the road rises and falls by up to 1.5 cm in waves 6 to 25 m long, and the car
+  takes it for the plane it stands on: `parking/ground.py`) and `--wear 1` (some lines are
+  faded, a few to barely lighter than the road). They are off by default because the set of
+  scenarios has not been run with them. Three runs with all of them on: a perpendicular stall
+  between two cars was parked 2 cm off centre, 13 cm deep and 0.6 degrees off (0.5 cm, 6 cm and
+  0.1 degrees without), an angled one 7 cm off centre, and in a parallel one the car drove past
+  the free stall without recognising it.
 - **One exposure, no auto-exposure.** See above. A camera would adapt when it drives into shade.
 - **The rear camera does not see kerbs**, and places cars only within 1.9 m. Backing into a
   stall relies on what the stereo pair mapped while driving past.

@@ -10,6 +10,7 @@ import numpy as np
 
 from .chrono_env import chrono, sens, veh
 from .config import STEP
+from .ground import Ground
 from .scenario import parked_model
 from .vehicle import EGO
 
@@ -107,14 +108,15 @@ def light_scene(scene, sky):
 
 
 class World:
-    def __init__(self, scn, visual=True, tire="tmeasy"):
-        self.scn = scn
+    def __init__(self, scn, visual=True, tire="tmeasy", wear=1.0, bumps=0.0):
+        self.scn, self.wear = scn, wear
+        self.ground = Ground(scn.bounds, bumps, getattr(scn, "seed", 0))
         x, y, th = scn.start
         sedan = veh.Sedan()
         sedan.SetContactMethod(chrono.ChContactMethod_SMC)
         sedan.SetChassisCollisionType(veh.CollisionType_HULLS)    # so that hitting a parked car is physical
         sedan.SetChassisFixed(False)
-        sedan.SetInitPosition(chrono.ChCoordsysd(chrono.ChVector3d(x, y, 0.25), chrono.QuatFromAngleZ(th)))
+        sedan.SetInitPosition(chrono.ChCoordsysd(chrono.ChVector3d(x, y, 0.25 + self.ground.height(x, y)), chrono.QuatFromAngleZ(th)))
         sedan.SetTireType(veh.TireModelType_PAC02 if tire == "pac02" else veh.TireModelType_TMEASY)
         sedan.SetTireStepSize(1e-3)
         sedan.SetBrakeType(veh.BrakeType_SHAFTS)     # the simple brake cannot hold the car still
@@ -137,9 +139,14 @@ class World:
         mat.SetRestitution(0.01)
         self.terrain = veh.RigidTerrain(self.system)
         x0, y0, x1, y1 = scn.bounds
-        patch = self.terrain.AddPatch(mat, chrono.ChCoordsysd(
-            chrono.ChVector3d(0.5 * (x0 + x1), 0.5 * (y0 + y1), 0.0), chrono.QUNIT),
-            (x1 - x0) + 60.0, (y1 - y0) + 60.0)
+        if self.ground.amp > 0.0:          # the road as a mesh over the heights, which Chrono reads from an image
+            image, low, high = self.ground.image(write_png)
+            patch = self.terrain.AddPatch(mat, chrono.ChCoordsysd(chrono.ChVector3d(*self.ground.center, 0.0), chrono.QUNIT),
+                                          image, *self.ground.size, low, high)
+        else:
+            patch = self.terrain.AddPatch(mat, chrono.ChCoordsysd(
+                chrono.ChVector3d(0.5 * (x0 + x1), 0.5 * (y0 + y1), 0.0), chrono.QUNIT),
+                (x1 - x0) + 60.0, (y1 - y0) + 60.0)
         patch.SetColor(chrono.ChColor(0.23, 0.23, 0.25))
         self.surfaces = surface_textures() if visual else {}
         if visual:
@@ -214,22 +221,36 @@ class World:
         body = chrono.ChBody()
         body.SetFixed(True)
         # Paint is laid down in half-metre pieces: each is worn to a different grey and a little
-        # narrower than new, and a few are gone
+        # narrower than new, and a few are gone. Some lines are worn more than the rest, as where
+        # cars have driven over them for years: one line in four is faded to between 55 and 85
+        # percent of its brightness and has lost one piece in ten, and one in twelve is down to
+        # between 40 and 55 percent, barely lighter than the road, with one piece in five gone.
         rng = np.random.default_rng(1000 + getattr(self.scn, "seed", 0))
+        old = np.random.default_rng(2000 + getattr(self.scn, "seed", 0))       # (its own stream: wear 0 is the paint as it was)
+        dip = self.ground.amp
         for x1, y1, x2, y2, color in self.scn.lines:
             length, yaw = math.hypot(x2 - x1, y2 - y1), math.atan2(y2 - y1, x2 - x1)
             n = max(1, int(round(length / 0.5)))
+            kind, fade, lost = old.random(), old.random(), old.random(n)
+            fade, lose = ((0.40 + 0.15 * fade, 0.20) if kind < 1.0 / 12.0 else
+                          (0.55 + 0.30 * fade, 0.10) if kind < 1.0 / 3.0 else (1.0, 0.0))
+            fade, lose = 1.0 - self.wear * (1.0 - fade), self.wear * lose
             for k in range(n):
                 v, wide, gone = rng.uniform(0.50, 0.80), 0.12 * rng.uniform(0.9, 1.0), rng.random() < 0.04
-                if gone:
+                v *= fade
+                if gone or lost[k] < lose:
                     continue
                 f = (k + 0.5) / n
-                self._box(body, length / n + 0.004, wide, 0.004, (x1 + f * (x2 - x1), y1 + f * (y2 - y1), 0.003), yaw,
+                px, py = x1 + f * (x2 - x1), y1 + f * (y2 - y1)
+                # (on an uneven road a piece lies on the surface under its middle, a little proud of it)
+                pz = 0.003 if dip == 0.0 else self.ground.height(px, py) + 0.005
+                self._box(body, length / n + 0.004, wide, 0.004, (px, py, pz), yaw,
                           (v, v, v) if color == "white" else (v, 0.80 * v, 0.10 * v))
+        # (kerbs and the ground beside the lot keep their tops and reach down below the lowest road)
         for cx, cy, lx, ly in self.scn.curbs:
-            self._box(body, lx, ly, 0.15, (cx, cy, 0.075), 0.0, (0.66, 0.66, 0.64), "concrete")
+            self._box(body, lx, ly, 0.15 + dip, (cx, cy, 0.075 - 0.5 * dip), 0.0, (0.66, 0.66, 0.64), "concrete")
         for cx, cy, lx, ly, rgb in self.scn.pads:
-            self._box(body, lx, ly, 0.14, (cx, cy, 0.07), 0.0, rgb, "grass" if rgb[1] > rgb[0] + 0.05 else "concrete")
+            self._box(body, lx, ly, 0.14 + dip, (cx, cy, 0.07 - 0.5 * dip), 0.0, rgb, "grass" if rgb[1] > rgb[0] + 0.05 else "concrete")
         self.system.Add(body)
 
     def _parked_cars(self, visual):
@@ -242,7 +263,7 @@ class World:
             c, s = math.cos(car["yaw"]), math.sin(car["yaw"])
             body = chrono.ChBody()
             body.SetFixed(True)
-            body.SetPos(chrono.ChVector3d(car["cx"] - mid * c, car["cy"] - mid * s, m["z"]))
+            body.SetPos(chrono.ChVector3d(car["cx"] - mid * c, car["cy"] - mid * s, m["z"] + self.ground.height(car["cx"], car["cy"])))
             body.SetRot(chrono.QuatFromAngleZ(car["yaw"]))
             hull = chrono.vector_ChVector3d()        # the body outline, from 0.1 m below to 1.1 m above the mesh origin
             for z in (-0.1, 1.1):

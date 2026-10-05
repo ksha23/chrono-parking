@@ -64,6 +64,9 @@ python parking_sim.py --headless --seed 7 --noise 2     # no window, prints a re
 | `--stereo-rows` | `TOP,BOTTOM`, for example `160,544` | give the stereo network only these rows of the 600 of an image, counted from the top: above is sky, below is the car's own bonnet. Default: all rows |
 | `--stereo-hz`, `--mono-hz` | per second, default 5 | how often the stereo network and the monocular network run, up to the 10 frames per second of the cameras. The maps add up time, not frames, so nothing is tuned to a rate: see [docs/sensors.md](docs/sensors.md#how-often-the-networks-run) |
 | `--sky` | `clear`, `low`, `overcast` | light for the sensors: sun at 41 degrees, sun at 32 degrees, or a grey sky. Default: by the seed |
+| `--pose-noise` | scale, default 0 | how well the car knows its own pose. At 1 its position is off by a slowly wandering 10 cm and its heading by 0.3 degrees, like a satellite receiver with an inertial unit, and its pitch and roll by 0.15 degrees. `--pose odometry` gives dead reckoning instead, which drifts. 0 = it knows the truth |
+| `--bumps` | cm, default 0 | how uneven the road is: up to this much up and down, in waves 6 to 25 m long. Try 1.5 |
+| `--wear` | scale, default 0 | worn paint: at 1, one line in four is faded and one in twelve is barely lighter than the road |
 | `--depth-host` | ssh host | run the depth networks on another machine, see [docs/sensors.md](docs/sensors.md#what-it-needs) |
 | `--type` | `perpendicular`, `angled`, `parallel` | kind of stalls |
 | `--cars` | `both`, `left`, `right`, `none`, `random` | parked cars next to the free stall, seen from the lane looking into it |

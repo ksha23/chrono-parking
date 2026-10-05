@@ -13,6 +13,7 @@ from .config import A_BRAKE, CONTROL_DT, PERCEPTION_DT, STEER_RATE, STEP, V_SEAR
 from .control import MpcTracker
 from .geometry import ego_poly, footprint_hits, poly_distance, wrap
 from .mapping import GridMap, LineMap
+from .localization import Localization
 from .perception import Perception
 from .planner import CSpace, Planner, Segment, holonomic_distance, split_segments
 from .scenario import make_scenario
@@ -55,7 +56,8 @@ class ParkingSim:
         self.scn = make_scenario(args.type, args.cars, args.side, args.angle, args.seed)
         rng = np.random.default_rng(args.seed + 7919)
         rig = args.sensors != "sim"
-        self.world = World(self.scn, visual=rig or not args.headless, tire=args.tire)   # sensors render the visual assets
+        self.world = World(self.scn, visual=rig or not args.headless, tire=args.tire, wear=args.wear,
+                           bumps=0.01 * args.bumps)        # (sensors render the visual assets)
         self.sensor = SensorRig(self.world, args.sensors, args.noise, rng, start_depth_worker(args), args.sky,
                                 args.stereo_hz, args.mono_hz, args.stereo_rows) if rig else \
             Perception(self.scn, args.noise, rng)
@@ -88,7 +90,10 @@ class ParkingSim:
         self.min_clearance = float("inf")
         self.gear_changes = 0
         self.result = None
-        self.pose, self.speed = self.world.state()
+        # The car goes by where it thinks it is (pose). Where it really is (true_pose) is for the score.
+        self.true_pose, self.speed = self.world.state()
+        self.odo = Localization(self.true_pose, np.random.default_rng(args.seed + 4441), args.pose, args.pose_noise)
+        self.pose = self.odo.pose
         self.travel_dir = np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
         self.park_dir = self.travel_dir          # which way a parallel-parked car should face
         car = self.world.car
@@ -126,14 +131,18 @@ class ParkingSim:
             if self.state == "PLAN":
                 break
             if self.steps % int(round(PERCEPTION_DT / STEP)) == 0:
-                self.pose, self.speed = self.world.state()
+                self._locate()
                 self._perceive()
             if self.steps % int(round(CONTROL_DT / STEP)) == 0:
-                self.pose, self.speed = self.world.state()
+                self._locate()
                 self._control()
             self.world.step(*self.cmd)
             self.steps += 1
         return True
+
+    def _locate(self):
+        self.true_pose, v = self.world.state()
+        self.pose, self.speed = self.odo.update(self.true_pose, self.time), self.odo.speed(v)
 
     def _follow(self, seg, presteer=True):
         self.tracker.start(seg, self.time, presteer)
@@ -181,7 +190,10 @@ class ParkingSim:
             self.cmd = (self.tracker.delta, 0.0, EGO.torque(A_BRAKE))
 
     def _perceive(self):
-        scans, dets = self.sensor.sense(self.pose)
+        if isinstance(self.sensor, SensorRig):
+            scans, dets = self.sensor.sense(self.pose, self.odo.tilt)
+        else:      # (the stand-in works out what a sensor at the true pose would give)
+            scans, dets = self.odo.as_believed(*self.sensor.sense(self.true_pose))
         hits = [np.zeros((0, 2))]
         for dt, origin, ang, r_hit, r_free, *more in scans:
             self.grid.update(origin, ang, r_hit, r_free, *more, dt=dt)
@@ -199,7 +211,7 @@ class ParkingSim:
         rig = isinstance(self.sensor, SensorRig)
         self.slots = find_slots(self.lines.markers() if rig else self.lines.confirmed(), self.trail, self.grid, rig)
 
-        ego = ego_poly(self.pose)
+        ego = ego_poly(self.true_pose)
         ctr = ego.mean(axis=0)
         for poly in self.obstacles:
             if np.hypot(*(poly.mean(axis=0) - ctr)) < np.ptp(poly, axis=0).max() + 6.0:
@@ -604,10 +616,11 @@ class ParkingSim:
             return
         self._finish(True, "parked")
 
-    def _pose_error(self, ref):
-        dx, dy = self.pose[0] - ref[0], self.pose[1] - ref[1]
+    def _pose_error(self, ref, pose=None):
+        pose = self.pose if pose is None else pose
+        dx, dy = pose[0] - ref[0], pose[1] - ref[1]
         c, s = math.cos(ref[2]), math.sin(ref[2])
-        return dx * c + dy * s, -dx * s + dy * c, wrap(self.pose[2] - ref[2])
+        return dx * c + dy * s, -dx * s + dy * c, wrap(pose[2] - ref[2])
 
     def _finish(self, ok, text):
         self.state = "PARKED" if ok else "FAILED"
@@ -616,22 +629,24 @@ class ParkingSim:
                    replans=self.replans, corrections=self.corrections, min_clearance=self.min_clearance)
         if ok and self.manual is not None and self.target is None:
             lon, lat, dth = self._pose_error((self.manual[0] - EGO.center * math.cos(self.manual[2]),
-                                              self.manual[1] - EGO.center * math.sin(self.manual[2]), self.manual[2]))
+                                              self.manual[1] - EGO.center * math.sin(self.manual[2]), self.manual[2]),
+                                             self.true_pose)
             res.update(kind="manual", lateral=lat, depth=lon, heading_deg=math.degrees(abs(dth)))
             res["ok"] = bool(self.min_clearance > 0.0 and math.hypot(lon, lat) < 0.5)
         elif ok:
-            # score against the ground-truth stall the car ended up in
-            c = np.array(self.pose[:2]) + EGO.center * np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
+            # score against the ground-truth stall the car ended up in, with the pose it really has
+            true = self.true_pose
+            c = np.array(true[:2]) + EGO.center * np.array([math.cos(true[2]), math.sin(true[2])])
             stall = min(self.scn.stalls, key=lambda s: np.hypot(*(s["center"] - c)))
             u = stall["u_in"]
             nu = np.array([-u[1], u[0]])
             axis = math.atan2(u[1], u[0]) + (0.5 * math.pi if stall["kind"] == "parallel" else 0.0)
-            head = wrap(self.pose[2] - axis)
+            head = wrap(true[2] - axis)
             head = min(abs(head), abs(wrap(head - math.pi)))
             poly = stall["corners"]
             e = np.roll(poly, -1, axis=0) - poly
             cr = lambda p: e[:, 0] * (p[1] - poly[:, 1]) - e[:, 1] * (p[0] - poly[:, 0])
-            inside = all(np.all(cr(p) >= -0.02) or np.all(cr(p) <= 0.02) for p in ego_poly(self.pose))
+            inside = all(np.all(cr(p) >= -0.02) or np.all(cr(p) <= 0.02) for p in ego_poly(true))
             res.update(kind=stall["kind"], gt_occupied=stall["occupied"], inside_lines=bool(inside),
                        lateral=float((c - stall["center"]) @ (u if stall["kind"] == "parallel" else nu)),
                        depth=float((c - stall["center"]) @ (nu if stall["kind"] == "parallel" else u)),

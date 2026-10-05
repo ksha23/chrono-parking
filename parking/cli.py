@@ -8,6 +8,7 @@ import sys
 
 from .agent import ParkingSim
 from .chrono_env import HAVE_SENSORS, rerun_with_own_build, sens
+from .localization import Localization
 from .sensors import SensorRig, find_depth_python
 from .world import SKIES
 
@@ -70,6 +71,21 @@ def parse_args(argv=None):
     ap.add_argument("--igev", default=None, metavar="DIR",
                     help="checkout of the IGEV++ repository with its weights (default: third_party/IGEV-plusplus)")
     ap.add_argument("--noise", type=float, default=1.0, help="perception noise scale (0 = perfect)")
+    # The next four make the world less kind. They are off by default until the whole set of
+    # scenarios has been run with them: the results in the docs were measured without.
+    ap.add_argument("--wear", type=float, default=0.0,
+                    help="how worn the paint is: at 1, one line in four is faded and one in twelve is barely "
+                         "lighter than the road. 0 (default) = every line as good as the next")
+    ap.add_argument("--bumps", type=float, default=0.0, metavar="CM",
+                    help="how uneven the road is: it rises and falls by up to this much, in waves 6 to 25 m long "
+                         "(try 1.5). 0 (default) = a perfect plane")
+    ap.add_argument("--pose", choices=Localization.SOURCES, default="gps",
+                    help="where the car gets its own pose from: a satellite receiver with an inertial unit, "
+                         "whose error wanders slowly, or dead reckoning from wheel speed and yaw rate, "
+                         "whose error grows as it drives")
+    ap.add_argument("--pose-noise", type=float, default=0.0,
+                    help="scale of the errors of that pose (at 1: 10 cm and 0.3 degrees with gps) and of the pitch "
+                         "and roll the car assumes (0.15 degrees). 0 (default) = it knows its true pose")
     ap.add_argument("--seed", type=int, default=1, help="random seed (layout details and noise)")
     ap.add_argument("--tour", action="store_true", help="play through a set of scenarios one after another")
     ap.add_argument("--headless", action="store_true", help="no window, run as fast as possible")

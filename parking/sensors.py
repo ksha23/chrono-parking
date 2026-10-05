@@ -191,6 +191,7 @@ class SensorRig:
         self.mono_every = max(1, int(round(1.0 / (mono_hz * PERCEPTION_DT))))
         self.name = "Chrono::Sensor " + mode.replace("+", " + ")
         self.body = world.car.GetChassisBody()
+        self.ground = world.ground
         self.system = world.system
         # the car's outline in the chassis frame: its own body shows up in every sensor
         mid = -EGO.ref_to_rear
@@ -266,6 +267,26 @@ class SensorRig:
         ax, ay, az = R.GetAxisX(), R.GetAxisY(), R.GetAxisZ()
         return np.array([p.x, p.y, p.z]), np.array([[ax.x, ay.x, az.x], [ax.y, ay.y, az.y], [ax.z, ay.z, az.z]])
 
+    def _believed_frame(self, pose, tilt):
+        """The chassis frame as the car believes it to be: position and heading from its own
+        estimate, pitch and roll off by `tilt`. The car takes the road to be a plane and itself
+        to stand on it: it knows its height above the road under it and how it leans relative
+        to that road, not how the road itself lies. On an uneven road the ground further away
+        is then not where the car expects it."""
+        p, R = self._frame()
+        sx, sy = self.ground.slope(p[0], p[1])
+        n = np.array([-sx, -sy, 1.0]) / math.sqrt(sx * sx + sy * sy + 1.0)       # the road's normal under the car
+        k = np.array([-n[1], n[0], 0.0])                                         # tips the vertical onto it
+        K = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
+        lie = np.eye(3) + K + K @ K / (1.0 + n[2])
+        R = lie.T @ R                                                            # how the car leans relative to the road
+        turn = pose[2] - math.atan2(R[1, 0], R[0, 0])
+        c, s = math.cos(tilt[1]), math.sin(tilt[1])
+        roll = np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+        return (np.array([pose[0] + EGO.ref_to_rear * math.cos(pose[2]), pose[1] + EGO.ref_to_rear * math.sin(pose[2]),
+                          p[2] - self.ground.height(p[0], p[1])]),
+                _rot_z(turn) @ R @ _rot_y(tilt[0]) @ roll)
+
     def _develop(self, cam, rgba):
         """What a camera delivers for a rendered frame: its own exposure and the noise of its
         sensor, different in every camera and every frame."""
@@ -276,11 +297,14 @@ class SensorRig:
         n = np.roll(n, (int(self.rng.integers(self.CAM_H)), int(self.rng.integers(self.CAM_W))), axis=(0, 1))
         return np.clip(img * np.float32(cam["gain"]) + n * self.sigma[img] + 0.5, 0.0, 255.0).astype(np.uint8)
 
-    def sense(self, pose):
+    def sense(self, pose, tilt=None):
         """Render the sensors for the current state of the simulation and process what they give.
-        Returns (scans, line detections)."""
+        Returns (scans, line detections). pose is where the car thinks its rear axle is, and tilt
+        the error of the pitch and roll it assumes (None: it knows all of that exactly). What the
+        sensors show is put into the map with those, not with the truth."""
         t = round(self.system.GetChTime(), 4)
-        ref_p, ref_R = self.frames[t] = self._frame()
+        exact = tilt is None and self.ground.amp == 0.0
+        ref_p, ref_R = self.frames[t] = self._frame() if exact else self._believed_frame(pose, tilt or (0.0, 0.0))
         while len(self.frames) > 12:
             self.frames.popitem(last=False)
         self.tick += 1
