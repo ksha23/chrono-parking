@@ -1,158 +1,275 @@
-# Sensors: perception from Chrono::Sensor
+# Sensors: perception from camera images
 
-With `--sensors camera`, `camera+lidar` or `camera+radar` the car perceives through sensors that
-Chrono::Sensor ray traces in the scene. Nothing is read from the scenario: the painted lines come
-out of a colour image, the obstacles and the free ground out of a depth image, a lidar scan or
-radar returns. Code: `SensorRig`, `planar_scan`, `paint_segments`, and the parts of `GridMap`,
+With `--sensors camera` or `camera+lidar` the car perceives through sensors that Chrono::Sensor
+ray traces in the scene. Nothing is read from the scenario, and nothing is read from the renderer
+except what a real sensor would deliver: colour images, and lidar returns. In particular there is
+no depth camera. Range is computed from the images by neural networks. Code: `SensorRig`,
+`DepthWorker`, `stereo_worker.py`, `planar_scan`, `paint_segments`, and the parts of `GridMap`,
 `LineTrack` and `find_slots` that exist because a camera does not see everything.
 
 | `--sensors` | The car has | Lines from | Obstacles and free ground from |
 | --- | --- | --- | --- |
-| `camera` | a stereo camera looking forward and one looking back | colour images | depth images |
-| `camera+lidar` | the same, plus a 16 channel lidar above the roof | colour images | depth images and the lidar |
-| `camera+radar` | the same, plus a radar on each side | colour images | depth images and the radars |
+| `camera` | a stereo pair behind the windshield, a camera at the tail, a camera on the front bumper | the images | depth computed from the images |
+| `camera+lidar` | the same, plus a forward-facing lidar on the roof | the images | the same, and the lidar |
 | `sim` | no sensor | computed from the scenario | computed from the scenario |
 
 `sim` is the stand-in described in [perception-and-mapping.md](perception-and-mapping.md). The
-default is `camera` when the PyChrono in use has the ray-traced sensors, and `sim` otherwise.
+default is `camera` when the PyChrono in use has the ray-traced sensors and the depth networks
+are set up, and `sim` otherwise.
 
-There is no camera to the sides. What is beside the car is known from what a camera saw before
-the car got there, or from the lidar or the radars. Most of this document is about what follows
+Nothing looks sideways, and only the front has two cameras. What is beside the car is known from
+what the stereo pair saw before the car got there. Most of this document is about what follows
 from that.
 
 ![Where the sensors sit and what they cover](img/sensor_rig.png)
 
 ## What it needs
 
-**A PyChrono with ray-traced sensors.** Chrono::Sensor renders cameras, lidar and radar with one
-of three backends: OptiX (NVIDIA), Vulkan RT, or Metal RT (Apple). At the time of writing
-(Chrono main at `c6acd4e`), the Python bindings wrap these sensors only when Chrono is built with
-OptiX. With Vulkan RT or Metal RT the C++ library has them, but `pychrono.sensor` contains only
-the GPS and IMU sensors. The conda package for macOS is built without the sensor module.
+**A PyChrono with ray-traced sensors.** Chrono::Sensor renders cameras and lidar with one of
+three backends: OptiX (NVIDIA), Vulkan RT, or Metal RT (Apple). At the time of writing (Chrono
+main at `c6acd4e`), the Python bindings wrap these sensors only when Chrono is built with OptiX.
+With Vulkan RT or Metal RT the C++ library has them, but `pychrono.sensor` contains only the GPS
+and IMU sensors. The conda package for macOS is built without the sensor module.
 
 [pychrono-rt-sensors.patch](pychrono-rt-sensors.patch) changes the bindings so that the same
 classes are wrapped for Vulkan RT and Metal RT. It touches only the SWIG interface files and
-their CMake flags, applies to Chrono main at `c6acd4e`, and was tested with Metal RT, and with
-Vulkan RT in its CPU fallback:
+their CMake flags and applies to Chrono main at `c6acd4e`:
 
 ```
 cd chrono && git apply /path/to/chrono-parking/docs/pychrono-rt-sensors.patch
 cmake -S . -B build -DCH_ENABLE_MODULE_VEHICLE=ON -DCH_ENABLE_MODULE_IRRLICHT=ON \
       -DCH_ENABLE_MODULE_SENSOR=ON -DCH_ENABLE_MODULE_PYTHON=ON ...
 cmake --build build
-PYTHONPATH=build/bin python parking_sim.py --sensors camera
 ```
 
-On Linux with an NVIDIA card, a Chrono built with OptiX needs no patch.
+Everything on this page was developed and tested with **Metal RT**. The scene uses features that
+the other backends may render differently (textures without mip-maps, glass as plain
+transparency, the exposure and vignette settings of the scene), so expect to retune the light on
+OptiX or Vulkan RT.
 
-**Memory and time.** With the ray-traced scene of the perpendicular lot (14 parked cars, 665,000
-triangles) the process holds 3.5 GB with the four camera streams, 4.1 GB with the lidar, 4.7 GB
-with the radars. That is allocated once and does not grow. Rendering all streams takes about
-20 ms per perception tick and processing them 25 ms, so a run takes about as long as the time it
-simulates. The stand-in perception needs 0.2 GB and runs four times faster than real time.
+**The depth networks.** They run in a process of their own, `stereo_worker.py`, with a Python
+that has PyTorch:
+
+```
+conda create -n parking-stereo python=3.12
+conda run -n parking-stereo pip install torch timm transformers scipy gdown
+
+git clone https://github.com/gangweiX/IGEV-plusplus third_party/IGEV-plusplus
+cd third_party/IGEV-plusplus
+gdown --folder https://drive.google.com/drive/folders/1eubNsu03MlhUfTtrbtN7bfAsl39s2ywJ -O pretrained_models
+
+python stereo_worker.py --check      # with that Python: runs both networks once and prints the time
+```
+
+`parking_sim.py` finds a Python that has `torch`, `timm` and `transformers` among the conda
+environments by itself, or takes the one named with `--depth-python`. `--igev DIR` points at an
+IGEV++ checkout somewhere else. The monocular model is fetched from the Hugging Face hub the
+first time it is used.
+
+It is a separate process for two reasons. The Python that has PyChrono usually has no PyTorch.
+And on macOS the two bring their own OpenMP runtimes, which abort when loaded into one process.
+
+**Memory and time.** Measured on an Apple M4 Pro with 48 GB:
+
+| | Value |
+| --- | --- |
+| simulation process | 4.1 GB with the four cameras, 4.8 GB with the lidar |
+| network process | 1.1 GB, and 3.4 GB on the GPU |
+| rendering four cameras at 960 x 600, 4 rays per pixel | 130 ms per perception tick |
+| IGEV++ on one pair | 0.9 s, run every fourth tick |
+| RT-IGEV++ on one pair (`--stereo rt`) | 0.28 s |
+| Depth Anything V2 Small on two images | 0.11 s, run every fourth tick |
+| a run that simulates 40 s | 3 to 4 minutes |
+
+The stand-in perception needs 0.2 GB and runs four times faster than real time. The sensor rig
+runs at about a fifth of real time: per simulated second, 2.6 s for the networks and 1.3 s for
+rendering the cameras.
+
+## The scene the cameras see
+
+A stereo matcher has nothing to match on a road of one flat colour, and a line detector that only
+ever sees white paint on clean grey under shadowless light has an easy job. So the scene is not
+clean:
+
+- **Road.** Asphalt with grain, blotches, light stones, sealed cracks and oil stains, from
+  band-limited noise generated once into a 1024 x 1024 image that repeats every 6 m. Its
+  reflectance is 0.16 on average. Kerbs are concrete and the ground beside the lot is grass, both
+  textured the same way.
+- **Paint.** Every line is laid down in half-metre pieces. Each piece is worn to a reflectance
+  between 0.5 and 0.8 and is up to 10 percent narrower than new, and 4 percent of them are gone.
+- **Light.** A directional sun and a much weaker ambient term, so parked cars cast hard shadows
+  across the stall lines. The sky is one of the HDR images that ship with Chrono, and the sun
+  stands where that image has it. `--sky` picks one of three, and without it the seed does:
+
+| `--sky` | Sun | Shade against sun, on the road |
+| --- | --- | --- |
+| `clear` | 41 degrees up | about 1 to 5 |
+| `low` | 32 degrees up, longer shadows | about 1 to 4 |
+| `overcast` | weak, most light from the sky | about 1 to 1.4 |
+
+- **Exposure.** One fixed exposure per run, set so that sunlit asphalt comes out at 120 of 255,
+  as a camera's auto-exposure would settle on a road. The backend has no auto-exposure, so shade
+  is dark and a white car in a low sun burns out. The corners of the image are a quarter darker
+  than the middle.
+
+What the scene does not have: reflections on paint and glass, wet road, motion blur, lens flare,
+or anything moving.
 
 ## The rig
 
-Every mounting point is derived from the car model, like the rest of the car's geometry. The
-roof is taken from the convex hull the chassis collides with: its height, and where it starts and
-ends.
+Every mounting point is read from the car model, like the rest of the car's geometry. The body
+mesh says where the glass is (the materials that are see-through), where the tail ends and where
+the nose is.
 
-| Sensor | Where | What |
+| Sensor | Where | Above the road | What |
+| --- | --- | --- | --- |
+| stereo pair | behind the windshield, 20 cm below its top edge and 4.5 cm inside the glass, 30 cm apart | 1.45 m | two cameras, level, looking forward |
+| rear camera | at the top of the tail | 1.11 m | one camera, pitched 25 degrees down, looking back |
+| bumper camera | on the nose | 0.72 m | one camera, pitched 5 degrees down, looking forward |
+| lidar (optional) | on the roof above the windshield | 1.67 m | 480 x 32 beams over 120 degrees, 20 degrees down to 5 up |
+
+**The cameras** are all the same: a Stereolabs ZED X One GS with the 2.2 mm lens, in its binned
+960 x 600 mode. The sensor has 1920 x 1200 pixels of 3 micron, so a binned pixel is 6 micron and
+the focal length is 2.2 mm / 6 micron = 367 pixels. Rendered as a pinhole camera, that is a field
+of view of 105 x 79 degrees. The data sheet says 110 x 80 for the lens, which includes its
+distortion. What is rendered here is the image after rectification. Each pixel is the average of
+four rays, like the four sensor pixels that are binned.
+
+At the full resolution the focal length in pixels is twice as large, so the same disparity error
+is half the depth error. A stereo pair then costs 4.7 s and 12 GB instead of 0.9 s.
+
+**What each camera adds to the rendered frame**, differently in every camera and every frame:
+
+| | Model | At `--noise 1` |
 | --- | --- | --- |
-| front stereo camera | 10 cm ahead of the roof, 5 cm above it, pitched 10 degrees down | 960 x 540 colour, 480 x 270 depth, 120 degrees wide |
-| rear stereo camera | 10 cm behind the roof, same height and pitch, looking back | the same |
-| lidar | on a mast 35 cm above the middle of the roof | 720 x 16 beams, 360 degrees, 25 degrees down to 5 up |
-| radars | on each side of the body, mid length, 0.45 m up, looking sideways | 96 x 6 beams over 130 x 9 degrees each |
+| sensor noise | shot noise and read noise in linear light, then the gamma curve | signal to noise 40 at mid grey: 1.2 to 1.8 counts of 255 |
+| exposure | each camera has its own gain | 3 percent apart |
+| stereo calibration | the right camera is turned by an angle the processing does not know | 0.015 degrees in yaw and in pitch |
 
-A stereo camera is modelled as a colour camera and a depth camera in the same place. Chrono's
-depth camera returns the exact range along each pixel's ray. The error of real stereo depth is
-added in processing (see below). Running a stereo matcher on two rendered images would be the
-alternative. On the untextured road surface of this scene it would return mostly holes.
+The yaw error is the one that matters: 0.015 degrees is a tenth of a pixel of disparity, which at
+10 m is 9 cm of depth.
 
-The cameras sit on the roof, so the bonnet and the boot are in the picture. The first ground the
-front camera sees is 2.6 m ahead of the bumper, the rear one 2.9 m behind it. The lidar is on a
-mast because from roof height its lower beams would hit the roof.
+**What the windshield and the bonnet do.** The pair looks through the glass, which the renderer
+treats as a tinted pane: 80 percent of the light passes per layer of glass. The bonnet hides everything more than
+16 degrees below level, so the first road the pair sees is 3.2 m ahead of the bumper. That strip
+is what the bumper camera is for: it sees the road from 0.7 m. The rear camera sees it from
+0.5 m. The lidar's lowest beam reaches the road 2.4 m ahead of the bumper.
 
-**Timing.** The sensors are rendered once per perception tick (10 Hz), with no lag and no motion
-blur. Every buffer carries the time it was rendered at. The chassis frame of that instant is
-kept, with its roll and pitch, and all geometry below uses that frame. Braking pitches the car by
-about a degree, which moves the ground intersection of a pixel 10 m away by more than a metre.
+**Timing.** The cameras are rendered once per perception tick (10 Hz). Every frame carries the
+time it was rendered at, and the chassis frame of that instant is kept, with its roll and pitch.
+The networks do not run on every frame, and their answer is not there at once: a stereo result is
+used two ticks (0.2 s) after its images were taken, a monocular one after one tick, both with the
+pose the car had when the images were taken. The simulation waits for a result when it is due,
+so a run does not depend on how fast the machine is.
 
-## From sensor data to the map
+## From images to the map
 
 ```mermaid
 flowchart TB
-    subgraph Camera["each stereo camera"]
-        D["depth image"] --> P3["3D point per pixel"]
-        P3 --> CL["ground / obstacle / unclear<br/>by height, with the depth error"]
-        CL --> SC["planar scan<br/>nearest obstacle and free range per bearing"]
-        RGB["colour image"] --> BR["pixels brighter than the road"]
-        BR --> IPM["ray onto the ground plane"]
-        IPM --> ST["narrow stripe?<br/>ground in the depth image?<br/>not behind something?"]
-        CL --> ST
-        ST --> HG["Hough vote + least squares<br/>line segments"]
+    subgraph Front["stereo pair"]
+        L["left image"] --> IG["IGEV++<br/>disparity"]
+        R["right image"] --> IG
+        IG --> DZ["range per pixel<br/>depth edges and the left rim dropped"]
     end
-    L["lidar ranges"] --> SCL["planar scan"]
-    R["radar ranges"] --> SCR["planar scan<br/>free only up to a return"]
+    subgraph Single["rear camera, bumper camera"]
+        M["image"] --> DA["Depth Anything V2<br/>inverse depth, no scale"]
+        DA --> AN["scale and offset fitted<br/>to the ground the camera must see"]
+    end
+    DZ --> P3["3D point per pixel"]
+    AN --> P3
+    P3 --> CL["ground / obstacle / unclear<br/>by height, with the range error"]
+    CL --> SC["planar scan<br/>nearest obstacle and free range per bearing"]
+    L --> BEV["image laid out on the ground<br/>5 cm cells, linear light"]
+    M --> BEV
+    BEV --> RG["lighter than the ground<br/>20 cm to both sides?"]
+    CL --> RG
+    RG --> HG["Hough vote + least squares<br/>line segments from solid pieces"]
+    LI["lidar ranges"] --> SCL["planar scan"]
     SC --> G["GridMap"]
     SCL --> G
-    SCR --> G
     HG --> LM["LineMap"]
 ```
 
 Both kinds of output are what the stand-in perception also produces: planar scans and line
 segments. Everything after `SensorRig.sense` is shared.
 
-![One camera frame](img/camera_frame.png)
+![One moment: what each camera delivers and what is made of it](img/camera_frame.png)
 
-### Pixel rays
+### Range from the stereo pair
 
-The cameras are pinhole cameras. For an image `W` pixels wide with horizontal field of view
-`alpha`, the focal length in pixels and the ray of pixel `(u, v)` in the camera frame (x forward,
-y left, z up) are
-
-```math
-f = \frac{W/2}{\tan(\alpha/2)}, \qquad
-d(u, v) \propto \begin{pmatrix} f \\ -(u + \tfrac12 - \tfrac{W}{2}) \\ \;\;v + \tfrac12 - \tfrac{H}{2} \end{pmatrix}
-```
-
-Chrono image buffers start at the bottom-left pixel, so `v` counts upward. The depth image holds
-the range along that ray, not the distance along the optical axis. Both facts were checked
-against the depth image itself: with this model the ground plane is reproduced to the last digit
-that the buffer holds.
-
-### Stereo depth error
-
-Stereo depth comes from a disparity, and a fixed disparity error is a range error that grows with
-the square of the range. The measured range of a pixel is
+The two images go to IGEV++ (Xu et al., 2024), a stereo network that builds cost volumes over
+several disparity ranges and refines the disparity iteratively. It runs with the weights its
+authors trained for the Middlebury benchmark on a mix of data sets, which did best on this scene
+among the published ones, and with 8 refinement iterations. Nothing was trained or tuned on this
+scene. From the disparity `d` of a pixel of the left image,
 
 ```math
-\hat r = r\,(1 + s) + n(u, v)\,\sigma_r(r), \qquad \sigma_r(r) = 0.003\,k\,r^2, \qquad s \sim \mathcal N(0,\; 0.004\,k)
+Z = \frac{f B}{d}, \qquad r = \frac{Z}{\hat{d}_x}, \qquad
+\sigma_r \approx \frac{r^2}{f B}\,\sigma_d
 ```
 
-That is 7.5 cm at 5 m and 30 cm at 10 m, which is what a wide stereo camera with a 12 cm baseline
-delivers. `k` is `--noise`. `n` is unit noise that is smooth over the image (independent values
-on a grid of 8 pixels, interpolated in between), because the error of a stereo matcher is. Noise
-that is independent per pixel could simply be averaged away, and the processing would look better
-than it is. `s` is a scale error common to the whole frame.
+with `f` = 367 pixels, `B` = 0.30 m, `Z` the depth along the optical axis, `r` the range along
+the pixel's ray with unit direction `d_hat`, and `sigma_d` the disparity error. The processing
+works at half the image size, on the mean disparity of each 2 x 2 block.
+
+Two kinds of pixel are dropped, because a matcher's answer there is not a measurement:
+
+- **Depth edges.** Where the disparity jumps by more than 1 pixel plus 10 percent between
+  neighbours. A network puts pixels between the near and the far surface there.
+- **The left rim.** A pixel `u` columns from the left edge with a disparity above `u` is not in
+  the right image at all.
+
+Anything further than 30 m, and the sky, is reported at 30 m and plays no part.
+
+### Range from a single camera
+
+The rear and the bumper camera have no partner. Their images go to Depth Anything V2 Small, a
+network that estimates depth from one image. What it returns is relative inverse depth: right in
+its ordering and its proportions, but without scale and without offset. Both are fixed with the
+one thing the car knows for certain about the view, which is where the ground is:
+
+```math
+\frac{1}{Z_g(u, v)} \approx a\,q(u, v) + b
+```
+
+`q` is the network's output and `Z_g` the depth at which the pixel's ray meets the road, from the
+camera's height and attitude. `a` and `b` are fitted by least squares, first on the bottom
+quarter of the image, then three more times on the pixels that the previous fit put within 6
+percent of the ground. If fewer than 1500 pixels agree, or the slope comes out negative, the
+frame is not used.
+
+This gives the range of a parked car to a few centimetres at 1 to 2 m and to 10 to 20 cm at 3 m
+(see the measurements below). It does not see a kerb. A 15 cm step in the ground is far below
+what a network resolves from one image, and the anchoring to the ground pulls it flat. So a
+single camera is used for less than the pair:
+
+| | Stereo pair | Single camera |
+| --- | --- | --- |
+| range error assumed | `0.25 px` of disparity: 2.3 mm at 1 m, growing with the square of the range | 2 cm plus 7 percent of the range |
+| obstacles into the map up to | 8.1 m | 1.9 m |
+| ground counted as seen free up to | 8.1 m | never |
+| ground counted as probably free up to | 12 m | 3 m |
+| painted lines up to | 11 m | 5 m (rear), 3.5 m (bumper) |
+| shortest line segment | 0.35 m | 0.6 m |
+
+The limits follow from one rule, the same for both: an obstacle goes into the map only from as
+far as it can be placed to 15 cm, and ground counts as free only from as far as it can be told
+from a kerb, which needs the height of a point to 4 cm. A single camera never meets the second.
 
 ### Ground, obstacle, or unclear
 
-Each depth pixel gives a point in the world. The points on the car's own body are dropped: any
-point inside the car's outline plus 15 cm. The height `z` of the others decides:
+Each pixel with a range gives a point in the world. The points on the car's own body are dropped:
+any point inside the car's outline plus 15 cm. The height `z` of the others decides:
 
 ```math
 \text{ground: } |z| < 0.05 + 1.25\,\sigma_z, \qquad
 \text{obstacle: } 0.08 + 2.5\,\sigma_z < z < 2.3, \qquad
-\sigma_z = \sigma_r \,|d_z|
+\sigma_z = \sigma_r \,|\hat{d}_z|
 ```
 
 `sigma_z` is the height error that the range error causes, small for a ray that looks nearly
 level. A point that is neither is **unclear**: it is not ground, and it is not certain that it
-stands up. A kerb is 15 cm high. Up close it is an obstacle. From 8 m, where the height of a
-point is known to 4 cm, it is unclear.
-
-The three classes have different consequences, and this is the centre of the design:
+stands up. A kerb is 15 cm high. Up close the pair sees it as an obstacle. From 8 m it is unclear.
 
 | A point that is | ends the free part of its ray | puts an obstacle into the map |
 | --- | --- | --- |
@@ -162,105 +279,113 @@ The three classes have different consequences, and this is the centre of the des
 
 ### The planar scan
 
-The classified points are collapsed into a scan around the camera: 240 bearings, half a degree
+The classified points are collapsed into a scan around the camera, with bearings half a degree
 apart. Per bearing,
 
 - `r_hit` is the range of the nearest obstacle point that has company: at least three points
-  within the next 0.3 m. A stray pixel does not make an obstacle. The value is the range of that
-  first point itself. An earlier version took a quantile of all obstacle points on the bearing.
-  On a kerb with a pavement behind it, that lands somewhere on the pavement, and the car parked
-  10 to 15 cm too close to the kerb.
+  within the next 0.3 m. A stray pixel does not make an obstacle.
 - `r_stop` is the same for points that are not ground.
 - `r_free` is the range of the farthest ground point, cut 15 cm before `r_stop`.
 
 A line of sight proves more than the ground where it ends: everything it passes over is free of
 things as tall as the ray is high there. The scan treats the whole ray as free, as a 2D lidar scan
-would. That includes the 2.6 m in front of the bumper that the camera cannot see. A low object
-right in front of the car is therefore not noticed, as with any camera mounted behind a bonnet.
-
-### How far the depth image is trusted
-
-Two requirements limit the range from which a camera writes into the map.
-
-```math
-\sigma_r(r) \le 0.15\ \text{m} \;\Rightarrow\; r \le 7.1\ \text{m}, \qquad
-\sigma_z(r) \approx \sigma_r \frac{h}{r} \le 0.04\ \text{m} \;\Rightarrow\; r \le 7.7\ \text{m}
-```
-
-The first keeps obstacles where they are. Before this limit, a parked car seen from 10 m was
-smeared over 30 cm, the smear reached into the free stall next to it, and the planner shifted
-the goal 20 cm off centre to stay clear of it. The second is what telling a kerb from the road
-takes, with the camera at height `h`. Both scale with `--noise`.
-
-Ground seen beyond that, up to 12 m, is not thrown away. It goes into the map as **far ground**:
-good enough to plan a drive over, not good enough to count as evidence. See the grid below.
+would. For the stereo pair that includes the road under the bonnet line that it cannot see.
 
 ### Painted lines
 
-A painted line is found in the colour image and placed with geometry, not with the depth image.
+Paint is found in the image and placed with geometry: the pixel's ray is intersected with the
+road plane. The depth is used only to confirm that a pixel is on the road.
 
-1. **Brightness.** The road brightness is the median over the pixels that the depth image calls
-   ground. A pixel is a candidate if its brightest channel is above `max(1.3 x road, road + 35)`.
-   This follows the lighting, and it keeps a line that lies in the shadow of a car. Image noise
-   of 3 grey levels is added to the pixels near the threshold.
-2. **Onto the ground plane.** The ray of a candidate pixel is intersected with the plane z = 0.
-   From a camera at `p` with world ray `d`, the range is `t = -p_z / d_z`, and the point is
-   `p + t d`. This is where the chassis frame of the image matters. Candidates beyond 11 m are
-   dropped. The position does not use the noisy depth, so a line 8 m away is placed to a few
-   centimetres.
-3. **A stripe is narrow.** The candidates are counted in 10 cm cells. A cell lies in a wide
-   bright area if 42 percent or more of the 7 x 7 cells around it hold candidates. A 12 cm stripe
-   covers a quarter of that window. The top of a kerb, a pavement or a white car covers all of
-   it. Candidates in a wide area are dropped, and so are those within 0.3 m of one: at a corner
-   of such an area the count is as low as on a stripe, and short false lines came from there.
-4. **The depth image must agree.** The pixel has to be classed as ground, and its depth has to
-   match the range to the ground plane. That removes bright things that stand above the ground.
-5. **Nothing behind something.** A candidate further away than `r_stop` on its bearing is
-   dropped. The top of a kerb in line with a stall line is the case this catches.
+The image is laid out on the ground first, as a picture from above with 5 cm cells, converted
+from the 8 bit values back to linear light. In that picture a stripe has the same width at every
+range, and a ratio of brightness is a ratio of reflectance times light. A cell is paint if
 
-What survives is fitted with line segments (`paint_segments`). The points are binned into 5 cm
-cells, and cells with a single pixel are dropped as speckle. A Hough transform over 180 angles
-and 5 cm offsets finds the strongest line. Its cells within 12 cm are fitted by total least
-squares, the cells within 10 cm of that fit are its inliers, and gaps of more than 45 cm split
-them into segments. Segments shorter than 35 cm are dropped. The inliers are removed from the
-vote and the next line is searched, up to 20 per frame.
+1. it is **1.8 times lighter than the ground 20 cm to both sides** of it, in one of four
+   directions, and
+2. the depth image says that **both of those are ground**, and
+3. the cell itself is ground, at the range the road plane gives, and
+4. it is not past the first thing on its bearing that stands up.
 
-Measured over whole runs with a car on each side of the stall, at noise 0, 1 and 2: of the
-segments in perpendicular lots and parallel streets, 99 percent or more lie on a true line (within
-12 cm, and not more than 0.5 m past its end), and in angled lots 95 to 97 percent. Those that do
-are off the line by 2 cm (median) and by 6 to 9 cm at the 95th percentile. The rest are short,
-half a metre typically, and mostly do not survive the line tracking, which wants five detections
-of the same line.
+The first rule is what makes it work in shade. Paint reflects three to five times more than
+asphalt, under the sun and out of it, so the ratio to the ground right beside it holds in both. A
+fixed threshold does not: paint in the shade is darker than asphalt in the sun.
+
+| What it is | Lighter than both sides? | Why |
+| --- | --- | --- |
+| a stripe, in sun or shade | yes | |
+| the edge of a shadow | no | lighter than one side only |
+| a kerb top, a white car, the sky | no | wider than 40 cm |
+| the light sill of a parked car | yes, but dropped by rule 2 | the car is on one side |
+| a spot of sun between two shadows | yes | see below |
+
+The last one cannot be told from paint in shade by brightness: both are a light patch with dark
+ground on either side, and the numbers are the same. What differs is the shape. A spot of sun
+where two shadows nearly meet is a spot. So the segments that the Hough vote and the least
+squares fit produce are built only from **solid pieces of at least 0.25 m**, and pieces may be
+bridged over gaps of 0.45 m. A spot does not start a line, end one, or extend one.
 
 ### Lidar
 
-The lidar returns a range per beam, 720 bearings by 16 elevations, spaced from end to end of each
-range as Chrono's lidar does. Gaussian noise of 2 cm is added and 1 percent of the beams are
-dropped. The points are classified by height like the camera's and collapsed into a scan of 720
-bearings out to 20 m. The lidar is accurate at any range, so it has no far ground.
+The lidar is processed like before: a point per beam, the same three classes, the same scan.
+Returns from below 0.30 m end the free part of a ray but are not placed as obstacles. Its beams
+are 0.8 degrees apart, so a kerb is hit somewhere on its top, not at its face. Range noise is
+2 cm and 1 percent of the returns are dropped, both times `--noise`.
 
-Its weakness is low things. The beams are 2 degrees apart in elevation, which near the car is
-40 cm on the ground. A kerb is hit somewhere on its top, not at its face. With those returns in
-the map, the line fitted to the kerb was off by up to 2.8 degrees, and the car parked at that
-angle. So a lidar return from below 0.30 m ends the free part of its ray, like anything that is
-not ground, but is not placed in the map as an obstacle. Where the kerb is, the cameras say, as
-they do without a lidar. In addition `_align_with_kerb` fits the lane-side edge of what was hit,
-not its middle.
+## How good it is
 
-### Radar
+The reference is the scenario itself, not anything rendered. The road is a plane, so the true
+range of every pixel that shows the road follows from where the camera is. The true range to the
+nearest obstacle on a bearing follows from the outlines of the parked cars and the kerbs. The
+true lines are the painted ones. `docs/make_sensor_figures.py` measures all three over a whole
+run, from the first metre of the search to the parked car:
 
-A radar returns a range per beam too. The reported angles of Chrono's radar are half a beam
-spacing off from the beams it traces, so the bearing is computed from the cell index. Noise is
-8 cm and 15 percent of the beams are dropped.
+![Accuracy against the scenario](img/sensor_accuracy.png)
 
-A radar return says where something is and that the way to it is clear. No return says nothing:
-the beams span only 9 degrees in height and pass over low things. So a radar contributes
-obstacles, and free space only along the rays that came back. The two radars cover the sectors
-the cameras do not, from 25 to 155 degrees on each side.
+The numbers of that run (`--type perpendicular --cars both`, clear sky, `--noise 1`):
 
-## What changes because the car cannot see sideways
+**Range of the road.** Median error, and in brackets the error that 9 of 10 pixels stay within.
 
-![The map when the plan is made, for the three sensor sets](img/sensor_maps.png)
+| True range | Stereo pair | Rear camera | Bumper camera |
+| --- | --- | --- | --- |
+| 0.8 to 2 m | hidden by the bonnet | 1.0 cm (2.3) | 0.6 cm (2.0) |
+| 2 to 4 m | hidden by the bonnet | 2.1 cm (6.5) | 2.2 cm (7.2) |
+| 4 to 7 m | 3.1 cm (6.2) | 6.3 cm (24) | 14 cm (43) |
+| 7 to 10 m | 7.0 cm (14) | 17 cm (43) | 65 cm (156) |
+| 10 to 15 m | 22 cm (43) | 43 cm (102) | 222 cm (485) |
+
+The stereo error includes the calibration error of this run, which alone is about 4 cm at 7 m.
+The single cameras do well on the road because the road is what their depth is anchored to. Their
+real test is the next table.
+
+**Obstacles.** For every bearing on which a scan reported an obstacle: reported range minus the
+true range to the nearest outline.
+
+| Source | Median | Half within | 9 of 10 within | Bearings |
+| --- | --- | --- | --- | --- |
+| stereo pair, up to 8.1 m | +1.7 cm | 5.6 cm | 20 cm | 9705 |
+| bumper camera, up to 1.9 m | +1.6 cm | 8.2 cm | 19 cm | 1416 |
+| lidar, up to 20 m | -1.8 cm | 2.8 cm | 10 cm | 64671 |
+
+The rear camera reported an obstacle on fewer than 100 bearings in this run, too few to count: it
+only places what is within 1.9 m, and the car stopped before anything was. The outlines are those
+of the car bodies at bumper height, and a camera sees the whole front of a car, so a part of the
+spread is the reference.
+
+**Lines.**
+
+| Source | Segments | On a painted line | Median offset |
+| --- | --- | --- | --- |
+| stereo pair | 286, 265 m in all | 94.7 percent of the length | 2.8 cm |
+| rear camera | 117, 237 m | 94.6 percent | 1.2 cm |
+| bumper camera | 43, 49 m | 92.4 percent | 1.7 cm |
+
+A segment counts as on a line if no point of it is more than 12 cm from one. The rest are spots
+of sun between shadows that were long enough to pass, and real lines placed too far off from a
+long way away.
+
+## What changes because the car sees so little
+
+![The map when parked](img/sensor_maps.png)
 
 ### A stall is one line and a stub
 
@@ -270,7 +395,8 @@ metre of it. Of an empty stall the camera sees the far line through the empty sp
 line only as such a stub. (The stand-in perception looks in all directions and sees a line down
 the gap when the car is level with it.)
 
-So with a sensor rig, `find_slots` also accepts this pair:
+So with a sensor rig, `find_slots` also accepts a pair that is less than two long lines side by
+side:
 
 | | Requirement |
 | --- | --- |
@@ -280,112 +406,95 @@ So with a sensor rig, `find_slots` also accepts this pair:
 | direction | from the longer line alone if the shorter is under 1.2 m |
 | depth | if the lines end sooner than a car length plus 0.7 m, that depth is assumed |
 
-Once the car has passed the stall, the rear camera sees the other line through the empty stall,
-and while it backs in it sees both. The estimate then rests on two full lines, and the plan
-follows it (see [control.md](control.md#keeping-the-plan-attached-to-the-stall)).
+This also covers an angled stall at the end of a row, of which the pair sees only the halves of
+both lines that are near the lane: far parts of a line 6 to 8 m to the side come into the 105
+degree view only beyond the 11 m to which paint is looked for.
+
+While the car backs in, the rear camera sees both lines of the stall at close range. The
+estimate then rests on those, and the plan follows it (see
+[control.md](control.md#keeping-the-plan-attached-to-the-stall)).
 
 ### Lines remember
 
 A `LineTrack` keeps its 160 best detections and derives its extent from what they cover. With a
-camera that drops the wrong ones. Driving into an angled stall, the camera sees only the far
-part of the lines once it is close, the detections of the mouth (made from further away) are the
-first to be forgotten, and the stall estimate slid 2 m inward. With a rig, a track therefore
-keeps a record of where along the line paint was seen, in 10 cm bins with the summed weight of
-the detections. A stretch stays part of the line once that weight has passed a threshold.
+camera that drops the wrong ones: once the car is close, it sees only the far part of the lines,
+and the detections of the mouth, made from further away, are the first to be forgotten. With a
+rig, a track therefore keeps a record of where along the line paint was seen, in 10 cm bins with
+the summed weight of the detections. A stretch stays part of the line once that weight has
+passed a threshold.
 
-### Free means the mouth is empty
+### Free means a wedge of the mouth is empty
 
-Seen from along the lane, the far end of a stall between two cars is in the shadow of the nearer
-car. Requiring 60 percent of the stall to be seen free would never be met. A parked car would
-show at the mouth, so the rule becomes: no obstacle in the stall, and either 60 percent seen
-free, or 80 percent of the first 2.5 m and 30 percent overall.
+A camera that looks forward sees into a stall only at a slant, past the corner of the car parked
+before it. Of an empty stall it sees a wedge: most of the mouth, and less and less further in.
+Once the car is level with the stall, nothing looks at it any more.
 
-The planner already treats the unseen part of the chosen stall as free. With a rig that part
-reaches as far in as the parked car will, plus the planning margin, also where the lines were not
-seen that far: a stall is a place that holds a car. (Before, it ended where the seen lines ended,
-10 cm short of the nose of a car driven into an angled stall, and the planner pulled the goal
-back by up to 0.6 m.) What is deeper in comes into view while the car drives in, and the path
-monitor stops the car if something is there.
+In the run shown above, 71 percent of the first 2.5 m of the free stall was seen empty, 35 percent of
+the whole stall, and the empty ground was seen 3.0 m deep. Requiring 60 percent of the stall, or
+80 percent of its mouth, would never be met. A parked car would stand in that wedge. So with a
+rig a stall is free if
+
+- no obstacle was seen in it, and
+- at least 55 percent of its mouth and 25 percent of the whole was seen empty, and
+- the empty ground was seen at least 2 m into it.
+
+The planner then needs room that nobody has looked at. The region assumed free is extended to
+hold the parked car, and what is really there comes into view of the rear camera while backing
+in. That camera places obstacles only within 1.9 m, which is late, and is why the plan keeps a
+wider margin with a rig.
 
 ### Far ground in the grid
 
-`GridMap` has two more counters per cell for the far ground:
+The grid has a second, tentative layer for ground that was seen from too far to rule out a kerb,
+or by a single camera at all:
 
-- `far`: in how many scans a ray passed the cell beyond the range where the depth is trusted
-- `stop`: how often something that is not ground was seen in the cell from within that range
+| Layer | Written by | Counts as |
+| --- | --- | --- |
+| free | the stereo pair within 8.1 m, the lidar | seen free |
+| far | the stereo pair from 8.1 to 12 m, a single camera within 3 m | probably free: drivable for the planner once seen three times, with a larger margin |
+| stop | anything that is not ground | not free, whatever the far layer says |
 
-```math
-\text{known} = \mathrm{dilate}_2(\text{free} \ge 1) \;\vee\; \mathrm{erode}_4\big(\text{free} \ge 1 \;\vee\; (\text{far} \ge 3 \wedge \text{stop} = 0)\big)
-```
+### The monitor looks for margin, and the goal moves back
 
-Far ground makes a cell drivable for the planner. It is not counted in `free`, so it is no
-evidence against an obstacle, and one closer look that finds something there removes it. It is
-used only 0.4 m in from where it ends. Its edge is where a ray stopped at something 10 m away,
-and that is known to a few tens of centimetres.
-
-Both alternatives were tried. Without far ground the car knows 5 m of road ahead of its bumper
-and shuffles: up to nine gear changes for a parallel stall. With all ground counted as free out to
-12 m, parallel runs came within 3 to 13 cm of the kerb and two touched it. From that far a kerb
-passes for ground, and many far sightings outvote the few close ones that say otherwise.
-
-### The monitor looks for margin
-
-With cameras an obstacle is placed exactly only once it is close, which is often after the plan
-was made. In one run the plan swung the nose towards a car in the opposite row that was 9.5 m
-away when the plan was made, and the car came within 7.5 cm of it. The path monitor therefore
-reacts when an obstacle is nearer to the remaining path than `min(0.10, plan margin - 0.03)`, not
-only when it is on it. The car stops and looks for a better plan from where it stands, once per
-plan. If there is none it carries on: the plan it has is still drivable, only with less room
-than it was made for.
-
-### Back to the centre
-
-The planner shifts the goal off the stall centre when the map shows something close to where the
-car would stand, and says so in the log (`goal shifted 0.20 m sideways`). With cameras that
-something is often an obstacle placed a decimetre or two off from 6 m away. During the approach
-the goal therefore moves back towards the centre as soon as the map allows it
-([control.md](control.md#keeping-the-plan-attached-to-the-stall)).
+Unchanged from before: while driving, the path is checked against the map with the margin it was
+planned with, and a goal that was shifted off centre to stay clear of something is moved back as
+the map sharpens. See [planning.md](planning.md).
 
 ### Parallel stalls
 
-Two things are different with a rig. The planner's margins start wider (see
-[planning.md](planning.md#configuration-space-by-fft)). And the unseen part of the chosen stall
-is assumed free only within 0.5 m of ground that was seen: the far side of a parallel stall is
-the kerb, which a camera cannot tell from the road until the car is next to it.
-
-The kerb itself is only seen as an obstacle from about 5 m. At the time of the plan the car
-stands beside the stall, the kerb is 4 m to the side, and no camera looks there. The stall is then
-aligned with its two short tick lines. When the rear camera sees the kerb during the reverse,
-`_align_with_kerb` takes over, the estimate shifts, and the plan follows.
+A parallel stall is aligned with the kerb behind it, which only the stereo pair can see as a
+kerb. It does so while the car drives up, from 5 to 8 m. During the reverse the rear camera sees
+the two tick lines and the road, not the kerb, so the alignment rests on what was mapped before.
 
 ## In the viewer
 
-With a sensor rig the window shows what the sensors deliver next to the scene: the colour image
-and the depth image of each camera, and every measured range as a point seen from above, with the
-lidar's range image underneath. [simulation-and-viewer.md](simulation-and-viewer.md#the-window)
-describes each picture. What is made of that data shows up in three more places:
+With a sensor rig the window shows what the cameras deliver next to the scene: the left image of
+the stereo pair, the range that IGEV++ computed from the pair, the rear and the bumper image, and
+every range from above, with the lidar's range image underneath.
+[simulation-and-viewer.md](simulation-and-viewer.md#the-window) describes each picture. What is
+made of that data shows up in three more places:
 
 - The top view outlines what each sensor is looking at.
 - Line stubs are drawn in a darker colour than confirmed lines.
-- The panel shows, for each camera, the picture of what its pixels are read as: ground,
-  obstacle, unclear, paint, the car itself. It is the depth image's classification with the
-  paint from the colour image on top, at a third of the depth resolution.
-- The planning map in the panel shows far ground as drivable, like the planner sees it.
+- The panel shows, for each camera, what its pixels are read as: ground, obstacle, unclear,
+  paint, the car itself.
 
 ## Limits
 
-- **Kerbs at double noise.** At `--noise 2` the depth image is trusted to 3.9 m, and a 15 cm
-  kerb is at the limit of what it resolves. Perpendicular and angled stalls are still parked in
-  with every sensor set. Parallel stalls, which are aligned with the kerb, are where it shows:
-  22 cm off centre with cameras alone, 2.8 degrees off the kerb line with the radars, and with
-  the lidar the car touched the kerb ([results.md](results.md)). The lidar does not help with
-  the kerb, which it cannot see closer than 4.4 m.
-- **Low things right in front of the car** are not seen by the cameras, see above.
-- **The lines are found by brightness.** There is no learned detector. A scene with bright,
-  narrow things on the ground that are not lines would produce false ones.
-- **The stereo depth is a model.** No stereo matcher runs. The error model has the right growth
-  with range and the right smoothness, but not the failure modes of matching, such as repeated
-  patterns.
-- **Vulkan RT** was only run in its CPU fallback, on macOS. Depth, lidar and radar agree with
-  the scene geometry there. Its camera image arrives, but plain diffuse colours come out washed
-  out, and this was not looked into.
+- **The pose is exact.** The car knows where it is from the simulation. Odometry or visual
+  localization is not modelled, and every range and every line is placed with the true pose,
+  including the true pitch of the car under braking.
+- **One exposure, no auto-exposure.** See above. A camera would adapt when it drives into shade.
+- **The rear camera does not see kerbs**, and places cars only within 1.9 m. Backing into a
+  stall relies on what the stereo pair mapped while driving past.
+- **A sliver of sun can pass for paint.** A sunlit strip between two shadows that is 10 to 20 cm
+  wide and longer than 25 cm is taken for a line. Nothing in a grey image tells the two apart.
+- **The lines are found by a rule, not learned.** A scene with other bright, narrow things on
+  the ground would produce false ones.
+- **The networks were not trained for this.** They run with published weights. IGEV++ does well
+  on the textured road and badly on a road of one flat colour, where it has nothing to match.
+- **Stray obstacle cells with the lidar.** The map of the lidar run above has a handful of
+  obstacle cells in the open lane, and one false line along the side of a parked car. Where the
+  cells come from was not tracked down. They did not change a run.
+- **Static scene.** Nothing moves but the car.
+- **Other backends.** OptiX and Vulkan RT were not run with this scene.

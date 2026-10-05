@@ -220,6 +220,96 @@ def test_pictures():
     print("picture resampling: ok")
 
 
+def _rig():
+    """A sensor rig without sensors: enough of one to run its image processing on made-up data."""
+    rig = ps.SensorRig.__new__(ps.SensorRig)
+    rig.rays = ps.pinhole_rays(rig.CAM_W // 2, rig.CAM_H // 2, rig.CAM_HFOV)
+    rig.linear = ((np.arange(256) / 255.0) ** 2.2).astype(np.float32)
+    return rig
+
+
+def _ground_view(rig, height, pitch, shade=lambda x, y: np.ones_like(x), paint=lambda x, y: np.zeros(x.shape, bool)):
+    """What a camera 'height' above the ground and pitched down sees of a flat road: the image
+    (bottom row first) and the true depth along the optical axis at half size."""
+    R = ps._rot_y(pitch)
+    out = []
+    for w, h in ((rig.CAM_W, rig.CAM_H), (rig.CAM_W // 2, rig.CAM_H // 2)):
+        d = ps.pinhole_rays(w, h, rig.CAM_HFOV) @ R.T.astype(np.float32)
+        t = np.where(d[..., 2] < -1e-3, -height / np.minimum(d[..., 2], -1e-3), np.inf)      # range to the ground
+        out.append((d, t))
+    (d, t), (dh, th) = out
+    x, y = t * d[..., 0], t * d[..., 1]
+    lin = np.where(np.isfinite(t), np.where(paint(x, y), 0.60, 0.16) * shade(x, y), 0.5)
+    image = np.repeat((255.0 * lin ** (1.0 / 2.2) + 0.5).astype(np.uint8)[..., None], 3, axis=2)
+    return image, np.where(np.isfinite(th), th * rig.rays[..., 0], np.inf), R
+
+
+def test_depth_from_images():
+    """Stereo disparity and monocular inverse depth are turned into the right ranges."""
+    rig = _rig()
+    h = 1.42
+    _, z, R = _ground_view(rig, h, 0.0)
+    zf = np.repeat(np.repeat(np.minimum(z, 200.0), 2, axis=0), 2, axis=1)                  # full size
+    r = rig._stereo_range((rig.CAM_F * rig.BASELINE / zf).astype(np.float32))
+    P = r[..., None] * (rig.rays @ R.T.astype(np.float32))
+    near = (r > 0.0) & (r < 12.0)
+    assert near.sum() > 20000 and np.abs(P[near][:, 2] + h).max() < 2e-3                  # the road comes out flat
+    assert np.all(r[:, 4:][z[:, 4:] > rig.CAM_FAR] >= 0.99 * rig.CAM_FAR)                 # and the sky far away
+    assert np.all(r[rig.CAM_H // 4 - 40, :2] == 0.0)          # near ground at the left rim: not in the right image
+    step = (rig.CAM_F * rig.BASELINE / zf).astype(np.float32)
+    step[:, 480:] += 6.0                                                                  # something nearer on one side
+    r = rig._stereo_range(step)               # (rows 100 to 145 show the road from 5 m on, where 6 pixels is a jump)
+    assert np.all(r[100:145, 239:241] == 0.0) and np.all(r[100:145, 236] > 0.0) and np.all(r[100:145, 243] > 0.0)
+
+    # a network's inverse depth with an unknown scale and offset, of a road with a wall across it
+    cam = dict(pos=np.array([0.0, 0.0, 1.09]), R=ps._rot_y(math.radians(25.0)))
+    _, z, _ = _ground_view(rig, 1.09, math.radians(25.0))
+    wall = np.minimum(z, 2.5 / np.maximum(rig.rays[..., 0], 1e-3) * rig.rays[..., 0])       # depth 2.5 m at most
+    zf = np.repeat(np.repeat(np.minimum(wall, 30.0), 2, axis=0), 2, axis=1)
+    r = rig._mono_range(cam, (3.7 / zf + 0.9).astype(np.float32), np.zeros(3), np.eye(3))
+    want = np.minimum(wall, 30.0) / rig.rays[..., 0]
+    assert r is not None and np.all(np.abs(r - want)[want < 20.0] < 0.01 * want[want < 20.0] + 0.005)
+    assert rig._mono_range(cam, np.full((rig.CAM_H, rig.CAM_W), 0.3, np.float32), np.zeros(3), np.eye(3)) is None
+    print("ranges from stereo disparity and from monocular depth: ok")
+
+
+def test_paint_in_light_and_shade():
+    """A stripe is found in the sun and in the shade; the edge of a shadow is not a stripe."""
+    rig = _rig()
+    h, pitch = 1.09, math.radians(25.0)
+    stripe = lambda x, y: (np.abs(y - 0.8) < 0.06) & (x > 1.0) & (x < 4.5)
+    shadow = lambda x, y: np.where(x > 2.6, 0.2, 1.0)                                    # a shadow across the road
+    image, z, R = _ground_view(rig, h, pitch, shadow, stripe)
+    flat = np.isfinite(z)
+    xy, _, _ = rig._paint(image, flat, np.array([0.0, 0.0, h]), R.astype(np.float32), 0.0, 5.0)
+    assert len(xy) > 80 and np.abs(xy[:, 1] - 0.8).max() < 0.10                           # nothing off the stripe
+    along = np.sort(xy[:, 0])
+    assert along[0] < 1.15 and along[-1] > 4.3 and np.diff(along).max() < 0.12            # and all of it, lit and shaded
+    segs = ps.paint_segments(xy, np.zeros(2), min_count=1)
+    assert len(segs) == 1 and abs(math.hypot(segs[0][2] - segs[0][0], segs[0][3] - segs[0][1]) - 3.5) < 0.2
+    # a light spot half a metre beyond the end of a stripe does not make the stripe longer
+    spot = np.stack(np.meshgrid(np.arange(5.0, 5.2, 0.05), np.arange(0.75, 0.9, 0.05)), axis=-1).reshape(-1, 2)
+    segs = ps.paint_segments(np.concatenate([xy, spot]), np.zeros(2), min_count=1)
+    assert len(segs) == 1 and max(segs[0][0], segs[0][2]) < 4.6
+    print("paint in sun and shade, shadow edges, light spots: ok")
+
+
+def test_surfaces():
+    """The road surface images exist, are PNG files and have the reflectance of asphalt."""
+    files = ps.surface_textures()
+    raw = open(files["asphalt"], "rb").read()
+    assert raw[:8] == b"\x89PNG\r\n\x1a\n" and raw[12:16] == b"IHDR"
+    w, h = int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+    assert (w, h) == (1024, 1024)
+    import zlib
+    k = raw.index(b"IDAT")
+    data = zlib.decompress(raw[k + 4:k + 4 + int.from_bytes(raw[k - 4:k], "big")])
+    px = np.frombuffer(data, np.uint8).reshape(h, 1 + 3 * w)[:, 1:].reshape(h, w, 3)
+    lin = (px[..., 0] / 255.0) ** 2.2
+    assert 0.13 < lin.mean() < 0.19 and 0.02 < lin.std() < 0.06                          # dark grey, and not flat
+    print("road surface images: ok")
+
+
 if __name__ == "__main__":
     test_reeds_shepp()
     test_mpc_solver()
@@ -227,4 +317,7 @@ if __name__ == "__main__":
     test_sensor_geometry()
     test_mapping()
     test_pictures()
+    test_depth_from_images()
+    test_paint_in_light_and_shade()
+    test_surfaces()
     print("all checks passed")

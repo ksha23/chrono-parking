@@ -97,7 +97,7 @@ is typed in.
 | steering stop and angle to rack table | sweep of the rack at power-up, `GetSteeringAngle()` | 35.4 deg |
 | brake torque capacity | `GetBrakeTorque()` with the brakes fully applied | 8000 N m |
 | planning curvature limit | `tan(GetMaxSteeringAngle()) / wheelbase`, the declared 25 deg | 0.168 per metre, radius 5.95 m |
-| roof, for the sensor mounts | top of the chassis collision hull | 1.47 m above the reference point, 1.17 m long |
+| sensor mounts | the chassis mesh: where its glass is, where its tail and nose end | stereo pair 1.45 m above the road behind the windshield, rear camera 1.11 m, bumper camera 0.72 m |
 
 The outline and ride height of the parked cars come from their meshes in the same way.
 
@@ -158,34 +158,32 @@ show the whole world, including what the car cannot see. What the car knows is d
 | top view | straight down, north up. Follows the car, or shows the whole lot in drag mode |
 | chase view | behind and above the car, heading low-pass filtered |
 
-**What the sensors deliver**, in the middle and on the right. This is the data from Chrono::Sensor
-that the perception works from, renewed whenever the sensors deliver, ten times per second.
+**What the sensors deliver**, in the middle and on the right. The images are what Chrono::Sensor
+renders for each camera, with that camera's noise and exposure, renewed ten times per second.
 
 | Picture | Content |
 | --- | --- |
-| front camera: colour | the 960 x 540 colour image of the front stereo camera |
-| front camera: depth | its 480 x 270 depth image. The value of a pixel is the range along its ray. Red is near, blue is 15 m, dark means nothing within the 30 m that the depth image covers |
-| rear camera: colour, depth | the same for the rear stereo camera |
-| range data from above | every range measured in this tick as a point, seen from above. The car is in the middle and forward is up. The colour is the height of the point above the ground, blue at ground level and red at 1.6 m |
+| front left camera | the left image of the stereo pair behind the windshield, 960 x 600. The bonnet fills the bottom of it |
+| stereo depth | what the stereo network computed from the left and the right image: the range along each pixel's ray. Red is near, blue is 15 m. Dark means not used: the sky, anything beyond 30 m, depth edges, the left rim. Renewed every 0.4 s, 0.2 s behind the images |
+| rear camera | the camera at the tail, pitched down |
+| bumper camera | the camera on the nose |
+| ranges from above | every range that was computed or measured, as a point seen from above. The car is in the middle and forward is up. The colour is the height of the point above the road, blue at road level and red at 1.6 m |
 
-The range picture holds the points of all range sensors of the rig:
+There is no depth camera on the car. The depth picture is the output of a network that was given
+two colour images.
 
-- **Stereo depth**: every second pixel of both depth images, as small dots. With cameras alone
-  these are the only points, and the two dark sectors to the left and right of the car are what
-  no camera looks at.
-- **Lidar** (`camera+lidar`): the returns of its 16 beams as larger dots, with the stereo points
-  dimmed. Underneath is the lidar's range image: one row per beam with the highest on top, and
-  the columns going round the car with forward in the middle and the rear at both ends. Red is
-  near, blue is 20 m, dark is no return.
-- **Radar** (`camera+radar`): the returns of both radars as white dots.
+The picture from above holds the points of every source:
 
-The rings are 5 m apart. The thin lines are the edges of each camera's and each radar's field of
-view. The car's own body shows up too: the cameras see the bonnet and the boot, which is the
-cluster of points inside the car's outline.
+- **From the stereo pair**: every second pixel of the computed depth, as small dots.
+- **From a single camera**: the same for the rear and the bumper camera, fainter. Their depth is
+  an estimate from one image, anchored to the road (see [sensors.md](sensors.md#range-from-a-single-camera)).
+- **Lidar** (`camera+lidar`): the returns of its 32 beams as larger dots. Underneath is the
+  lidar's range image: one row per beam with the highest on top, 120 degrees wide with the left
+  of the car on the left. Red is near, blue is 20 m, dark is no return.
 
-The colour images are the buffers of Chrono::Sensor as they come. The depth images and the points
-have the range error of [sensors.md](sensors.md#stereo-depth-error) added, because that is the
-data the perception gets.
+The rings are 5 m apart. The thin lines are the edges of each sensor's field of view. The dark
+sectors to both sides of the car are what nothing looks at. The car's own body shows up too: the
+stereo pair sees the bonnet, which is the cluster of points inside the car's outline.
 
 **The internals panel** on the far right, see below.
 
@@ -213,7 +211,7 @@ Drawn into the 3D scene, on the ground:
 | yellow, on the path | the MPC's predicted positions over its horizon |
 | white rectangle | goal pose |
 | orange | range scan of the current frame (top view only) |
-| light blue outline | what each sensor is looking at: a fan per camera or radar, a circle for the lidar (top view only) |
+| light blue outline | what each sensor is looking at, as a fan (top view only) |
 | dark teal | line stubs, shorter than a confirmed line (sensor rig only) |
 
 ### The internals panel
@@ -233,10 +231,10 @@ The right-hand panel shows what the agent is doing, updated at the perception ra
 7. Counts: the perception source, line tracks, stalls by status, what was read from the model
    (dimensions, mass, steering stop, brake capacity), smallest clearance so far, margin and segment
    count of the current plan.
-8. **Cameras, as read** (sensor rig only). For the front and the rear camera, what each pixel is
-   taken to be: ground, obstacle, unclear, paint, or the car's own body. This is the depth image's
-   classification with the paint from the colour image on top, the picture that the mapping is
-   built from. See [sensors.md](sensors.md#ground-obstacle-or-unclear).
+8. **Cameras, as read** (sensor rig only). For the stereo pair, the rear and the bumper camera,
+   what each pixel is taken to be: ground, obstacle, unclear, paint, or the car's own body. This
+   is the classification of the computed depth with the paint from the image on top, the picture
+   that the mapping is built from. See [sensors.md](sensors.md#ground-obstacle-or-unclear).
 
 `--no-panel` hides it.
 
@@ -272,10 +270,8 @@ shaped the implementation:
 With `--sensors sim` the window keeps real time at 30 frames per second on the machine this was
 developed on. The simulation itself needs about a seventh of real time.
 
-With a sensor rig the window runs at about 0.8 of real time and 23 frames per second. Measured
-with cameras and lidar, a tick of 100 ms simulated time takes 124 ms: 53 ms to render and process
-the sensors, 19 ms for the physics, the control and the mapping, and 52 ms for three frames of the
-window. Of those 52 ms, the sensor pictures take 16 ms and the panel 10 ms.
+With a sensor rig the window runs at about a fifth of real time. Rendering four cameras and
+running the depth networks takes most of it, see [sensors.md](sensors.md#what-it-needs).
 
 ## Placing the target by hand
 

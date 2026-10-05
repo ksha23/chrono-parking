@@ -4,7 +4,7 @@ This document describes how `parking_sim.py` is put together: the data flow, the
 things run, the state machine that sequences a parking maneuver, and where each part lives in the
 file. The other documents go into each stage:
 
-- [sensors.md](sensors.md): the Chrono::Sensor cameras, lidar and radar, and how their data becomes scans and line segments
+- [sensors.md](sensors.md): the Chrono::Sensor cameras and lidar, the networks that compute depth from the images, and how that becomes scans and line segments
 - [perception-and-mapping.md](perception-and-mapping.md): the stand-in perception, line tracks, occupancy grid, stall inference, stall choice
 - [planning.md](planning.md): configuration space, Hybrid A*, Reeds-Shepp curves, docking
 - [control.md](control.md): the MPC, the online steering model, speed control, plan re-anchoring
@@ -17,11 +17,13 @@ A car drives along a lane next to parking stalls. It knows its own pose. It does
 stalls are, which ones are free, or where the obstacles are. It has to find a free stall, choose
 one, and park in it, driving forward and backward as needed.
 
-What it perceives with is selectable. With a sensor rig the car carries a stereo camera that looks
-forward and one that looks back, and optionally a lidar or two radars, all ray traced by
-Chrono::Sensor. It has no camera to the sides. Without a rig, a stand-in computes noisy line
-segments and a noisy range scan from the scenario. Either way the rest of the agent receives the
-same two things: planar scans, and segments of painted lines.
+What it perceives with is selectable. With a sensor rig the car carries a stereo pair of cameras
+behind the windshield, a camera at the tail and one on the front bumper, and optionally a
+forward-facing lidar, all ray traced by Chrono::Sensor. Depth is computed from the camera images
+by neural networks: IGEV++ for the stereo pair, a monocular network for the single cameras.
+Nothing looks sideways. Without a rig, a stand-in computes noisy line segments and a noisy range
+scan from the scenario. Either way the rest of the agent receives the same two things: planar
+scans, and segments of painted lines.
 
 The scope is the decision, planning and control problem, with perception from simulated sensors.
 Localization is taken as given.
@@ -69,6 +71,7 @@ ground truth is its own pose.
 | Physics | 2 ms | Chrono vehicle and terrain, tire sub-step 1 ms |
 | Control | 20 ms | error measurement, steering gain update, MPC solve, speed loop, torque commands |
 | Perception and mapping | 100 ms | sensor rendering and processing, grid and line map update, stall inference, decision, plan refinement, path monitor |
+| Depth networks | 400 ms | stereo matching of the front pair, monocular depth of the single cameras, in a process of their own |
 | Rendering | about 33 ms | the views of the scene, the sensor pictures and the internals panel |
 | Planning | on demand | runs in a worker thread while simulated time is frozen |
 

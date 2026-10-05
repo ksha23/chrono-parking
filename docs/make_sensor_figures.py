@@ -1,27 +1,36 @@
 #!/usr/bin/env python3
-"""Regenerates the sensor figures in docs/img from real runs with Chrono::Sensor.
+"""Regenerates the sensor figures in docs/img from real runs with Chrono::Sensor, and measures
+how good the perception is against the geometry of the scenario.
 
-Recording needs a PyChrono that has the ray-traced sensors. Drawing needs matplotlib. If one
-Python has both:
+Recording needs a PyChrono that has the ray-traced sensors, and the depth networks set up (see
+docs/sensors.md). Drawing needs matplotlib. If one Python has both:
 
     python docs/make_sensor_figures.py
 
 Otherwise in two steps, with the Python that has each:
 
-    python docs/make_sensor_figures.py record frames.npz
-    python docs/make_sensor_figures.py draw frames.npz
+    python docs/make_sensor_figures.py record frames.pkl
+    python docs/make_sensor_figures.py draw frames.pkl
 
-Three headless simulations are run one after another (camera, camera + lidar, camera + radar)."""
+Two headless simulations are run one after another (camera, camera + lidar).
+
+The reference for the accuracy figures is the scenario itself, not anything rendered: the road is
+a plane, so the true range of every pixel that shows the road follows from where the camera is,
+and the true range to the nearest obstacle on a bearing follows from the outlines of the parked
+cars and the kerbs."""
 
 import importlib.util
 import math
 import os
+import pickle
 import sys
 
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 IMG = os.path.join(HERE, "img")
+SNAPSHOTS = (9.0, 27.0)          # simulated times at which the camera frames are kept [s]
+KIND = {"front": 0, "rear": 1, "bumper": 2}
 
 
 def load_sim():
@@ -40,74 +49,117 @@ def record(path):
     """Each sensor set runs in a process of its own: a ray-traced scene holds a few GB."""
     import subprocess
     out = {}
-    for mode in ("camera", "camera+lidar", "camera+radar"):
-        part = "%s.%s.npz" % (path, mode.replace("+", "_"))
+    for mode in ("camera", "camera+lidar"):
+        part = "%s.%s.pkl" % (path, mode.replace("+", "_"))
         if subprocess.call([sys.executable, os.path.abspath(__file__), "record-one", mode, part]) != 0:
             sys.exit("recording %s failed" % mode)
-        with np.load(part) as d:
-            out.update({k: d[k] for k in d.files})
+        out[mode] = pickle.load(open(part, "rb"))
         os.remove(part)
-    np.savez_compressed(path, **out)
+    pickle.dump(out, open(path, "wb"))
     print("wrote " + path, flush=True)
+
+
+def first_hit(origin, ang, edges, r_max):
+    """Range from a point to the nearest of the edges (x1, y1, x2, y2) along each bearing."""
+    d = np.stack([np.cos(ang), np.sin(ang)], axis=1)[:, None, :]
+    a, e = edges[None, :, :2] - np.asarray(origin)[None, None, :], (edges[:, 2:] - edges[:, :2])[None]
+    den = d[..., 0] * e[..., 1] - d[..., 1] * e[..., 0]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = (a[..., 0] * e[..., 1] - a[..., 1] * e[..., 0]) / den
+        s = (a[..., 0] * d[..., 1] - a[..., 1] * d[..., 0]) / den
+    t = np.where((np.abs(den) > 1e-9) & (t > 0.0) & (s >= 0.0) & (s <= 1.0), t, np.inf)
+    return np.minimum(t.min(axis=1), r_max)
 
 
 def record_one(mode, path):
     ps = load_sim()
     if not ps.HAVE_SENSORS:
         sys.exit("this PyChrono has no ray-traced sensors, see docs/sensors.md")
-    out = {}
-    if True:
-        args = ps.parse_args(["--headless", "--sensors", mode, "--type", "perpendicular", "--cars", "both"])
-        sim = ps.ParkingSim(args)
-        rig, tag = sim.sensor, mode.replace("camera", "c").replace("+lidar", "l").replace("+radar", "r")
-        frame = {}
-        inner = rig._camera
+    args = ps.parse_args(["--headless", "--sensors", mode, "--type", "perpendicular", "--cars", "both"])
+    sim = ps.ParkingSim(args)
+    rig, scn = sim.sensor, sim.scn
+    rects = [ps.rect_poly(cx, cy, 0.0, -0.5 * lx, 0.5 * lx, 0.5 * ly) for cx, cy, lx, ly, _ in scn.pads]
+    polys = scn.obstacle_polys() + rects                   # parked cars, kerbs, and the raised ground beside the lot
+    edges = np.array([np.concatenate([p[k], p[(k + 1) % len(p)]]) for p in polys for k in range(len(p))])
+    lines = np.array([ln[:4] for ln in scn.lines], dtype=float)
+    road, hits, segs, latest, frames = [], [], [], {}, {}
+    rng = np.random.default_rng(0)
 
-        def spy(cam, rgb, depth, ref_p, ref_R, inner=inner, frame=frame, sim=sim):
-            res = inner(cam, rgb, depth, ref_p, ref_R)
-            # the frame the camera figure is made of: the front camera, a stall coming into view
-            if not frame and cam["label"] == "front" and sim.state == "SEARCH" and sim.pose[0] > 3.0:
-                scan, xy, segs = res
-                frame.update(rgb=np.array(rgb[..., :3]), depth=np.array(depth), view=cam["view"].copy(),
-                             origin=np.array(scan[0]), ang=scan[1], r_hit=scan[2], r_free=scan[3], r_far=scan[4],
-                             paint=xy, segs=np.array(segs).reshape(-1, 5), pose=np.array(sim.pose))
-            return res
+    def off_line(q):                                       # distance of a point from the nearest painted line
+        a, ab = lines[:, :2], lines[:, 2:] - lines[:, :2]
+        t = np.clip(((q[None] - a) * ab).sum(1) / (ab * ab).sum(1), 0.0, 1.0)
+        return float(np.hypot(*(a + t[:, None] * ab - q[None]).T).min())
 
-        rig._camera = spy
-        plan = None
-        while sim.result is None and sim.time < 120.0:
-            sim.advance(50)
-            if plan is None and sim.plan_info is not None:
-                g = sim.grid
-                plan = dict(free=g.free.copy(), far=g.far.copy(), stop=g.stop.copy(), occ=g.occupied().copy(),
-                            blocked=g.blocked().copy(), pose=np.array(sim.pose),
-                            path=np.concatenate([np.stack([s.x, s.y], axis=1) for s in sim.path]),
-                            tracks=np.array([np.concatenate(t.ends()) for t in sim.lines.markers()]).reshape(-1, 4),
-                            long=np.array([t.length > 1.2 for t in sim.lines.markers()]),
-                            target=sim.target.corners.copy() if sim.target is not None else np.zeros((0, 2)),
-                            fans=np.array([[f[0][0], f[0][1], f[1], f[2], f[3]] for f in rig.fans]))
-        print("%s: %s" % (mode, sim.result), flush=True)
-        for k, v in plan.items():
-            out["%s_plan_%s" % (tag, k)] = v
-        if mode == "camera":
-            for k, v in frame.items():
-                out["frame_" + k] = v
-            E = ps.EGO
-            out["ego"] = np.array([E.rear, E.front, E.half_width, E.ref_to_rear, *E.roof])
-            out["mounts"] = np.array([np.append(c["pos"], math.atan2(c["R"][1, 0], c["R"][0, 0])) for c in rig.cameras])
-            out["extent"] = np.array([sim.grid.x0, sim.grid.x0 + sim.grid.nx * sim.grid.RES,
-                                      sim.grid.y0, sim.grid.y0 + sim.grid.ny * sim.grid.RES])
-            out["lines"] = np.array([l[:4] for l in sim.scn.lines])
-            out["cars"] = np.array([c["poly"] for c in sim.scn.cars])
-            out["cam"] = np.array([rig.CAM_W, rig.CAM_H, rig.CAM_HFOV, rig.CAM_PITCH, rig.CAM_RANGE])
-        elif mode == "camera+lidar":
-            out["lidar"] = np.append(rig.lidar["pos"], [*rig.LIDAR_EL, rig.LIDAR_RANGE])
-        else:
-            out["radars"] = np.array([np.append(r["pos"], math.atan2(r["R"][1, 0], r["R"][0, 0])) for r in rig.radars])
-            out["radar"] = np.array([rig.RADAR_HFOV, rig.RADAR_VFOV, rig.RADAR_RANGE])
-    np.savez_compressed(path, **out)
-    sys.stdout.flush()
-    os._exit(0)             # leave without running destructors: the sensor manager owns render threads
+    camera = ps.SensorRig._camera
+
+    def camera_checked(self, cam, image, depth, ref_p, ref_R):
+        scan, xy, found = camera(self, cam, image, depth, ref_p, ref_R)
+        p, R = ref_p + ref_R @ cam["pos"], ref_R @ cam["R"]
+        kind = KIND[cam["label"]]
+        latest[cam["label"]] = dict(image=image[::-1].copy(), range=depth[::-1].copy(), view=cam["view"].copy())
+        # the road as a reference: pixels whose ray reaches the ground with nothing in between
+        pick = rng.integers(0, depth.size, 2500)
+        dw = (self.rays.reshape(-1, 3)[pick] @ R.T.astype(np.float32)).astype(float)
+        est = depth.reshape(-1)[pick].astype(float)
+        ok = (dw[:, 2] < -0.02) & (est > 0.3)
+        true = np.where(ok, -p[2] / np.minimum(dw[:, 2], -0.02), np.inf)
+        ok &= true < 15.0
+        g = p[:2] + np.where(ok, true, 0.0)[:, None] * dw[:, :2]
+        # (not the pixels that show the car itself: the bonnet hides the road up to 3 m ahead of the bumper)
+        seen_at = (p + est[:, None] * dw).astype(np.float32)
+        ok &= ~self._is_own(seen_at, ref_p, ref_R, 0.3)
+        rho = np.hypot(*(g - p[:2]).T)
+        ok[ok] = first_hit(p[:2], np.arctan2(dw[ok, 1], dw[ok, 0]), edges, 40.0) > rho[ok] + 0.3
+        road.append(np.stack([np.full(ok.sum(), kind), true[ok], est[ok]], axis=1))
+        # the nearest obstacle per bearing against the outlines
+        origin, ang, r_hit = scan[0], scan[1], scan[2]
+        m = np.isfinite(r_hit)
+        if m.any():
+            hits.append(np.stack([np.full(m.sum(), kind), first_hit(origin, ang[m], edges, 40.0), r_hit[m]], axis=1))
+        for x1, y1, x2, y2, _ in found:
+            worst = max(off_line(q) for q in np.linspace((x1, y1), (x2, y2), 7))
+            segs.append((kind, math.hypot(x2 - x1, y2 - y1), worst))
+        return scan, xy, found
+
+    ps.SensorRig._camera = camera_checked
+    scanner = ps.SensorRig._scanner
+
+    def scanner_checked(self, dev, r, *rest):
+        out = scanner(self, dev, r, *rest)
+        origin, ang, r_hit = out[0], out[1], out[2]
+        m = np.isfinite(r_hit)
+        if m.any():
+            hits.append(np.stack([np.full(m.sum(), 3), first_hit(origin, ang[m], edges, 40.0), r_hit[m]], axis=1))
+        return out
+
+    ps.SensorRig._scanner = scanner_checked
+    todo = list(SNAPSHOTS)
+    trail = []
+    while sim.result is None and sim.time < args.timeout:
+        sim.advance(50)
+        trail.append(sim.pose)
+        if todo and sim.time >= todo[0] and len(latest) == 3:
+            frames[todo.pop(0)] = {k: dict(v) for k, v in latest.items()}
+    g = sim.grid
+    # the car from the side: the top and the bottom of its body along the middle, from the mesh
+    shape = ps.chrono.CastToChVisualShapeTriangleMesh(rig.body.GetVisualModel().GetShape(0))
+    verts = np.array([[float(v) for v in ln.split()[1:4]] for ln in open(shape.GetMesh().GetFileName()) if ln.startswith("v ")])
+    mid = verts[np.abs(verts[:, 1]) < 0.3]
+    bins = np.round(mid[:, 0] / 0.05).astype(int)
+    profile = np.array([(b * 0.05, mid[bins == b, 2].max(), mid[bins == b, 2].min()) for b in np.unique(bins)])
+    out = dict(mode=mode, result=sim.result, message=sim.message, road=np.concatenate(road), hits=np.concatenate(hits),
+               segs=np.array(segs), frames=frames, free=g.free.copy(), far=g.far.copy(), obstacles=g.hits.copy(),
+               grid=(g.x0, g.y0, g.RES, g.nx, g.ny), trail=np.array(trail), parked=ps.ego_poly(sim.pose),
+               lines=scn.lines, cars=[c["poly"] for c in scn.cars],
+               tracks=[t.ends() for t in sim.lines.markers()],
+               cameras=[dict(label=c["label"], pos=c["pos"], R=c["R"], reach=c.get("reach", 0.0)) for c in rig.cameras],
+               lidar=None if rig.lidar is None else rig.lidar["pos"], profile=profile, own=rig.own,
+               ref_height=float(rig._frame()[0][2]), hfov=rig.CAM_HFOV, vfov=2.0 * math.atan(0.5 * rig.CAM_H / rig.CAM_F),
+               lidar_fov=(rig.LIDAR_HFOV, rig.LIDAR_EL, rig.LIDAR_RANGE), info=rig.depth.info,
+               network_seconds=rig.depth.seconds, network_calls=rig.depth.sent)
+    pickle.dump(out, open(path, "wb"))
+    print("recorded %s: %s" % (mode, sim.message), flush=True)
+    os._exit(0)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -118,188 +170,186 @@ def draw(path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.colors import ListedColormap
-    from matplotlib.patches import Polygon, Wedge
-
-    d = np.load(path)
-    os.makedirs(IMG, exist_ok=True)
-    plt.rcParams.update({"font.size": 9, "axes.titlesize": 10, "figure.dpi": 110, "savefig.bbox": "tight"})
-    C = dict(cam="#2f6fe0", lidar="#22a745", radar="#d9412b", car="#b02a2a", paint="#e0a800", seg="#d63ec8",
-             hit="#111111", free="#dfe9df", far="#f3ead0", unknown="#6b7078", occ="#111111", line="#c9a400",
-             track="#0aa5c4", stub="#0a6f82", path="#d63ec8", target="#22a745")
+    data = pickle.load(open(path, "rb"))
+    cam, lid = data["camera"], data["camera+lidar"]
+    plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.right": False})
+    C = {"front": "#1f77b4", "rear": "#d62728", "bumper": "#2ca02c", "lidar": "#9467bd"}
+    NAMES = (("front", "stereo pair"), ("rear", "rear camera"), ("bumper", "bumper camera"))
 
     def save(fig, name):
-        fig.savefig(os.path.join(IMG, name), dpi=130)
+        fig.savefig(os.path.join(IMG, name), dpi=110, bbox_inches="tight", facecolor="white")
         plt.close(fig)
         print("wrote docs/img/" + name)
 
-    rear, front, hw, ref_to_rear, roof_x0, roof_x1, roof_z = d["ego"]
+    def to_ground(p, a, sg, far=7.0):                      # end of a sight line in the side view
+        q = p + far * np.array([sg * math.cos(a), math.sin(a)])
+        return p + (q - p) * p[1] / (p[1] - q[1]) if q[1] < 0.0 else q
 
-    # ---- the rig: where the sensors sit and what they cover -----------------------------------
-    fig, axs = plt.subplots(2, 1, figsize=(8.0, 10.2), gridspec_kw=dict(height_ratios=[2.6, 1.0]))
-    ax = axs[0]
-    x0, x1 = -ref_to_rear - rear, -ref_to_rear + front           # body outline in the chassis frame
-    ax.add_patch(Polygon([(x0, -hw), (x1, -hw), (x1, hw), (x0, hw)], closed=True, fc="#e7c1c1", ec=C["car"], lw=1.5))
-    ax.add_patch(Polygon([(roof_x0, -0.6), (roof_x1, -0.6), (roof_x1, 0.6), (roof_x0, 0.6)], closed=True,
-                         fc="#d79a9a", ec=C["car"], lw=0.8))
-    hfov, reach = float(d["cam"][2]), float(d["cam"][4])
-    for (mx, my, mz, yaw), name in zip(d["mounts"], ("front stereo camera", "rear stereo camera")):
-        ax.add_patch(Wedge((mx, my), reach, math.degrees(yaw - 0.5 * hfov), math.degrees(yaw + 0.5 * hfov),
-                           fc=C["cam"], alpha=0.13, ec=C["cam"]))
-        ax.plot(mx, my, "s", color=C["cam"], ms=6)
-        ax.annotate(name, (mx + 4.5 * math.cos(yaw), my + 3.2), color=C["cam"], ha="center", fontsize=8)
-    lx, ly, lz, el0, el1, lr = d["lidar"]
-    ax.add_patch(plt.Circle((lx, ly), 14.0, fc="none", ec=C["lidar"], ls="--", lw=1.0))
-    ax.plot(lx, ly, "o", color=C["lidar"], ms=6)
-    ax.annotate("lidar, 360 deg\n(camera + lidar)", (lx, -13.2), color=C["lidar"], ha="center", fontsize=8)
-    r_hfov = float(d["radar"][0])
-    for mx, my, mz, yaw in d["radars"]:
-        ax.add_patch(Wedge((mx, my), 9.0, math.degrees(yaw - 0.5 * r_hfov), math.degrees(yaw + 0.5 * r_hfov),
-                           fc=C["radar"], alpha=0.10, ec=C["radar"]))
-        ax.plot(mx, my, "^", color=C["radar"], ms=6)
-    ax.annotate("side radars\n(camera + radar)", (0.0, 9.6), color=C["radar"], ha="center", fontsize=8)
-    ax.set_aspect("equal")
-    ax.set_xlim(-15.5, 15.5)
-    ax.set_ylim(-15, 15)
-    ax.set_xlabel("x [m], forward")
-    ax.set_ylabel("y [m], left")
-    ax.set_title("From above. No camera looks sideways.")
-    ax = axs[1]
-    prof_x = [x0, x0, roof_x0 - 0.6, roof_x0, roof_x1, roof_x1 + 0.75, x1, x1]
-    prof_z = [0.0, 0.95, 1.0, roof_z, roof_z, 0.95, 0.75, 0.0]
-    ground = -0.21                                              # the chassis frame sits above the ground
-    ax.add_patch(Polygon(list(zip(prof_x, prof_z)), closed=True, fc="#e7c1c1", ec=C["car"], lw=1.5))
-    ax.axhline(ground, color="0.4", lw=1.0)
-    pitch = float(d["cam"][3])
-    vfov = 2.0 * math.atan(math.tan(0.5 * hfov) * d["cam"][1] / d["cam"][0])
-    for (mx, my, mz, yaw), (ex, ez) in zip(d["mounts"], ((x1, 0.75), (x0, 0.95))):
-        s = math.cos(yaw)
-        up = -pitch + 0.5 * vfov                                 # upper edge of the image
-        ax.plot([mx, mx + s * 4.5 * math.cos(up)], [mz, mz + 4.5 * math.sin(up)], color=C["cam"], lw=0.9)
-        gx = mx + (ex - mx) * (mz - ground) / (mz - ez)          # the ray that grazes the end of the body
-        ax.plot([mx, gx], [mz, ground], color=C["cam"], lw=0.9)
-        ax.fill([mx, mx + s * 4.5 * math.cos(up), gx], [mz, mz + 4.5 * math.sin(up), ground], color=C["cam"], alpha=0.08)
-        ax.annotate("first ground seen\n%.1f m from the bumper" % abs(gx - ex), (gx, ground), (gx + s * 0.4, 1.9),
-                    color=C["cam"], fontsize=7, ha="center", arrowprops=dict(arrowstyle="-", color=C["cam"], lw=0.6))
-        ax.plot(mx, mz, "s", color=C["cam"], ms=6)
-    for a in np.linspace(el0, el1, 16):
-        t = min(8.5, (lz - ground) / max(-math.sin(a), 1e-6)) if a < 0 else 8.5
-        for s in (-1.0, 1.0):
-            ax.plot([lx, lx + s * t * math.cos(a)], [lz, lz + t * math.sin(a)], color=C["lidar"], lw=0.35)
-    ax.plot(lx, lz, "o", color=C["lidar"], ms=6)
-    ax.plot(d["radars"][0][0], d["radars"][0][2], "^", color=C["radar"], ms=6)
-    ax.set_aspect("equal")
-    ax.set_xlim(-9.5, 9.5)
-    ax.set_ylim(-0.6, 3.4)
-    ax.set_xlabel("x [m], forward")
-    ax.set_ylabel("z [m], chassis frame")
-    ax.set_title("From the side. The bonnet and the boot hide the nearest ground from the cameras.")
-    fig.tight_layout()
+    # ---- the rig -----------------------------------------------------------------------------
+    fig, (ax, bx) = plt.subplots(1, 2, figsize=(15, 4.6), gridspec_kw=dict(width_ratios=[1.6, 1]))
+    pr, z0 = lid["profile"], lid["ref_height"]
+    # the body from the side: the envelope of the mesh along the middle of the car
+    top = np.array([pr[np.abs(pr[:, 0] - x) < 0.11, 1].max() for x in pr[:, 0]]) + z0
+    ax.fill_between(pr[:, 0], z0, top, color="0.82", lw=0)
+    ax.axhline(0.0, color="0.3", lw=1.2)
+    for c in lid["cameras"]:
+        if c["label"] not in C:
+            continue
+        fwd = c["R"] @ np.array([1.0, 0.0, 0.0])
+        pitch, sg = math.atan2(-fwd[2], math.hypot(fwd[0], fwd[1])), (1.0 if fwd[0] > 0 else -1.0)
+        p = np.array([c["pos"][0], c["pos"][2] + z0])
+        low = -pitch - 0.5 * lid["vfov"]
+        ahead = sg * (pr[:, 0] - p[0]) > 0.3                 # the car's own body may hide the lower part
+        if ahead.any():
+            low = max(low, float(np.arctan2(top[ahead] - p[1], sg * (pr[ahead, 0] - p[0])).max()))
+        for a in (low, -pitch + 0.5 * lid["vfov"]):
+            q = to_ground(p, a, sg, 9.0)
+            ax.plot([p[0], q[0]], [p[1], q[1]], color=C[c["label"]], lw=1.0)
+        ax.plot(*p, "o", color=C[c["label"]], ms=6, label="%s, %.2f m up" % (dict(NAMES)[c["label"]], p[1]))
+    p = np.array([lid["lidar"][0], lid["lidar"][2] + z0])
+    for a in lid["lidar_fov"][1]:
+        q = to_ground(p, a, 1.0)
+        ax.plot([p[0], q[0]], [p[1], q[1]], color=C["lidar"], lw=1.0, ls="--")
+    ax.plot(*p, "s", color=C["lidar"], ms=6, label="lidar (optional), %.2f m up" % p[1])
+    ax.set_aspect("equal"); ax.set_xlim(-7.0, 9.5); ax.set_ylim(-0.2, 4.2)
+    ax.set_xlabel("along the car [m]"); ax.set_ylabel("height [m]")
+    ax.legend(loc="upper left", fontsize=8, frameon=False, ncol=2)
+    ax.set_title("From the side: the upper and lower edge of what each sensor sees", fontsize=10)
+    x0, x1, hw = lid["own"]
+    bx.add_patch(plt.Rectangle((x0, -hw), x1 - x0, 2 * hw, color="0.82"))
+    for c in lid["cameras"]:
+        if c["label"] not in C:
+            continue
+        yaw = math.atan2(c["R"][1, 0], c["R"][0, 0])
+        a = np.linspace(yaw - 0.5 * lid["hfov"], yaw + 0.5 * lid["hfov"], 40)
+        pts = np.concatenate([[c["pos"][:2]], c["pos"][:2] + c["reach"] * np.stack([np.cos(a), np.sin(a)], 1), [c["pos"][:2]]])
+        bx.fill(pts[:, 0], pts[:, 1], color=C[c["label"]], alpha=0.18, lw=0)
+        bx.plot(pts[:, 0], pts[:, 1], color=C[c["label"]], lw=1.0)
+    hf, _, reach = lid["lidar_fov"]
+    a = np.linspace(-0.5 * hf, 0.5 * hf, 40)
+    pts = np.concatenate([[lid["lidar"][:2]], lid["lidar"][:2] + reach * np.stack([np.cos(a), np.sin(a)], 1), [lid["lidar"][:2]]])
+    bx.plot(pts[:, 0], pts[:, 1], color=C["lidar"], lw=1.0, ls="--")
+    bx.set_aspect("equal"); bx.set_xlim(-8, 24); bx.set_ylim(-13, 13)
+    bx.set_xlabel("along the car [m]"); bx.set_ylabel("to the left [m]")
+    bx.set_title("From above: how far each is used for the map", fontsize=10)
     save(fig, "sensor_rig.png")
 
-    # ---- one camera frame: what comes in and what is made of it -----------------------------------
-    fig = plt.figure(figsize=(13.0, 6.4))
-    gs = fig.add_gridspec(2, 3, width_ratios=[1.0, 1.0, 1.05], height_ratios=[1.0, 1.0])
-    ax = fig.add_subplot(gs[0, 0])
-    ax.imshow(d["frame_rgb"][::-1])
-    ax.set_title("colour image, front camera (%d x %d, %.0f deg)" % (d["cam"][0], d["cam"][1], math.degrees(hfov)))
-    ax.axis("off")
-    ax = fig.add_subplot(gs[0, 1])
-    im = ax.imshow(np.minimum(d["frame_depth"][::-1], 20.0), cmap="viridis_r")
-    ax.set_title("depth image: range along each pixel's ray")
-    ax.axis("off")
-    fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02, label="m")
-    ax = fig.add_subplot(gs[1, 0])
-    cmap = ListedColormap(["#222630", "#54585f", "#ff7828", "#702c2c", "#96784a", "#fff03c"])
-    ax.imshow(d["frame_view"], cmap=cmap, vmin=0, vmax=5, interpolation="nearest")
-    ax.set_title("what each pixel is read as")
-    ax.axis("off")
-    ax = fig.add_subplot(gs[1, 1])
-    ax.axis("off")
-    for k, (name, col) in enumerate((("ground", "#54585f"), ("obstacle", "#ff7828"), ("unclear: not ground, not clearly an obstacle", "#96784a"),
-                                     ("paint", "#fff03c"), ("the car itself", "#702c2c"), ("nothing within range, or sky", "#222630"))):
-        ax.add_patch(plt.Rectangle((0.02, 0.86 - 0.13 * k), 0.07, 0.085, fc=col, ec="0.3", transform=ax.transAxes))
-        ax.text(0.12, 0.90 - 0.13 * k, name, transform=ax.transAxes, va="center", fontsize=9)
-    ax = fig.add_subplot(gs[:, 2])
-    for x1_, y1_, x2_, y2_ in d["lines"]:
-        ax.plot([x1_, x2_], [y1_, y2_], color="#d8d8d8", lw=4, solid_capstyle="butt", zorder=1)
-    for poly in d["cars"]:
-        ax.add_patch(Polygon(poly, closed=True, fc="#eceef1", ec="#9aa0a8", lw=0.8, zorder=2))
-    o = d["frame_origin"]
-    for a, rf, rr in zip(d["frame_ang"][::3], d["frame_r_free"][::3], d["frame_r_far"][::3]):
-        ax.plot([o[0] + rf * math.cos(a), o[0] + rr * math.cos(a)], [o[1] + rf * math.sin(a), o[1] + rr * math.sin(a)],
-                color="#c9b26b", lw=0.5, zorder=3)
-        ax.plot([o[0], o[0] + rf * math.cos(a)], [o[1], o[1] + rf * math.sin(a)], color="#6fae6f", lw=0.5, zorder=3)
-    ok = np.isfinite(d["frame_r_hit"])
-    ax.plot(o[0] + d["frame_r_hit"][ok] * np.cos(d["frame_ang"][ok]), o[1] + d["frame_r_hit"][ok] * np.sin(d["frame_ang"][ok]),
-            ".", color=C["hit"], ms=3, zorder=5, label="nearest obstacle per bearing")
-    ax.plot(d["frame_paint"][::2, 0], d["frame_paint"][::2, 1], ",", color=C["paint"], zorder=4)
-    for k, s in enumerate(d["frame_segs"]):
-        ax.plot([s[0], s[2]], [s[1], s[3]], color=C["seg"], lw=2.0, zorder=6, label="line segments" if k == 0 else None)
-    ax.plot([], [], color="#6fae6f", lw=1.5, label="free ground")
-    ax.plot([], [], color="#c9b26b", lw=1.5, label="ground, too far to rule out a kerb")
-    ax.plot([], [], "s", color=C["paint"], ms=4, label="paint pixels on the ground")
-    px, py, pth = d["frame_pose"]
-    c, s_ = math.cos(pth), math.sin(pth)
-    body = [(px + c * a - s_ * b, py + s_ * a + c * b) for a, b in ((-rear, -hw), (front, -hw), (front, hw), (-rear, hw))]
-    ax.add_patch(Polygon(body, closed=True, fc="#e7c1c1", ec=C["car"], lw=1.2, zorder=7))
-    ax.set_aspect("equal")
-    ax.set_xlim(px - 3.0, px + 14.5)
-    ax.set_ylim(-12.5, 12.5)
-    ax.legend(loc="upper left", fontsize=7, framealpha=0.95)
-    ax.set_title("the same frame on the ground: scan and line segments")
-    ax.set_xlabel("x [m]")
-    ax.set_ylabel("y [m]")
+    # ---- one moment: what each camera delivers and what is made of it --------------------------
+    palette = np.array([(34, 38, 48), (84, 88, 96), (255, 120, 40), (112, 44, 44), (150, 120, 70), (255, 240, 60)], np.uint8)
+    t = SNAPSHOTS[1] if SNAPSHOTS[1] in cam["frames"] else sorted(cam["frames"])[-1]
+    fr = cam["frames"][t]
+    fig, axes = plt.subplots(3, 3, figsize=(15, 9.6))
+    for row, (label, name, net) in enumerate((("front", "front left camera", cam["info"]["model"] + ", from the stereo pair"),
+                                              ("rear", "rear camera", "a monocular network, anchored to the ground"),
+                                              ("bumper", "bumper camera", "a monocular network, anchored to the ground"))):
+        f = fr[label]
+        axes[row, 0].imshow(f["image"]); axes[row, 0].set_title(name, fontsize=10)
+        im = axes[row, 1].imshow(np.where(f["range"] > 0.05, f["range"], np.nan), cmap="turbo_r", vmin=0.0, vmax=15.0)
+        axes[row, 1].set_title("range computed by " + net, fontsize=10)
+        fig.colorbar(im, ax=axes[row, 1], fraction=0.03, pad=0.02, label="m")
+        axes[row, 2].imshow(palette[f["view"]], interpolation="nearest")
+        axes[row, 2].set_title("read as: ground (grey), obstacle (orange), paint (yellow), own body (red)", fontsize=9)
+        for a in axes[row]:
+            a.set_xticks([]); a.set_yticks([])
+    fig.suptitle("%.0f s into the run" % t, fontsize=11, y=0.995)
     fig.tight_layout()
     save(fig, "camera_frame.png")
 
-    # ---- what each sensor set knows when the plan is made ---------------------------------------
-    names = (("c", "camera"), ("cl", "camera + lidar"), ("cr", "camera + radar"))
-    fig, axs = plt.subplots(3, 1, figsize=(11.5, 11.0))
-    ext = d["extent"]
-    for ax, (tag, name) in zip(axs, names):
-        free, far, stop, occ = (d["%s_plan_%s" % (tag, k)] for k in ("free", "far", "stop", "occ"))
-        img = np.zeros(free.shape, dtype=np.uint8)                 # 0 unknown
-        img[(far >= 3) & (stop == 0)] = 1                          # far ground
-        img[free >= 1] = 2                                         # free
-        img[occ] = 3
-        ax.imshow(img, origin="lower", extent=ext, interpolation="nearest",
-                  cmap=ListedColormap([C["unknown"], C["far"], C["free"], C["occ"]]), vmin=0, vmax=3)
-        for x1_, y1_, x2_, y2_ in d["lines"]:
-            ax.plot([x1_, x2_], [y1_, y2_], color=C["line"], lw=2.5, alpha=0.35, solid_capstyle="butt")
+    # ---- accuracy against the scenario ---------------------------------------------------------
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.4))
+    ax = axes[0]
+    edges_r = np.array([0.8, 1.5, 2.5, 4.0, 6.0, 8.0, 10.0, 12.0, 15.0])
+    for k, (label, name) in enumerate(NAMES):
+        d = cam["road"][cam["road"][:, 0] == k]
+        mids, med, p90 = [], [], []
+        for lo, hi in zip(edges_r[:-1], edges_r[1:]):
+            m = (d[:, 1] >= lo) & (d[:, 1] < hi)
+            if m.sum() >= 200:
+                e = np.abs(d[m, 2] - d[m, 1])
+                mids.append(0.5 * (lo + hi)); med.append(np.median(e)); p90.append(np.quantile(e, 0.9))
+        ax.plot(mids, med, "o-", color=C[label], label=name + ", median")
+        ax.plot(mids, p90, "o--", color=C[label], alpha=0.6, label=name + ", 9 of 10 within")
+    ax.set_yscale("log"); ax.set_xlabel("true range of the road surface [m]"); ax.set_ylabel("range error [m]")
+    ax.set_title("Range of the road, against the plane that it is", fontsize=10); ax.legend(fontsize=8, frameon=False)
+    ax = axes[1]
+    for src, k, label, name in ((cam, 0, "front", "stereo pair"), (cam, 1, "rear", "rear camera"),
+                                (cam, 2, "bumper", "bumper camera"), (lid, 3, "lidar", "lidar")):
+        d = src["hits"][src["hits"][:, 0] == k]
+        d = d[d[:, 1] < 30.0]
+        if len(d) > 100:
+            e = d[:, 2] - d[:, 1]
+            ax.hist(np.clip(e, -0.5, 0.5), bins=np.linspace(-0.5, 0.5, 81), histtype="step", density=True, color=C[label],
+                    label="%s: median %+.0f cm, half within %.0f cm" % (name, 100 * np.median(e), 100 * np.median(np.abs(e))))
+    ax.set_xlabel("nearest obstacle per bearing: reported minus true range [m]"); ax.set_yticks([])
+    ax.set_title("Obstacles, against the outlines of the cars and kerbs", fontsize=10); ax.legend(fontsize=8, frameon=False)
+    ax = axes[2]
+    for k, (label, name) in enumerate(NAMES):
+        d = cam["segs"][cam["segs"][:, 0] == k] if len(cam["segs"]) else np.zeros((0, 3))
+        if len(d):
+            ax.hist(np.clip(d[:, 2], 0, 0.5), bins=np.linspace(0, 0.5, 51), weights=d[:, 1], histtype="step", color=C[label],
+                    label="%s: %.0f%% of %.0f m on a painted line" % (name, 100 * d[d[:, 2] < 0.12, 1].sum() / d[:, 1].sum(), d[:, 1].sum()))
+    ax.set_xlabel("largest distance of a reported segment from a painted line [m]"); ax.set_ylabel("metres of segments")
+    ax.set_title("Line segments, against the painted lines", fontsize=10); ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    save(fig, "sensor_accuracy.png")
+
+    # ---- the maps ----------------------------------------------------------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6.2))
+    for ax, d, name in zip(axes, (cam, lid), ("cameras", "cameras and lidar")):
+        x0, y0, res, nx, ny = d["grid"]
+        T = lambda a: a.T if a.shape == (nx, ny) else a
+        img = np.full((ny, nx, 3), 0.13)
+        img[T(d["far"] >= 3)] = (0.25, 0.3, 0.36)
+        img[T(d["free"] >= 1)] = (0.42, 0.45, 0.5)
+        img[T(d["obstacles"] >= 2)] = (0.95, 0.35, 0.25)
+        ax.imshow(img, origin="lower", extent=(x0, x0 + nx * res, y0, y0 + ny * res), interpolation="nearest")
         for poly in d["cars"]:
-            ax.add_patch(Polygon(poly, closed=True, fc="none", ec="#4c7fd0", lw=0.7))
-        for (ax1, ay1, ax2, ay2), lng in zip(d[tag + "_plan_tracks"], d[tag + "_plan_long"]):
-            ax.plot([ax1, ax2], [ay1, ay2], color=C["track"] if lng else C["stub"], lw=2.2 if lng else 3.2)
-        tgt = d[tag + "_plan_target"]
-        if len(tgt):
-            ax.add_patch(Polygon(tgt, closed=True, fc="none", ec=C["target"], lw=2.2))
-        p = d[tag + "_plan_path"]
-        ax.plot(p[:, 0], p[:, 1], color=C["path"], lw=1.6)
-        px, py, pth = d[tag + "_plan_pose"]
-        c, s_ = math.cos(pth), math.sin(pth)
-        body = [(px + c * a - s_ * b, py + s_ * a + c * b) for a, b in ((-rear, -hw), (front, -hw), (front, hw), (-rear, hw))]
-        ax.add_patch(Polygon(body, closed=True, fc="#e7c1c1", ec=C["car"], lw=1.2))
-        ax.set_xlim(-12.0, ext[1])
-        ax.set_ylim(ext[2], ext[3])
-        ax.set_aspect("equal")
-        ax.set_ylabel("y [m]")
-        ax.set_title("%s: the map when the plan is made. Free (light green), far ground (sand), obstacle (black), "
-                     "unknown (grey)" % name)
-    axs[-1].set_xlabel("x [m]")
+            ax.plot(*np.vstack([poly, poly[:1]]).T, color="0.75", lw=0.7)
+        for ends in d["tracks"]:
+            ax.plot(*np.array(ends).T, color="cyan", lw=1.8)
+        ax.plot(d["trail"][:, 0], d["trail"][:, 1], color="white", lw=1.0, ls=":")
+        ax.plot(*np.vstack([d["parked"], d["parked"][:1]]).T, color="white", lw=1.4)
+        xs = [v for ln in d["lines"] for v in (ln[0], ln[2])]; ys = [v for ln in d["lines"] for v in (ln[1], ln[3])]
+        ax.set_xlim(min(xs) - 10, max(xs) + 6); ax.set_ylim(min(ys) - 3, max(ys) + 3); ax.set_aspect("equal")
+        ax.set_title("%s: the map when parked\nred: obstacle, grey: seen free, dark blue: probably free, cyan: lines" % name, fontsize=9)
     fig.tight_layout()
     save(fig, "sensor_maps.png")
 
+    # ---- numbers for the text ------------------------------------------------------------------
+    for d in (cam, lid):
+        print("%s: %s; networks %.0f s in %d calls (%s, %s)" % (d["mode"], d["message"], d["network_seconds"], d["network_calls"],
+                                                             d["info"]["model"], d["info"]["mono"]))
+    for k, (label, name) in enumerate(NAMES):
+        d = cam["road"][cam["road"][:, 0] == k]
+        for lo, hi in ((0.8, 2), (2, 4), (4, 7), (7, 10), (10, 15)):
+            m = (d[:, 1] >= lo) & (d[:, 1] < hi)
+            if m.sum() >= 200:
+                e = np.abs(d[m, 2] - d[m, 1])
+                print("  road, %-13s %4.1f-%4.1f m: median %.3f m, 9 of 10 within %.3f m (%d samples)" % (
+                    name, lo, hi, np.median(e), np.quantile(e, 0.9), m.sum()))
+    for src, k, name in ((cam, 0, "stereo pair"), (cam, 1, "rear camera"), (cam, 2, "bumper camera"), (lid, 3, "lidar")):
+        d = src["hits"][src["hits"][:, 0] == k]
+        d = d[d[:, 1] < 30.0]
+        if len(d) > 100:
+            e = d[:, 2] - d[:, 1]
+            print("  obstacles, %-13s median %+.3f m, half within %.3f m, 9 of 10 within %.3f m (%d bearings)" % (
+                name, np.median(e), np.median(np.abs(e)), np.quantile(np.abs(e), 0.9), len(d)))
+    for k, (label, name) in enumerate(NAMES):
+        d = cam["segs"][cam["segs"][:, 0] == k] if len(cam["segs"]) else np.zeros((0, 3))
+        if len(d):
+            print("  lines, %-13s %d segments, %.0f m, %.1f%% of the length on a painted line, median offset %.3f m" % (
+                name, len(d), d[:, 1].sum(), 100 * d[d[:, 2] < 0.12, 1].sum() / d[:, 1].sum(), np.median(d[:, 2])))
+
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "record-one":
+    if len(sys.argv) > 1 and sys.argv[1] == "record-one":
         record_one(sys.argv[2], sys.argv[3])
-    elif len(sys.argv) == 3 and sys.argv[1] in ("record", "draw"):
-        (record if sys.argv[1] == "record" else draw)(sys.argv[2])
-    elif len(sys.argv) == 1:
+    elif len(sys.argv) > 1 and sys.argv[1] == "record":
+        record(sys.argv[2])
+    elif len(sys.argv) > 1 and sys.argv[1] == "draw":
+        draw(sys.argv[2])
+    else:
         import tempfile
-        tmp = os.path.join(tempfile.gettempdir(), "parking_sensor_frames.npz")
+        tmp = os.path.join(tempfile.gettempdir(), "parking_sensor_frames.pkl")
         record(tmp)
         draw(tmp)
-    else:
-        sys.exit(__doc__)

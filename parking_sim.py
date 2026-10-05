@@ -8,11 +8,12 @@
 # maneuver into it and tracks that plan with model predictive control. One
 # window shows the scene, what the sensors deliver and a panel with the internals.
 #
-#   perception : Chrono::Sensor stereo cameras looking forward and back (lines
-#                from the colour image, obstacles and free ground from depth),
-#                optionally a roof lidar or side radars. No camera looks
-#                sideways. Without ray-traced sensors: noisy detections
-#                computed from the scenario
+#   perception : Chrono::Sensor cameras where a production car has them: a stereo
+#                pair behind the windshield, one at the tail, one on the front
+#                bumper, optionally a forward-facing lidar. Depth is computed
+#                from the images by neural networks (IGEV++ for the pair), not
+#                read from the renderer. No camera looks sideways. Without
+#                ray-traced sensors: noisy detections computed from the scenario
 #   mapping    : line tracks (total least squares) + occupancy grid
 #   decision   : stalls are inferred from pairs of tracked lines, classified
 #                free / occupied / unknown, and scored
@@ -27,11 +28,12 @@
 # design is documented in docs/.
 #
 # Examples (any Python with PyChrono's vehicle and irrlicht modules; the sensors
-# also need its sensor module with cameras, lidar and radar, see docs/sensors.md):
+# also need its sensor module with cameras and lidar, and a Python with PyTorch
+# for the depth networks, see docs/sensors.md):
 #
 #   python parking_sim.py                                  perpendicular, car on each side
-#   python parking_sim.py --sensors camera+lidar           cameras and a roof lidar
-#   python parking_sim.py --sensors camera+radar           cameras and side radars
+#   python parking_sim.py --sensors camera+lidar           cameras and a forward-facing lidar
+#   python parking_sim.py --stereo rt                      the faster stereo network
 #   python parking_sim.py --sensors sim                    no sensors, detections from the scenario
 #   python parking_sim.py --layout quad                    four views of the scene, no sensor pictures
 #   python parking_sim.py --type angled --cars none        60 deg stalls, empty lot
@@ -49,20 +51,22 @@ import collections
 import ctypes
 import glob
 import heapq
+import json
 import math
 import os
+import queue
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import zlib
 
 import numpy as np
 
 
-def _reexec_in_chrono_env():
-    """PyChrono is not importable here: look for a conda env that has it."""
-    if os.environ.get("PARKING_SIM_REEXEC"):
-        return
+def _conda_roots():
     roots = []
     for var in ("CONDA_EXE", "MAMBA_EXE"):
         exe = os.environ.get(var)
@@ -71,8 +75,15 @@ def _reexec_in_chrono_env():
     roots += ["/opt/homebrew/Caskroom/miniconda/base", "/opt/homebrew/anaconda3",
               os.path.expanduser("~/miniconda3"), os.path.expanduser("~/anaconda3"),
               os.path.expanduser("~/miniforge3"), os.path.expanduser("~/mambaforge")]
+    return list(dict.fromkeys(roots))
+
+
+def _reexec_in_chrono_env():
+    """PyChrono is not importable here: look for a conda env that has it."""
+    if os.environ.get("PARKING_SIM_REEXEC"):
+        return
     found = []
-    for root in dict.fromkeys(roots):
+    for root in _conda_roots():
         for f in glob.glob(os.path.join(root, "envs", "*", "lib", "python*", "site-packages",
                                         "pychrono", "vehicle.py")):
             if os.path.exists(os.path.join(os.path.dirname(f), "irrlicht.py")):
@@ -97,7 +108,7 @@ try:
     import pychrono.sensor as sens
 except ImportError:
     sens = None
-# Cameras, lidar and radar need a PyChrono whose sensor module wraps the ray-traced sensors
+# Cameras and lidar need a PyChrono whose sensor module wraps the ray-traced sensors
 HAVE_SENSORS = sens is not None and hasattr(sens, "ChCameraSensor")
 
 # =============================================================================
@@ -426,15 +437,17 @@ def make_street(cars, side, rng, n=5):
 def make_scenario(kind, cars, side, angle, seed):
     rng = np.random.default_rng(seed)
     sg = -1 if side == "right" else 1
-    if kind == "parallel":
-        return make_street(cars, sg, rng)
-    return make_lot(90.0 if kind == "perpendicular" else angle, cars, sg, rng)
+    scn = make_street(cars, sg, rng) if kind == "parallel" else \
+        make_lot(90.0 if kind == "perpendicular" else angle, cars, sg, rng)
+    scn.seed = seed
+    return scn
 
 
 # =============================================================================
 # Perception. Two interchangeable sources feed the same mapping code:
 #   Perception   noisy line segments and a noisy 360 degree range scan, computed from the scenario
-#   SensorRig    Chrono::Sensor cameras (and optionally a lidar or radars) mounted on the car
+#   SensorRig    Chrono::Sensor cameras (and optionally a lidar) mounted on the car, with depth
+#                computed from their images by neural networks
 # Both return, every tick, a list of planar scans (origin, bearings, range of the nearest
 # obstacle per bearing or NaN, range known to be free per bearing) and a list of line
 # segments (x1, y1, x2, y2, distance from the sensor).
@@ -523,10 +536,12 @@ class Perception:
 
 
 # =============================================================================
-# Perception from Chrono::Sensor. The car carries a stereo camera (colour image + depth) that
-# looks forward and one that looks back, and optionally a roof lidar or four corner radars.
-# There is no camera to the sides: what is beside the car is known only from what was seen
-# before, or from the lidar or the radars.
+# Perception from Chrono::Sensor. The car carries what a production car could: a stereo pair of
+# cameras behind the windshield, one camera at the tail, one on the front bumper, and optionally
+# a forward-facing lidar. Nothing looks sideways: what is beside the car is known only from what
+# was seen before. Range is not read from the renderer. It is computed from the images, by a
+# stereo network for the pair and by a monocular depth network for the single cameras, both of
+# which run in stereo_worker.py.
 # =============================================================================
 
 def _rot_y(a):
@@ -550,7 +565,7 @@ def pinhole_rays(w, h, hfov):
 
 def angular_rays(w, h, hfov, el_min, el_max, inclusive):
     """Unit rays of a scanning sensor: one per bearing and elevation. The lidar spaces its beams
-    from end to end of each range (inclusive); the radar puts them at the cell centres."""
+    from end to end of each range (inclusive); otherwise they are at the centres of the cells."""
     if inclusive:
         az = -0.5 * hfov + np.arange(w) / (w - 1) * hfov
         el = el_min + np.arange(h) / (h - 1) * (el_max - el_min)
@@ -559,18 +574,6 @@ def angular_rays(w, h, hfov, el_min, el_max, inclusive):
         el = el_min + (np.arange(h) + 0.5) / h * (el_max - el_min)
     EL, AZ = np.meshgrid(el, az, indexing="ij")
     return np.stack([np.cos(EL) * np.cos(AZ), np.cos(EL) * np.sin(AZ), np.sin(EL)], axis=-1).astype(np.float32)
-
-
-def smooth_noise(rng, shape, block=8):
-    """Unit-variance noise that varies smoothly over an image, like the error of a stereo matcher."""
-    h, w = shape
-    g = rng.normal(0.0, 1.0, (h // block + 2, w // block + 2))
-    y, x = (np.arange(h) + 0.5) / block, (np.arange(w) + 0.5) / block
-    y0, x0 = y.astype(int), x.astype(int)
-    fy, fx = (y - y0)[:, None], (x - x0)[None, :]
-    top = g[y0][:, x0] * (1.0 - fx) + g[y0][:, x0 + 1] * fx
-    bot = g[y0 + 1][:, x0] * (1.0 - fx) + g[y0 + 1][:, x0 + 1] * fx
-    return ((top * (1.0 - fy) + bot * fy) / 0.75).astype(np.float32)   # blending lowers the variance
 
 
 def planar_scan(P, origin, obstacle, ground, blocking, n_bins, half_fov, heading, r_max, r_cell=0.1):
@@ -615,9 +618,11 @@ def planar_scan(P, origin, obstacle, ground, blocking, n_bins, half_fov, heading
     return ang, r_hit, np.maximum(np.fmin(far, r_stop - 0.15), 0.0), r_stop, before
 
 
-def paint_segments(pts, origin, cell=0.05, r_max=14.0, max_lines=20, min_len=0.35):
+def paint_segments(pts, origin, cell=0.05, r_max=14.0, max_lines=20, min_len=0.35, min_count=2):
     """Straight stripes among the ground points classified as paint. A Hough vote finds a line,
-    a total least squares fit over its cells refines it, gaps split it into segments.
+    a total least squares fit over its cells refines it, gaps split it into segments. A segment
+    is built from solid pieces of at least 0.25 m: a patch of sunlit road between two shadows
+    is as light as paint, but it is a spot, and a spot does not start, end or extend a line.
     Returns a list of (x1, y1, x2, y2, distance from the sensor)."""
     if len(pts) < 20:
         return []
@@ -625,7 +630,7 @@ def paint_segments(pts, origin, cell=0.05, r_max=14.0, max_lines=20, min_len=0.3
     off = int(r_max / cell) + 2
     ij = ij[(np.abs(ij) < off).all(axis=1)]
     key, cnt = np.unique((ij[:, 0] + off) * (2 * off + 1) + (ij[:, 1] + off), return_counts=True)
-    key = key[cnt >= 2]                                   # single pixels are speckle
+    key = key[cnt >= min_count]                           # single pixels are speckle
     if len(key) < 12:
         return []
     c = (np.stack([key // (2 * off + 1) - off, key % (2 * off + 1) - off], axis=1) + 0.5) * cell
@@ -657,8 +662,12 @@ def paint_segments(pts, origin, cell=0.05, r_max=14.0, max_lines=20, min_len=0.3
         off_n = (c - m) @ np.array([-d[1], d[0]])
         inl = alive & (np.abs(off_n) < 0.10)
         s = np.sort((c[inl] - m) @ d)
+        cut = np.flatnonzero(np.diff(s) > 2.5 * cell)
+        solid = [s[a:b + 1] for a, b in zip(np.concatenate(([0], cut + 1)), np.concatenate((cut, [len(s) - 1])))
+                 if s[b] - s[a] >= 0.25]
+        s = np.concatenate(solid) if solid else s[:0]
         cut = np.flatnonzero(np.diff(s) > 0.45)
-        for a, b in zip(np.concatenate(([0], cut + 1)), np.concatenate((cut, [len(s) - 1]))):
+        for a, b in zip(np.concatenate(([0], cut + 1)), np.concatenate((cut, [len(s) - 1]))) if len(s) else ():
             if s[b] - s[a] >= min_len and (b - a + 1) >= 0.35 * (s[b] - s[a]) / cell:
                 p1, p2 = origin + m + s[a] * d, origin + m + s[b] * d
                 out.append((p1[0], p1[1], p2[0], p2[1], float(np.hypot(*(m + 0.5 * (s[a] + s[b]) * d)))))
@@ -667,93 +676,215 @@ def paint_segments(pts, origin, cell=0.05, r_max=14.0, max_lines=20, min_len=0.3
     return out
 
 
+class DepthWorker:
+    """The process that runs the depth networks (stereo_worker.py). Requests are answered in the
+    order they were made; a thread keeps reading the answers so that neither side waits on a
+    full pipe."""
+
+    def __init__(self, python, options):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stereo_worker.py")
+        self.proc = subprocess.Popen([python, script] + options, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError("the depth networks did not start. Try: %s %s --check" % (python, script))
+        self.info = json.loads(line)
+        self.replies = queue.Queue()
+        self.sent, self.seconds = 0, 0.0
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        out = self.proc.stdout
+        try:
+            while True:
+                line = out.readline()
+                if not line:
+                    break
+                head = json.loads(line)
+                size = head["h"] * head["w"]
+                maps = [np.frombuffer(out.read(4 * size), np.float32).reshape(head["h"], head["w"])
+                        for _ in range(head["n"])]
+                self.replies.put((head, maps))
+        finally:
+            self.replies.put((None, None))
+
+    def submit(self, op, images):
+        """Ask for the disparity of a pair ('stereo') or the relative inverse depth of each
+        image ('mono'). Images are (rows, columns, 3) uint8 with the top row first."""
+        self.sent += 1
+        h, w = images[0].shape[:2]
+        pipe = self.proc.stdin
+        pipe.write((json.dumps(dict(id=self.sent, op=op, h=h, w=w, n=len(images))) + "\n").encode())
+        for img in images:
+            pipe.write(np.ascontiguousarray(img).tobytes())
+        pipe.flush()
+        return self.sent
+
+    def collect(self, ident):
+        head, maps = self.replies.get()
+        if head is None or head["id"] != ident:
+            raise RuntimeError("the depth networks stopped")
+        self.seconds += head["seconds"]
+        return maps
+
+
+def find_depth_python(explicit=None):
+    """A Python that has what the depth networks need: the one named, this one, or a conda env."""
+    need = ("torch", "timm", "transformers")
+
+    def fits(py):          # looked up on disk, which is quick; importing PyTorch to ask takes seconds
+        env = os.path.dirname(os.path.dirname(os.path.abspath(py)))
+        return all(glob.glob(os.path.join(env, "lib", "python*", "site-packages", n, "__init__.py")) for n in need)
+
+    explicit = explicit or os.environ.get("PARKING_DEPTH_PYTHON")
+    if explicit:
+        return explicit
+    found = [sys.executable] if fits(sys.executable) else []
+    for root in _conda_roots():
+        found += [py for py in sorted(glob.glob(os.path.join(root, "envs", "*", "bin", "python"))) if fits(py)]
+    return found[0] if found else None
+
+
+def sensor_mounts(body):
+    """Where the sensors go, read from the car's body mesh, as (x, z) in the chassis frame:
+    'stereo' 4.5 cm inside the windshield and 20 cm below its top edge, 'rear' at the top of the
+    tail, 'bumper' on the nose, 'lidar' on the roof above the windshield."""
+    shape = chrono.CastToChVisualShapeTriangleMesh(body.GetVisualModel().GetShape(0))
+    path = shape.GetMesh().GetFileName()
+    glass, mat = set(), None
+    with open(os.path.splitext(path)[0] + ".mtl") as f:    # glass is what the materials call see-through
+        for line in f:
+            tok = line.split()
+            if tok[:1] == ["newmtl"]:
+                mat = tok[1]
+            elif tok[:1] == ["d"] and float(tok[1]) < 0.3:
+                glass.add(mat)
+    verts, panes, mat = [], [], None
+    with open(path) as f:
+        for line in f:
+            if line.startswith("v "):
+                verts.append([float(v) for v in line.split()[1:4]])
+            elif line.startswith("usemtl"):
+                mat = line.split()[1]
+            elif line.startswith("f ") and mat in glass:
+                panes += [int(t.split("/")[0]) - 1 for t in line.split()[1:]]
+    verts = np.array(verts)
+    mid = verts[np.abs(verts[:, 1]) < 0.3]                  # the strip along the middle of the car
+    x_rear, x_front = verts[:, 0].min(), verts[:, 0].max()
+    g = verts[np.unique(panes)]
+    g = g[(np.abs(g[:, 1]) < 0.25) & (g[:, 0] > 0.5 * (g[:, 0].min() + g[:, 0].max()))]     # windshield, middle strip
+    slope = np.polyfit(g[:, 0], g[:, 2], 1)[0]
+    along = np.array([1.0, slope]) / math.hypot(1.0, slope)
+    top = g[g[:, 2].argmax(), [0, 2]]
+    stereo = top + 0.20 * along - 0.045 * np.array([-along[1], along[0]])
+    tail = mid[mid[:, 0] < x_rear + 0.15]
+    nose = mid[mid[:, 0] > x_front - 0.12]
+    roof = mid[np.abs(mid[:, 0] - (top[0] - 0.05)) < 0.08]
+    z_tail = tail[:, 2].max() - 0.03
+    return dict(stereo=(float(stereo[0]), float(stereo[1])),
+                rear=(float(tail[tail[:, 2] > z_tail - 0.12, 0].min() - 0.02), float(z_tail)),
+                bumper=(float(x_front + 0.02), float(np.quantile(nose[:, 2], 0.75))),
+                lidar=(float(top[0] - 0.05), float(roof[:, 2].max() + 0.07)))
+
+
 class SensorRig:
     """The car's sensors, simulated with Chrono::Sensor, and what is computed from their data.
 
-    camera        a stereo camera at the front edge of the roof and one at its rear edge. Each gives
-                  a colour image and a depth image with an error that grows with the square of the
-                  range, as stereo depth does. Painted lines come from the colour image, obstacles
-                  and free ground from the depth image.
-    camera+lidar  the same, plus a 16 channel lidar on a mast above the roof (obstacles all round)
-    camera+radar  the same, plus a radar on each side of the car, covering the sectors that the
-                  cameras cannot see
+    camera        Four cameras, each a Stereolabs ZED X One GS with the 2.2 mm lens in its
+                  960 x 600 mode: two as a stereo pair behind the top of the windshield, one at
+                  the top of the tail looking back and down, one on the front bumper. Range comes
+                  from the images. A stereo network (IGEV++) matches the pair, and a monocular
+                  depth network (Depth Anything V2), anchored to the ground, covers what the two
+                  single cameras see. Painted lines come from each image, seen from above.
+    camera+lidar  the same plus a forward-facing lidar on the roof above the windshield
     """
-    MODES = ("camera", "camera+lidar", "camera+radar")
+    MODES = ("camera", "camera+lidar")
 
-    CAM_W, CAM_H, CAM_HFOV = 960, 540, math.radians(120.0)     # depth is rendered at half that size
-    CAM_PITCH = math.radians(10.0)
-    CAM_FAR = 30.0             # the depth image ends here: it reads this where there is nothing nearer
-    CAM_RANGE = 12.0           # obstacles and free ground are taken from the depth image up to here at most
-    PAINT_RANGE = 11.0
-    DEPTH_ERR = 0.003          # stereo depth error at 1 m [m]; it grows with the square of the range
-    RANGE_TOL, HEIGHT_TOL = 0.15, 0.04     # errors beyond which the depth image does not settle what a cell is
-    LIDAR_W, LIDAR_H = 720, 16
-    LIDAR_EL = (math.radians(-25.0), math.radians(5.0))
+    CAM_W, CAM_H = 960, 600                  # the sensor's 1920 x 1200 pixels, binned 2 x 2
+    CAM_F = 2.2e-3 / 6.0e-6                  # focal length [pixels]: 2.2 mm lens, 3 micron pixels, binned
+    CAM_HFOV = 2.0 * math.atan(0.5 * CAM_W / CAM_F)          # 105 degrees for the rectified image
+    BASELINE = 0.30                          # between the two cameras of the stereo pair [m]
+    REAR_PITCH, BUMPER_PITCH = math.radians(25.0), math.radians(5.0)      # downwards
+    STEREO_EVERY, MONO_EVERY = 4, 4          # perception ticks from one run of a network to the next
+    STEREO_LAG, MONO_LAG = 2, 1              # ticks until a result is in
+    DISP_ERR = 0.25                          # disparity error that the processing assumes [pixels]
+    MONO_ERR = (0.02, 0.07)                  # range error assumed for monocular depth: 2 cm + 7 %
+    MONO_RANGE = 3.0                         # ground seen by a single camera counts as probably free up to here
+    CAM_FAR = 30.0             # what is further than this, or the sky, is reported at this range
+    CAM_RANGE = 12.0           # obstacles and free ground are taken from a depth image up to here at most
+    PAINT_RANGE = 11.0         # painted lines are looked for up to here in the image of the stereo pair,
+    MONO_PAINT = {"rear": 5.0, "bumper": 3.5}       # and up to here in a single camera's: it is lower, and
+    #                                                 # only the ground tells how far away a pixel is
+    RANGE_TOL, HEIGHT_TOL = 0.15, 0.04     # errors beyond which a depth image does not settle what a cell is
+    LIDAR_W, LIDAR_H, LIDAR_HFOV = 480, 32, math.radians(120.0)
+    LIDAR_EL = (math.radians(-20.0), math.radians(5.0))
     LIDAR_RANGE = 20.0
-    RADAR_W, RADAR_H = 96, 6
-    RADAR_HFOV, RADAR_VFOV = math.radians(130.0), math.radians(9.0)
-    RADAR_RANGE = 20.0
     Z_GROUND, Z_OBSTACLE, Z_TOP = 0.05, 0.08, 2.3     # a kerb is 0.15 m high
     Z_LIDAR = 0.30             # lidar returns below this are not placed in the map as obstacles
 
-    def __init__(self, world, mode, noise, rng):
-        self.mode, self.noise, self.rng = mode, noise, rng
+    def __init__(self, world, mode, noise, rng, depth, sky):
+        self.mode, self.noise, self.rng, self.depth = mode, noise, rng, depth
         self.name = "Chrono::Sensor " + mode.replace("+", " + ")
         self.body = world.car.GetChassisBody()
         self.system = world.system
         # the car's outline in the chassis frame: its own body shows up in every sensor
         mid = -EGO.ref_to_rear
         self.own = (mid - EGO.rear, mid + EGO.front, EGO.half_width)
-        x_rear, x_front, top = EGO.roof
+        mounts = sensor_mounts(self.body)
+        k = noise
 
         self.manager = sens.ChSensorManager(self.system)
-        self.manager.scene.SetAmbientLight(chrono.ChVector3f(0.5, 0.5, 0.5))
-        self.manager.scene.AddPointLight(chrono.ChVector3f(30.0, -40.0, 120.0), chrono.ChColor(0.45, 0.45, 0.45), 2000.0)
-        sky = sens.Background()
-        sky.mode = sens.BackgroundMode_SOLID_COLOR
-        sky.color_zenith = chrono.ChVector3f(0.55, 0.65, 0.85)
-        self.manager.scene.SetBackground(sky)
-
+        light_scene(self.manager.scene, sky)
         rate = 1.05 / PERCEPTION_DT        # a little faster than it is read, so every read is fresh
-        self.cameras, self.radars, self.lidar = [], [], None
-        self.rays = pinhole_rays(self.CAM_W, self.CAM_H, self.CAM_HFOV)
-        self.rays_depth = pinhole_rays(self.CAM_W // 2, self.CAM_H // 2, self.CAM_HFOV)
-        focal = 0.5 * self.CAM_W / math.tan(0.5 * self.CAM_HFOV)
-        self.ground_rows = min(self.CAM_H, int(0.5 * self.CAM_H + focal * math.tan(self.CAM_PITCH + 0.05)))
-        for label, x, yaw in (("front", x_front + 0.10, 0.0), ("rear", x_rear - 0.10, math.pi)):
-            R = _rot_z(yaw) @ _rot_y(self.CAM_PITCH)
-            pos = np.array([x, 0.0, top + 0.05])
-            frame = chrono.ChFramed(chrono.ChVector3d(*pos), chrono.QuatFromAngleZ(yaw) * chrono.QuatFromAngleY(self.CAM_PITCH))
-            colour = sens.ChCameraSensor(self.body, rate, frame, self.CAM_W, self.CAM_H, self.CAM_HFOV)
-            colour.PushFilter(sens.ChFilterRGBA8Access())
-            depth = sens.ChDepthCamera(self.body, rate, frame, self.CAM_W // 2, self.CAM_H // 2, self.CAM_HFOV,
-                                       self.CAM_FAR)
-            for s in (colour, depth):
-                self._add(s, label + " camera")
-            self.cameras.append(dict(label=label, colour=colour, depth=depth, pos=pos, R=R, stamp=-1.0))
+        W, H = self.CAM_W, self.CAM_H
+        self.rays = pinhole_rays(W // 2, H // 2, self.CAM_HFOV)        # of the half-size depth images
+        self.cameras, self.lidar = [], None
+
+        def camera(label, x, y, z, yaw, pitch, role, skew=(0.0, 0.0)):
+            # 'skew' is what the mounting is off by and the processing does not know about
+            q = chrono.QuatFromAngleZ(yaw + skew[0]) * chrono.QuatFromAngleY(pitch + skew[1])
+            s = sens.ChCameraSensor(self.body, rate, chrono.ChFramed(chrono.ChVector3d(x, y, z), q), W, H,
+                                    self.CAM_HFOV, 2)
+            s.PushFilter(sens.ChFilterRGBA8Access())
+            self._add(s, label + " camera")
+            cam = dict(label=label, role=role, sensor=s, pos=np.array([x, y, z]), R=_rot_z(yaw) @ _rot_y(pitch),
+                       stamp=-1.0, gain=1.0 + 0.03 * k * float(rng.normal()), half=0.5 * self.CAM_HFOV)
+            self.cameras.append(cam)
+            return cam
+
+        x, z = mounts["stereo"]
+        self.left = camera("front", x, 0.5 * self.BASELINE, z, 0.0, 0.0, "stereo")
+        # the pair is never mounted exactly parallel: what is left after calibration, about 0.015 degrees
+        self.right = camera("right", x, -0.5 * self.BASELINE, z, 0.0, 0.0, "partner",
+                            tuple(math.radians(0.015) * k * rng.normal(size=2)))
+        camera("rear", mounts["rear"][0], 0.0, mounts["rear"][1], math.pi, self.REAR_PITCH, "mono")
+        camera("bumper", mounts["bumper"][0], 0.0, mounts["bumper"][1], 0.0, self.BUMPER_PITCH, "mono")
+        self.left["reach"], self.left["err"] = self.CAM_RANGE, (0.0, 0.0, self.DISP_ERR / (self.CAM_F * self.BASELINE))
+        self.left["paint"] = self.PAINT_RANGE
+        for cam in self.cameras[2:]:
+            cam["reach"], cam["err"], cam["half"] = self.MONO_RANGE, self.MONO_ERR + (0.0,), math.radians(80.0)
+            cam["paint"] = self.MONO_PAINT[cam["label"]]
         if mode == "camera+lidar":
-            pos = np.array([0.5 * (x_rear + x_front), 0.0, top + 0.35])
-            self.lidar = dict(pos=pos, stamp=-1.0, rays=angular_rays(self.LIDAR_W, self.LIDAR_H, 2.0 * math.pi,
+            pos = np.array([mounts["lidar"][0], 0.0, mounts["lidar"][1]])
+            self.lidar = dict(pos=pos, stamp=-1.0, rays=angular_rays(self.LIDAR_W, self.LIDAR_H, self.LIDAR_HFOV,
                                                                      *self.LIDAR_EL, inclusive=True))
             self.lidar["sensor"] = sens.ChLidarSensor(
                 self.body, rate, chrono.ChFramed(chrono.ChVector3d(*pos), chrono.QUNIT), self.LIDAR_W, self.LIDAR_H,
-                2.0 * math.pi, self.LIDAR_EL[1], self.LIDAR_EL[0], 1.5 * self.LIDAR_RANGE)
+                self.LIDAR_HFOV, self.LIDAR_EL[1], self.LIDAR_EL[0], 1.5 * self.LIDAR_RANGE)
             self.lidar["sensor"].PushFilter(sens.ChFilterDIAccess())
             self._add(self.lidar["sensor"], "lidar")
-        if mode == "camera+radar":
-            rays = angular_rays(self.RADAR_W, self.RADAR_H, self.RADAR_HFOV, -0.5 * self.RADAR_VFOV,
-                                0.5 * self.RADAR_VFOV, inclusive=False)
-            x0, x1, hw = self.own
-            for y, yaw in ((hw + 0.02, 0.5 * math.pi), (-hw - 0.02, -0.5 * math.pi)):
-                pos = np.array([0.5 * (x0 + x1), y, 0.45])
-                radar = sens.ChRadarSensor(self.body, rate, chrono.ChFramed(chrono.ChVector3d(*pos), chrono.QuatFromAngleZ(yaw)),
-                                           self.RADAR_W, self.RADAR_H, self.RADAR_HFOV, self.RADAR_VFOV,
-                                           1.5 * self.RADAR_RANGE)
-                radar.PushFilter(sens.ChFilterRadarAccess())
-                self._add(radar, "radar")
-                self.radars.append(dict(sensor=radar, pos=pos, R=_rot_z(yaw), rays=rays, stamp=-1.0))
+
+        # Sensor noise per count of the 8 bit image. In linear light it is shot noise plus read
+        # noise, here with a signal to noise ratio of 40 at mid grey for noise scale 1. The gamma
+        # curve stretches it in the shadows.
+        v = np.maximum(np.arange(256), 4) / 255.0
+        lin = v ** 2.2
+        self.sigma = (k * 255.0 * np.sqrt(1.03e-4 * lin + 1.44e-6) / (2.2 * v ** 1.2)).astype(np.float32)
+        self.grain = rng.standard_normal((3, H, W, 3), dtype=np.float32) if k > 0.0 else None
+        self.linear = ((np.arange(256) / 255.0) ** 2.2).astype(np.float32)     # brightness of a count
+
+        self.tick, self.pending = 0, []
         self.frames = collections.OrderedDict()      # chassis frame at the time of each render
-        self.paint = np.zeros((0, 2))                 # for the viewer: where paint was seen this tick
+        self.paint = np.zeros((0, 2))                 # for the viewer: where paint was seen last
         self.fans = []                                # for the viewer: (origin, heading, half fov, range) per sensor
         self.show = False                             # set by the viewer: keep what each sensor delivered
 
@@ -769,44 +900,120 @@ class SensorRig:
         ax, ay, az = R.GetAxisX(), R.GetAxisY(), R.GetAxisZ()
         return np.array([p.x, p.y, p.z]), np.array([[ax.x, ay.x, az.x], [ax.y, ay.y, az.y], [ax.z, ay.z, az.z]])
 
+    def _develop(self, cam, rgba):
+        """What a camera delivers for a rendered frame: its own exposure and the noise of its
+        sensor, different in every camera and every frame."""
+        img = rgba[..., :3]
+        if self.grain is None:
+            return np.array(img)
+        n = self.grain[int(self.rng.integers(len(self.grain)))]
+        n = np.roll(n, (int(self.rng.integers(self.CAM_H)), int(self.rng.integers(self.CAM_W))), axis=(0, 1))
+        return np.clip(img * np.float32(cam["gain"]) + n * self.sigma[img] + 0.5, 0.0, 255.0).astype(np.uint8)
+
     def sense(self, pose):
         """Render the sensors for the current state of the simulation and process what they give.
         Returns (scans, line detections)."""
         t = round(self.system.GetChTime(), 4)
-        self.frames[t] = self._frame()
-        while len(self.frames) > 8:
+        ref_p, ref_R = self.frames[t] = self._frame()
+        while len(self.frames) > 12:
             self.frames.popitem(last=False)
         self.manager.Update()
-        scans, dets, paint, self.fans = [], [], [], []
+        self.tick += 1
+        fresh = set()
         for cam in self.cameras:
-            colour, depth = cam["colour"].GetMostRecentRGBA8Buffer(), cam["depth"].GetMostRecentDepthBuffer()
-            if not (colour.HasData() and depth.HasData()):
+            buf = cam["sensor"].GetMostRecentRGBA8Buffer()
+            if not buf.HasData():
                 continue
-            stamp = round(depth.TimeStamp, 4)
-            if stamp == cam["stamp"] or stamp not in self.frames or round(colour.TimeStamp, 4) != stamp:
-                continue                               # nothing new, or the two images are not a pair
-            cam["stamp"] = stamp
-            scan, xy, segs = self._camera(cam, colour.GetRGBA8Data(), depth.GetDepthData()[..., 0], *self.frames[stamp])
-            scans.append(scan)
-            dets += segs
-            paint.append(xy)
+            stamp = round(buf.TimeStamp, 4)
+            if stamp != cam["stamp"] and stamp in self.frames:
+                cam["stamp"], cam["image"] = stamp, self._develop(cam, buf.GetRGBA8Data())
+                fresh.add(cam["label"])
+        self.fans = [((ref_p + ref_R @ c["pos"])[:2], math.atan2(*(ref_R @ c["R"])[1::-1, 0]), min(c["half"], 1.2),
+                      c["reach"]) for c in self.cameras if "reach" in c]
+
+        # The networks do not run on every frame, and their answer takes time. A request is made
+        # here and its result is used a fixed number of ticks later, with the pose the car had
+        # when the images were taken.
+        monos = self.cameras[2:]
+        if self.tick % self.STEREO_EVERY == 0 and {"front", "right"} <= fresh and \
+                self.left["stamp"] == self.right["stamp"]:
+            ident = self.depth.submit("stereo", [self.left["image"][::-1], self.right["image"][::-1]])
+            self.pending.append((self.tick + self.STEREO_LAG, ident, [self.left], self.left["stamp"],
+                                 [self.left["image"]]))
+        if self.tick % self.MONO_EVERY == self.MONO_EVERY // 2 and all(c["label"] in fresh for c in monos):
+            ident = self.depth.submit("mono", [c["image"][::-1] for c in monos])
+            self.pending.append((self.tick + self.MONO_LAG, ident, monos, monos[0]["stamp"],
+                                 [c["image"] for c in monos]))
+        scans, dets, paint = [], [], []
+        while self.pending and self.pending[0][0] <= self.tick:
+            _, ident, cams, stamp, images = self.pending.pop(0)
+            maps = self.depth.collect(ident)
+            for cam, image, out in zip(cams, images, maps):
+                frame = self.frames[stamp]
+                rng_img = self._stereo_range(out[::-1]) if cam["role"] == "stereo" else \
+                    self._mono_range(cam, out[::-1], *frame)
+                if rng_img is None:
+                    continue
+                scan, xy, segs = self._camera(cam, image, rng_img, *frame)
+                scans.append(scan)
+                dets += segs
+                paint.append(xy)
         if self.lidar is not None:
             buf = self.lidar["sensor"].GetMostRecentDIBuffer()
             stamp = round(buf.TimeStamp, 4) if buf.HasData() else -1.0
             if stamp != self.lidar["stamp"] and stamp in self.frames:
                 self.lidar["stamp"] = stamp
                 scans.append(self._scanner(self.lidar, buf.GetDIData()[..., 0], *self.frames[stamp], self.LIDAR_RANGE,
-                                           0.02, 0.01, self.LIDAR_W, math.pi, False, self.Z_LIDAR))
-        for radar in self.radars:
-            buf = radar["sensor"].GetMostRecentRadarBuffer()
-            # (older bindings do not show the time stamp of a radar buffer; it is the current time)
-            stamp = round(getattr(buf, "TimeStamp", t), 4) if buf.HasData() else -1.0
-            if stamp != radar["stamp"] and stamp in self.frames:
-                radar["stamp"] = stamp
-                scans.append(self._scanner(radar, buf.GetRadarData()[..., 0], *self.frames[stamp], self.RADAR_RANGE,
-                                           0.08, 0.15, self.RADAR_W, 0.5 * self.RADAR_HFOV, True))
-        self.paint = np.concatenate(paint) if paint else np.zeros((0, 2))
+                                           0.02, 0.01, int(round(math.degrees(self.LIDAR_HFOV) / 0.5)),
+                                           0.5 * self.LIDAR_HFOV, self.Z_LIDAR))
+        if paint:
+            self.paint = np.concatenate(paint)
         return scans, dets
+
+    def _stereo_range(self, disp):
+        """The range along each ray of the half-size depth image, from the disparity of the left
+        image (bottom row first). 0 where there is no telling: at depth edges, where a matcher
+        puts pixels between the near and the far surface, and at the left rim, which the right
+        camera does not see."""
+        d = 0.25 * (disp[0::2, 0::2] + disp[1::2, 0::2] + disp[0::2, 1::2] + disp[1::2, 1::2])
+        tol = 1.0 + 0.1 * d
+        edge = np.zeros(d.shape, dtype=bool)
+        jump = np.abs(np.diff(d, axis=1)) > np.minimum(tol[:, 1:], tol[:, :-1])
+        edge[:, 1:] |= jump
+        edge[:, :-1] |= jump
+        jump = np.abs(np.diff(d, axis=0)) > np.minimum(tol[1:], tol[:-1])
+        edge[1:] |= jump
+        edge[:-1] |= jump
+        unseen = 2.0 * np.arange(d.shape[1])[None, :] < d
+        r = self.CAM_F * self.BASELINE / np.maximum(d, 1e-3) / self.rays[..., 0]
+        r = np.minimum(r, self.CAM_FAR)
+        r[edge | unseen] = 0.0
+        return r.astype(np.float32)
+
+    def _mono_range(self, cam, inv, ref_p, ref_R):
+        """The range along each ray of the half-size depth image, from the relative inverse depth
+        a monocular network gives for the image (bottom row first). That output has neither scale
+        nor offset. Both are fitted so that the pixels showing the ground come out where the
+        ground is, which the camera's height and attitude give. None if the fit fails."""
+        inv = 0.25 * (inv[0::2, 0::2] + inv[1::2, 0::2] + inv[0::2, 1::2] + inv[1::2, 1::2])
+        p, R = ref_p + ref_R @ cam["pos"], ref_R @ cam["R"]
+        down = -(self.rays @ R.T.astype(np.float32))[..., 2]
+        axial = self.rays[..., 0]                               # depth along the optical axis per unit of range
+        zg = np.where(down > 0.03, p[2] / np.maximum(down, 0.03) * axial, np.inf)      # depth of the ground per pixel
+        m = np.zeros(inv.shape, dtype=bool)
+        m[:inv.shape[0] // 4] = True                            # to begin with: the bottom of the image
+        m &= np.isfinite(zg)
+        z = None
+        for _ in range(4):
+            x, y = inv[m].astype(np.float64), 1.0 / zg[m]
+            if len(x) < 1500 or np.ptp(x) < 1e-6:           # too little ground in view, or a blank answer
+                return None
+            a, b = np.polyfit(x, y, 1)
+            if a <= 0.0:
+                return None
+            z = 1.0 / np.maximum(a * inv + b, 1.0 / self.CAM_FAR)
+            m = np.isfinite(zg) & (zg < 8.0) & (np.abs(z - zg) < 0.06 * zg + 0.05)
+        return np.minimum(z / axial, self.CAM_FAR).astype(np.float32) if m.sum() >= 1500 else None
 
     def _keep(self, dev, P, valid, ref_p, ref_R, **raw):
         """For the viewer: the data of a sensor as it came in, and its points in the chassis frame."""
@@ -818,92 +1025,110 @@ class SensorRig:
         x0, x1, hw = self.own
         return (loc[..., 0] > x0 - grow) & (loc[..., 0] < x1 + grow) & (np.abs(loc[..., 1]) < hw + grow)
 
-    def _camera(self, cam, rgb, depth, ref_p, ref_R):
-        """One stereo camera: obstacles and free ground from the depth image, painted lines from
-        the colour image. rgb is (h, w, 4) uint8, depth (h/2, w/2) is the range along each pixel's
-        ray; the chassis frame is the one at the time the images were rendered."""
-        k = self.noise
+    def _paint(self, image, flat, p, R, head, reach):
+        """Ground cells that look painted. The image is laid out on the ground plane, as a picture
+        from above with 5 cm cells, in linear light. A cell is paint if it is 1.8 times lighter
+        than the ground 20 cm to both sides of it, in one of four directions, and the depth image
+        ('flat', at half the size) says that both of those are ground. That holds for a stripe in
+        the sun and for one in the shade. It does not hold for the edge of a shadow, which is
+        lighter than one side only, for anything wide, or for the light sill of a car, which has
+        the car on one side. Returns the world position of the cells and the pixel each was read
+        from."""
+        c, n = 0.05, int(reach / 0.05)
+        gx, gy = (np.arange(n) + 0.5) * c, (np.arange(2 * n) + 0.5 - n) * c
+        ch, sh = math.cos(head), math.sin(head)
+        X = p[0] + gx[:, None] * ch - gy[None, :] * sh
+        Y = p[1] + gx[:, None] * sh + gy[None, :] * ch
+        d = np.stack([X - p[0], Y - p[1], np.full_like(X, -p[2])], axis=-1) @ R       # into the camera frame
+        fwd = np.maximum(d[..., 0], 1e-3)
+        u = np.rint(0.5 * self.CAM_W - self.CAM_F * d[..., 1] / fwd - 0.5).astype(np.int64)
+        v = np.rint(0.5 * self.CAM_H + self.CAM_F * d[..., 2] / fwd - 0.5).astype(np.int64)
+        ok = (d[..., 0] > 0.2) & (u >= 0) & (u < self.CAM_W) & (v >= 0) & (v < self.CAM_H) & \
+            (gx[:, None] ** 2 + gy[None, :] ** 2 < reach * reach)
+        u, v = np.clip(u, 0, self.CAM_W - 1), np.clip(v, 0, self.CAM_H - 1)
+        B = np.where(ok, self.linear[image[v, u].max(axis=-1)], np.nan)
+        P = np.pad(B, 4, constant_values=np.nan)
+        G = np.pad(ok & flat[v // 2, u // 2], 4)
+        s = lambda A, i, j: A[4 + i:4 + i + B.shape[0], 4 + j:4 + j + B.shape[1]]
+        ridge = np.zeros(B.shape, dtype=bool)
+        with np.errstate(invalid="ignore"):
+            for i, j in ((4, 0), (0, 4), (3, 3), (3, -3)):
+                ridge |= (B > 1.8 * np.maximum(s(P, i, j), s(P, -i, -j)) + 0.004) & s(G, i, j) & s(G, -i, -j)
+        ii, jj = np.nonzero(ridge)
+        return np.stack([X[ii, jj], Y[ii, jj]], axis=1), v[ii, jj], u[ii, jj]
+
+    def _camera(self, cam, image, depth, ref_p, ref_R):
+        """One camera with its depth image: obstacles and free ground from the depth, painted
+        lines from the image. image is (h, w, 3) uint8, depth (h/2, w/2) the range along each
+        pixel's ray (0 where unknown), both with the bottom row first. The chassis frame is the
+        one at the time the image was taken."""
         p, R = ref_p + ref_R @ cam["pos"], (ref_R @ cam["R"]).astype(np.float32)
-        nothing = depth > 0.995 * self.CAM_FAR
-        if k > 0.0:
-            depth = depth * (1.0 + self.rng.normal(0.0, 0.004 * k)) + \
-                smooth_noise(self.rng, depth.shape) * (self.DEPTH_ERR * k) * depth * depth
-        sig = self.DEPTH_ERR * max(k, 0.3)                # the accuracy the processing assumes
-        # The map takes obstacles and free ground only from as far as the depth is good enough:
-        # an obstacle must be placed to RANGE_TOL, and ground must be told from a kerb, which
-        # needs the height of a point to HEIGHT_TOL. Ground seen further out, up to where even the
-        # top of a kerb would pass for ground, is reported as probably free.
-        reach = min(self.CAM_RANGE, math.sqrt(self.RANGE_TOL / sig), self.HEIGHT_TOL / (sig * p[2]))
-        reach_far = min(self.CAM_RANGE, 1.65 * self.HEIGHT_TOL / (sig * p[2]))
-        dw = self.rays_depth @ R.T
+        e0, e1, e2 = cam["err"]
+        err = lambda r: e0 + e1 * r + e2 * r * r          # the range error the processing assumes
+        # The map takes obstacles only from as far as they can be placed to RANGE_TOL, and free
+        # ground only from as far as ground can be told from a kerb, which needs the height of a
+        # point to HEIGHT_TOL. Ground seen further out, up to where even the top of a kerb would
+        # pass for ground, is reported as probably free. Monocular depth never tells a kerb from
+        # the ground, so all the ground it shows is only probably free.
+        rr = np.linspace(0.3, self.CAM_RANGE, 235)
+        placed = err(rr) <= self.RANGE_TOL
+        level = err(rr) * p[2] / rr
+        reach_hit = float(rr[placed].max()) if placed.any() else 0.0
+        reach = float(rr[placed & (level <= self.HEIGHT_TOL)].max()) if (placed & (level <= self.HEIGHT_TOL)).any() else 0.0
+        reach_far = float(rr[level <= 1.65 * self.HEIGHT_TOL].max()) if (level <= 1.65 * self.HEIGHT_TOL).any() else 0.0
+        if cam["role"] == "mono":
+            reach_far = self.MONO_RANGE
+        dw = self.rays @ R.T
         P = p.astype(np.float32) + depth[..., None] * dw
         z = P[..., 2]
-        zs = sig * depth * depth * np.abs(dw[..., 2])     # height error that the depth error causes
+        zs = err(depth) * np.abs(dw[..., 2])              # height error that the range error causes
         own = self._is_own(P, ref_p, ref_R, 0.15)
         seen = (depth > 0.3) & (depth < 28.0) & (z < self.Z_TOP) & ~own
         if self.show:
-            self._keep(cam, P[::2, ::2], ((depth > 0.3) & ~nothing)[::2, ::2], ref_p, ref_R,
-                       rgb=np.array(rgb[..., :3]), range=np.where(nothing, 0.0, depth))
+            self._keep(cam, P[::2, ::2], ((depth > 0.3) & (depth < 0.99 * self.CAM_FAR))[::2, ::2], ref_p, ref_R,
+                       rgb=image, range=np.where(depth < 0.99 * self.CAM_FAR, depth, 0.0))
         ground = seen & (np.abs(z) < self.Z_GROUND + 1.25 * zs)
         obstacle = seen & (z > self.Z_OBSTACLE + 2.5 * zs)
         head = math.atan2(R[1, 0], R[0, 0])
-        n_bins = int(round(math.degrees(self.CAM_HFOV) / 0.5))
-        ang, r_hit, r_free, r_stop, _ = planar_scan(P, p, obstacle, ground, seen & ~ground, n_bins,
-                                                    0.5 * self.CAM_HFOV, head, reach)
+        half = cam["half"]
+        n_bins = int(round(math.degrees(2.0 * half) / 0.5))
+        ang, r_hit, r_free, r_stop, _ = planar_scan(P, p, obstacle, ground, seen & ~ground, n_bins, half, head,
+                                                    max(reach_hit, 0.5))
+        r_free = np.minimum(r_free, reach)
         r_far = r_free
         if reach_far > reach + 0.5:
             maybe = seen & (np.abs(z) < self.Z_GROUND + 1.5 * zs)
-            r_far = np.maximum(r_free, planar_scan(P, p, maybe & False, maybe, seen & ~maybe, n_bins,
-                                                   0.5 * self.CAM_HFOV, head, reach_far)[2])
+            r_far = np.maximum(r_free, planar_scan(P, p, maybe & False, maybe, seen & ~maybe, n_bins, half, head,
+                                                   reach_far)[2])
             r_far = np.where(np.isfinite(r_stop), r_free, r_far)      # not past something that stands up
-        self.fans.append((p[:2], head, 0.5 * self.CAM_HFOV, reach))
 
-        # paint: clearly brighter than the road surface, a narrow stripe, and on the ground plane.
-        # Only the rows below the horizon can show the ground (the buffer starts at the bottom row).
-        rows = self.ground_rows
-        bright = np.maximum(np.maximum(rgb[:rows, :, 0], rgb[:rows, :, 1]), rgb[:rows, :, 2])
-        lo = bright[::2, ::2]
-        road = float(np.median(lo[ground[:lo.shape[0]]])) if ground[:lo.shape[0]].sum() > 50 else 120.0
-        thr = max(1.3 * road, road + 35.0)
-        vv, uu = np.nonzero(bright > thr - 12.0 * k)
-        if k > 0.0:                                       # image noise decides the pixels near the threshold
-            keep = bright[vv, uu] + self.rng.normal(0.0, 3.0 * k, len(vv)) > thr
-            vv, uu = vv[keep], uu[keep]
-        dc = self.rays[vv, uu] @ R.T
-        t = -p[2] / np.minimum(dc[:, 2], -1e-6)           # range to the ground plane along the pixel ray
-        keep = (dc[:, 2] < -0.03) & (t < self.PAINT_RANGE)
-        vv, uu, dc, t = vv[keep], uu[keep], dc[keep], t[keep]
-        xy = p[:2] + t[:, None] * dc[:, :2]
-        # a stripe covers little of its surroundings; the top of a kerb or a pavement covers all of it
-        cell, n = 0.1, int(2 * self.PAINT_RANGE / 0.1) + 8
-        ij = np.floor((xy - p[:2]) / cell).astype(np.int64) + n // 2
-        occ = np.zeros((n, n), dtype=np.int32)
-        occ[ij[:, 1], ij[:, 0]] = 1
-        ii = np.pad(occ, ((4, 3), (4, 3))).cumsum(axis=0).cumsum(axis=1)
-        dens = (ii[7:, 7:] - ii[:-7, 7:] - ii[7:, :-7] + ii[:-7, :-7]) / 49.0
-        # (and the rim of such an area is not a stripe either: at a corner of it the count is low)
-        wide = GridMap.grow((occ > 0) & (dens >= 0.42), 3)
-        stripe = ~wide[ij[:, 1], ij[:, 0]]
-        # the depth image has to agree that the pixel is on the ground: a white car is not, nor is
-        # the top of a kerb
+        # paint: found in the image as laid out on the ground, then checked against the depth
+        xy, vv, uu = self._paint(image, ground, p, R, head, cam["paint"])
+        t = np.sqrt((xy[:, 0] - p[0]) ** 2 + (xy[:, 1] - p[1]) ** 2 + p[2] ** 2)      # range of the ground cell
         vd, ud = np.minimum(vv // 2, depth.shape[0] - 1), np.minimum(uu // 2, depth.shape[1] - 1)
-        keep = stripe & ground[vd, ud] & (np.abs(depth[vd, ud] - t) < 0.10 + 0.035 * t + 2.5 * sig * t * t)
+        # the depth has to agree that the pixel is on the ground: a white car is not, nor is the
+        # top of a kerb
+        keep = ground[vd, ud] & (np.abs(depth[vd, ud] - t) < 0.10 + 0.035 * t + 2.5 * err(t))
         keep[keep] = ~self._is_own(np.concatenate([xy[keep], np.zeros((keep.sum(), 1))], axis=1).astype(np.float32),
                                    np.array([ref_p[0], ref_p[1], 0.0]), ref_R, 0.3)
         # and nothing past the first thing that stands up from the ground on its bearing is a line
+        rho = np.hypot(xy[:, 0] - p[0], xy[:, 1] - p[1])
         rel = (np.arctan2(xy[:, 1] - p[1], xy[:, 0] - p[0]) - head + math.pi) % (2.0 * math.pi) - math.pi
-        b = np.clip(np.floor((rel + 0.5 * self.CAM_HFOV) / self.CAM_HFOV * n_bins).astype(int), 0, n_bins - 1)
-        keep &= ~(np.hypot(xy[:, 0] - p[0], xy[:, 1] - p[1]) > r_stop[b] + 0.1)
+        b = np.clip(np.floor((rel + half) / (2.0 * half) * n_bins).astype(int), 0, n_bins - 1)
+        keep &= ~(rho > r_stop[b] + 0.1)
         xy = xy[keep]
         # a small picture of what the camera is read as, for the viewer (top row first):
         # 0 nothing, 1 ground, 2 obstacle, 3 the car itself, 4 unclear, 5 paint
-        view = np.where(own, 3, np.where(obstacle, 2, np.where(ground, 1, np.where(seen, 4, 0)))).astype(np.uint8)
-        view[vd[keep], ud[keep]] = 5
-        cam["view"] = view[::-3, ::3]
-        return (p[:2], ang, r_hit, r_free, r_far, r_stop), xy, paint_segments(xy, p[:2])
+        view = np.where(own & (depth > 0.0), 3, np.where(obstacle, 2, np.where(ground, 1, np.where(seen, 4, 0)))).astype(np.uint8)
+        view = view[::-5, ::5].copy()
+        view[np.minimum((depth.shape[0] - 1 - vd[keep]) // 5, view.shape[0] - 1), np.minimum(ud[keep] // 5, view.shape[1] - 1)] = 5
+        cam["view"] = view
+        # (a single camera places a stripe by the ground alone, so only a longer piece counts)
+        segs = paint_segments(xy, p[:2], min_count=1, min_len=0.35 if cam["role"] == "stereo" else 0.6)
+        return (p[:2], ang, r_hit, r_free, r_far, r_stop), xy, segs
 
-    def _scanner(self, dev, r, ref_p, ref_R, r_max, sigma, dropout, n_bins, half_fov, radar, z_min=0.0):
-        """A lidar or a radar: a range per beam (0 where nothing came back).
+    def _scanner(self, dev, r, ref_p, ref_R, r_max, sigma, dropout, n_bins, half_fov, z_min=0.0):
+        """A lidar: a range per beam (0 where nothing came back).
         z_min: returns from lower than this end the free part of a ray but are not obstacles. The
         beams of a lidar are far apart on the ground, so a kerb is hit somewhere on its top, not at
         its face, and placing those returns in the map blurs where the kerb is. The cameras see it."""
@@ -929,10 +1154,6 @@ class SensorRig:
             # lidar would keep clearing the face of a kerb that the cameras put in the map.
             low = np.isfinite(r_stop) & ~(r_hit < r_stop + 0.3)
             r_free = np.where(low, np.minimum(r_free, before), r_free)
-        if radar:
-            # a radar return says where something is and that the way to it is clear; no return
-            # says nothing, since the beam is narrow in height and passes over low things
-            r_free = np.where(np.isfinite(r_hit), np.maximum(r_hit - 0.3, 0.0), 0.0)
         self.fans.append((p[:2], head, half_fov, r_max))
         return p[:2], ang, r_hit, r_free
 
@@ -1243,9 +1464,8 @@ def find_slots(tracks, trail, grid, stubs=False):
     for i in range(n):
         for j in range(i + 1, n):
             a, b = tracks[i], tracks[j]
-            partial = stubs and min(a.length, b.length) < 3.5 and max(a.length, b.length) >= 2.0
             db = b.d if a.d @ b.d >= 0.0 else -b.d
-            if partial and min(a.length, b.length) < 1.2:
+            if stubs and min(a.length, b.length) < 1.2 and max(a.length, b.length) >= 2.0:
                 d = a.d if a.length > b.length else db       # a stub has no direction of its own
             elif abs(a.d[0] * db[1] - a.d[1] * db[0]) > 0.14:
                 continue
@@ -1257,6 +1477,11 @@ def find_slots(tracks, trail, grid, stubs=False):
             sa = np.sort(np.array(a.ends()) @ d)
             sb = np.sort(np.array(b.ends()) @ d)
             overlap = min(sa[1], sb[1]) - max(sa[0], sb[0])
+            # partly seen: anything short of two long lines side by side. That includes two lines
+            # of an angled stall of which only the halves near the lane were in view, which lie
+            # too far apart lengthwise to overlap much.
+            whole = min(a.length, b.length) >= 3.5 and overlap >= 3.0
+            partial = stubs and not whole and max(a.length, b.length) >= 2.0
             if partial and 2.2 <= abs(sep) <= 3.5:
                 # the shorter piece marks the mouth of the stall: one of its ends lies near the
                 # matching end of the longer one (further off the more the stalls are angled)
@@ -1270,7 +1495,7 @@ def find_slots(tracks, trail, grid, stubs=False):
                     continue
                 sa, sb = (lng, sht) if a.length > b.length else (sht, lng)
                 parallel = False
-            elif 2.2 <= abs(sep) <= 3.5 and min(a.length, b.length) >= 3.5 and overlap >= 3.0:
+            elif 2.2 <= abs(sep) <= 3.5 and whole:
                 parallel = False
             elif (5.0 <= abs(sep) <= 7.8 and 1.5 <= a.length <= 3.6 and 1.5 <= b.length <= 3.6
                   and overlap >= 1.2):
@@ -1382,9 +1607,15 @@ def _classify(slot, grid, s0, s1, l0, l1, deep=False):
     # to be empty counts as free; what is deeper in comes into view while backing in.
     mouth = inside & (S < s0 + 2.5)
     frac_mouth = (free & mouth).sum() / max(int(mouth.sum()), 1)
+    # A camera that looks forward sees into a stall only at a slant, past the corner of the car
+    # before it: of an empty stall it sees a wedge, about two thirds of the mouth. A car in the
+    # stall would stand in that wedge. So with such a rig a stall is free if most of its mouth is
+    # seen empty and the empty ground is seen at least 2 m into it.
+    wedge = deep and frac_mouth >= 0.55 and frac_free >= 0.25 and \
+        (free & inside).any() and float(S[free & inside].max()) - s0 >= 2.0
     if n_occ >= 4:
         slot.status = Slot.OCCUPIED
-    elif n_occ <= 1 and (frac_free >= 0.6 or (frac_mouth >= 0.8 and frac_free >= 0.3)):
+    elif n_occ <= 1 and (frac_free >= 0.6 or (frac_mouth >= 0.8 and frac_free >= 0.3) or wedge):
         slot.status = Slot.FREE
     side = (S > s0 - 0.3) & (S < s1 - back)
     reach = 2.4 if slot.kind != "parallel" else 3.0
@@ -2280,6 +2511,98 @@ class MpcTracker:
 # Chrono world: sedan, flat terrain, painted lines, kerbs and parked cars
 # =============================================================================
 
+def write_png(path, rgb):
+    """A (rows, columns, 3) uint8 image as a PNG file."""
+    h, w, _ = rgb.shape
+    raw = np.concatenate([np.zeros((h, 1), np.uint8), rgb.reshape(h, 3 * w)], axis=1).tobytes()
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+                chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def surface_textures():
+    """Image files for the surfaces of the lot: worn asphalt, concrete, grass. They are made here,
+    once, from band-limited noise, so that the road has the grain, the blotches and the cracks
+    that a camera sees on a real one. A stereo matcher needs that: on a road of one flat colour
+    there is nothing for it to match."""
+    folder = os.path.join(tempfile.gettempdir(), "chrono_parking_surfaces_1")
+    files = {name: os.path.join(folder, name + ".png") for name in ("asphalt", "concrete", "grass")}
+    if all(os.path.exists(f) for f in files.values()):
+        return files
+    os.makedirs(folder, exist_ok=True)
+    rng = np.random.default_rng(7)
+
+    def noise(n, lo, hi):         # seamless on an n x n tile, wavelengths lo to hi texels, unit variance
+        f = np.fft.fftfreq(n)
+        r = np.hypot(f[:, None], f[None, :])
+        x = np.fft.ifft2((rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n))) * ((r >= 1.0 / hi) & (r <= 1.0 / lo))).real
+        return (x - x.mean()) / x.std()
+
+    def srgb(lin):                # the files hold display values, the renderer turns them back into reflectance
+        lin = np.clip(lin, 0.0, 1.0)
+        return (255.0 * np.where(lin <= 0.0031308, 12.92 * lin, 1.055 * lin ** (1.0 / 2.4) - 0.055) + 0.5).astype(np.uint8)
+
+    n, t = 1024, SURFACE_TILE / 1024                        # asphalt: reflectance about 0.16
+    a = 0.16 + 0.016 * noise(n, 2.0, 6.0) + 0.020 * noise(n, 0.05 / t, 0.40 / t) + 0.018 * noise(n, 0.6 / t, 3.0 / t)
+    a += 0.06 * (rng.random((n, n)) < 0.012)                # light stones
+    for _ in range(5):                                      # sealed cracks
+        q, d = rng.random(2) * n, rng.random() * 2.0 * math.pi
+        for _ in range(int(rng.integers(300, 900))):
+            d += rng.normal(0.0, 0.12)
+            q = (q + (math.cos(d), math.sin(d))) % n
+            i, j = int(q[1]), int(q[0])
+            a[i, j] = a[i, (j + 1) % n] = a[(i + 1) % n, j] = 0.05
+    for _ in range(3):                                      # oil stains
+        c, rad = rng.random(2) * n, rng.uniform(0.15, 0.45) / t
+        yy, xx = np.ogrid[:n, :n]
+        dy, dx = np.minimum(abs(yy - c[1]), n - abs(yy - c[1])), np.minimum(abs(xx - c[0]), n - abs(xx - c[0]))
+        a *= 1.0 - 0.45 * np.exp(-(dx * dx + dy * dy) / (2.0 * rad * rad))
+    g = srgb(a)
+    write_png(files["asphalt"], np.stack([g, g, np.minimum(g.astype(int) + 3, 255).astype(np.uint8)], axis=-1))
+    n, t = 512, 0.5 * SURFACE_TILE / 512
+    g = srgb(0.42 + 0.03 * noise(n, 2.0, 8.0) + 0.035 * noise(n, 0.08 / t, 0.6 / t))
+    write_png(files["concrete"], np.stack([g, g, (0.97 * g).astype(np.uint8)], axis=-1))
+    v = 0.5 * noise(n, 2.0, 5.0) + 0.6 * noise(n, 0.05 / t, 0.5 / t)
+    write_png(files["grass"], np.stack([srgb(0.06 + 0.02 * v), srgb(0.14 + 0.045 * v), srgb(0.035 + 0.012 * v)], axis=-1))
+    return files
+
+
+SURFACE_TILE = 6.0             # the asphalt image covers this much road before it repeats [m]
+
+# The skies the sensors can render under: a sky image that ships with Chrono, the azimuth and
+# elevation of the sun in that image [deg], and the strength of the sun and of the light from the
+# rest of the sky. The sun is a directional light that stands where the image has it.
+SKIES = {"clear": ("sensor/textures/sky_2_4k.hdr", 36.0, 40.8, 2.2, 0.14),
+         "low": ("sensor/textures/driving_school_4k.hdr", 36.0, 32.4, 2.6, 0.14),
+         "overcast": ("sensor/textures/kloppenheim_06_4k.hdr", 39.4, 60.0, 0.45, 0.50)}
+
+
+def light_scene(scene, sky):
+    """Sun, sky light, background and exposure of the scene that the sensors render."""
+    image, az, el, sun, ambient = SKIES[sky]
+    scene.SetAmbientLight(chrono.ChVector3f(ambient, ambient, 1.08 * ambient))
+    scene.AddDirectionalLight(chrono.ChColor(sun, 0.97 * sun, 0.90 * sun), math.radians(el), math.radians(az))
+    bg = sens.Background()
+    path = chrono.GetChronoDataFile(image)
+    if os.path.exists(path):
+        bg.mode, bg.env_tex = sens.BackgroundMode_ENVIRONMENT_MAP, path
+    else:
+        bg.mode = sens.BackgroundMode_GRADIENT
+        bg.color_zenith, bg.color_horizon = chrono.ChVector3f(0.30, 0.45, 0.80), chrono.ChVector3f(0.70, 0.78, 0.88)
+    scene.SetBackground(bg)
+    # One fixed exposure, set for the road as a camera's auto-exposure would settle: sunlit asphalt
+    # comes out at 120 of 255. The backend has no auto-exposure, so shade is dark and white cars
+    # in a low sun burn out. The lens darkens the corners by a quarter.
+    road = 0.16 * (sun * math.sin(math.radians(el)) ** 2 + 1.5 * ambient)
+    if hasattr(scene, "SetExposure"):
+        scene.SetExposure((120.0 / 255.0) ** 2.2 / road)
+        scene.SetVignette(0.12)
+
+
 class World:
     def __init__(self, scn, visual=True, tire="tmeasy"):
         self.scn = scn
@@ -2315,6 +2638,9 @@ class World:
             chrono.ChVector3d(0.5 * (x0 + x1), 0.5 * (y0 + y1), 0.0), chrono.QUNIT),
             (x1 - x0) + 60.0, (y1 - y0) + 60.0)
         patch.SetColor(chrono.ChColor(0.23, 0.23, 0.25))
+        self.surfaces = surface_textures() if visual else {}
+        if visual:
+            patch.SetTexture(self.surfaces["asphalt"], ((x1 - x0) + 60.0) / SURFACE_TILE, ((y1 - y0) + 60.0) / SURFACE_TILE)
         self.terrain.Initialize()
 
         self.contact_mat = mat
@@ -2367,9 +2693,16 @@ class World:
         rack = math.copysign(float(np.interp(abs(steer_angle), *self.rack_of_angle)), steer_angle)
         self._advance(rack, min(max(brake_torque / EGO.brake_torque_max, 0.0), 1.0), drive_torque)
 
-    def _box(self, body, lx, ly, lz, pos, yaw, rgb):
+    def _box(self, body, lx, ly, lz, pos, yaw, rgb, surface=None):
         shape = chrono.ChVisualShapeBox(lx, ly, lz)
-        shape.SetColor(chrono.ChColor(*rgb))
+        if surface is None:
+            shape.SetColor(chrono.ChColor(*rgb))
+        else:
+            mat = chrono.ChVisualMaterial()
+            mat.SetKdTexture(self.surfaces[surface])
+            mat.SetTextureScale(max(lx / (0.5 * SURFACE_TILE), 0.2), max(ly / (0.5 * SURFACE_TILE), 0.2))
+            mat.SetRoughness(0.9)
+            shape.AddMaterial(mat)
         body.AddVisualShape(shape, chrono.ChFramed(chrono.ChVector3d(*pos), chrono.QuatFromAngleZ(yaw)))
 
     def _decor(self, visual):
@@ -2377,14 +2710,23 @@ class World:
             return
         body = chrono.ChBody()
         body.SetFixed(True)
+        # Paint is laid down in half-metre pieces: each is worn to a different grey and a little
+        # narrower than new, and a few are gone
+        rng = np.random.default_rng(1000 + getattr(self.scn, "seed", 0))
         for x1, y1, x2, y2, color in self.scn.lines:
-            rgb = (0.95, 0.95, 0.95) if color == "white" else (0.95, 0.78, 0.10)
-            self._box(body, math.hypot(x2 - x1, y2 - y1), 0.12, 0.01,
-                      (0.5 * (x1 + x2), 0.5 * (y1 + y2), 0.006), math.atan2(y2 - y1, x2 - x1), rgb)
+            length, yaw = math.hypot(x2 - x1, y2 - y1), math.atan2(y2 - y1, x2 - x1)
+            n = max(1, int(round(length / 0.5)))
+            for k in range(n):
+                v, wide, gone = rng.uniform(0.50, 0.80), 0.12 * rng.uniform(0.9, 1.0), rng.random() < 0.04
+                if gone:
+                    continue
+                f = (k + 0.5) / n
+                self._box(body, length / n + 0.004, wide, 0.004, (x1 + f * (x2 - x1), y1 + f * (y2 - y1), 0.003), yaw,
+                          (v, v, v) if color == "white" else (v, 0.80 * v, 0.10 * v))
         for cx, cy, lx, ly in self.scn.curbs:
-            self._box(body, lx, ly, 0.15, (cx, cy, 0.075), 0.0, (0.66, 0.66, 0.64))
+            self._box(body, lx, ly, 0.15, (cx, cy, 0.075), 0.0, (0.66, 0.66, 0.64), "concrete")
         for cx, cy, lx, ly, rgb in self.scn.pads:
-            self._box(body, lx, ly, 0.14, (cx, cy, 0.07), 0.0, rgb)
+            self._box(body, lx, ly, 0.14, (cx, cy, 0.07), 0.0, rgb, "grass" if rgb[1] > rgb[0] + 0.05 else "concrete")
         self.system.Add(body)
 
     def _parked_cars(self, visual):
@@ -2436,6 +2778,21 @@ class World:
 # The parking agent: perception -> map -> stall decision -> plan -> track
 # =============================================================================
 
+def start_depth_worker(args):
+    """Start the process with the depth networks, or exit with what is missing."""
+    python = find_depth_python(args.depth_python)
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = args.igev or os.environ.get("IGEV_ROOT") or os.path.join(here, "third_party", "IGEV-plusplus")
+    if python is None:
+        sys.exit("--sensors %s computes depth with neural networks and needs a Python with torch, timm and "
+                 "transformers. None was found: name one with --depth-python, or see docs/sensors.md. "
+                 "--sensors sim runs without sensors." % args.sensors)
+    try:
+        return DepthWorker(python, ["--repo", repo, "--model", args.stereo])
+    except RuntimeError as exc:
+        sys.exit("[parking] %s" % exc)
+
+
 class ParkingSim:
     MAX_REPLANS = 6
     MAX_CORRECTIONS = 2
@@ -2446,8 +2803,8 @@ class ParkingSim:
         rng = np.random.default_rng(args.seed + 7919)
         rig = args.sensors != "sim"
         self.world = World(self.scn, visual=rig or not args.headless, tire=args.tire)   # sensors render the visual assets
-        self.sensor = SensorRig(self.world, args.sensors, args.noise, rng) if rig else \
-            Perception(self.scn, args.noise, rng)
+        self.sensor = SensorRig(self.world, args.sensors, args.noise, rng, start_depth_worker(args), args.sky) \
+            if rig else Perception(self.scn, args.noise, rng)
         self.grid = GridMap(self.scn.bounds)
         self.lines = LineMap(keep=rig)
         self.planner = Planner()
@@ -2487,6 +2844,10 @@ class ParkingSim:
                   car.GetSteering(0).GetTemplateName(), car.GetDriveline().GetTemplateName(),
                   car.GetTire(0, veh.LEFT).GetTemplateName()), flush=True)
         print("[parking] perception: %s" % self.sensor.name, flush=True)
+        if rig:
+            info = self.sensor.depth.info
+            print("[parking] depth from images: %s (%s) for the stereo pair, %s for the single cameras, on %s; "
+                  "sky: %s" % (info["model"], info["weights"], info["mono"], info["device"], args.sky), flush=True)
 
     @property
     def time(self):
@@ -3218,24 +3579,25 @@ class Viewer:
             print("[parking] Python cannot put pictures into the window with this Irrlicht library: the views "
                   "show the scene, not the sensor images", flush=True)
         if args.layout == "sensors" and self.add_texture is not None:
-            # The viewer's own top and chase views on the left. On the right what the sensors
-            # deliver: colour and depth image of each camera, and the measured ranges from above.
+            # The viewer's own top and chase views on the left. On the right what the cameras
+            # deliver and what the stereo network makes of the front pair. Below the top view, every
+            # range that was computed or measured, from above.
             rig = sim.sensor
             ch = (H - top) // 4
             xl = W - ch * rig.CAM_W // rig.CAM_H
             ym = top + int(0.52 * (H - top))
             self.rects = [(0, top, xl, ym), (0, ym, xl // 2, H)]
-            sizes = {"colour": (rig.CAM_W, rig.CAM_H), "depth": (rig.CAM_W // 2, rig.CAM_H // 2)}
-            for i, (cam, kind) in enumerate((c, k) for c in rig.cameras for k in ("colour", "depth")):
-                self.pics.append(((cam["label"], kind), (xl, top + i * ch, W, top + (i + 1) * ch),
-                                  "%s CAMERA: %s" % (cam["label"], kind),
-                                  "CHRONO::SENSOR, %d X %d PIXELS" % sizes[kind]))
-            what = "STEREO DEPTH POINTS"
+            size = "ZED X ONE GS, %d X %d" % (rig.CAM_W, rig.CAM_H)
+            net = rig.depth.info["model"].upper()
+            for i, (key, title, sub) in enumerate((
+                    (("front", "image"), "FRONT LEFT CAMERA", size + ", ONE OF THE STEREO PAIR"),
+                    (("front", "range"), "STEREO DEPTH: " + net, "COMPUTED FROM THE TWO FRONT IMAGES"),
+                    (("rear", "image"), "REAR CAMERA", size), (("bumper", "image"), "BUMPER CAMERA", size))):
+                self.pics.append((key, (xl, top + i * ch, W, top + (i + 1) * ch), title, sub))
+            what = "FROM STEREO, FAINT: FROM ONE CAMERA"
             if rig.lidar is not None:
-                what = "LIDAR %d X %d (LARGE DOTS), STEREO DEPTH" % (rig.LIDAR_W, rig.LIDAR_H)
-            if rig.radars:
-                what = "%d RADARS %d X %d (WHITE), STEREO DEPTH" % (len(rig.radars), rig.RADAR_W, rig.RADAR_H)
-            self.pics.append((("range", ""), (xl // 2, ym, xl, H), "RANGE DATA FROM ABOVE", "CHRONO::SENSOR, " + what))
+                what = "LARGE DOTS: LIDAR %d X %d, SMALL: STEREO" % (rig.LIDAR_W, rig.LIDAR_H)
+            self.pics.append((("range", ""), (xl // 2, ym, xl, H), "RANGES FROM ABOVE", what))
             self.pic_rects = [(irr.recti(*r), irr.recti(0, 0, r[2] - r[0], r[3] - r[1])) for _, r, _, _ in self.pics]
             rig.show = True
         elif args.layout == "wide":    # big top view on the left, three views stacked on the right
@@ -3597,8 +3959,7 @@ class Viewer:
         if not self.pics:
             return
         rig = self.sim.sensor
-        stamp = tuple(d["stamp"] for d in rig.cameras + rig.radars + ([rig.lidar] if rig.lidar is not None else []))
-        new, self.pic_stamp = stamp != self.pic_stamp, stamp
+        new, self.pic_stamp = rig.tick != self.pic_stamp, rig.tick
         for (key, r, title, sub), (dst, src) in zip(self.pics, self.pic_rects):
             if new:
                 img = self._picture(key, r[2] - r[0], r[3] - r[1])
@@ -3617,20 +3978,20 @@ class Viewer:
         if name == "range":
             return self._range_picture(w, h)
         cam = next(c for c in self.sim.sensor.cameras if c["label"] == name)
-        if "rgb" not in cam:
+        if kind == "image":
+            return resample(cam["image"][::-1], w, h) if "image" in cam else None     # (bottom row first)
+        if "range" not in cam:
             return None
-        if kind == "colour":
-            return resample(cam["rgb"][::-1], w, h)               # the buffers start at the bottom row
         r = cam["range"][::-1]
         img = RAMP[(255.0 * (1.0 - np.clip(r / self.DEPTH_SCALE, 0.0, 1.0))).astype(np.uint8)]
-        img[r < 0.05] = (24, 26, 31)                                # nothing within the range of the camera
+        img[r < 0.05] = (24, 26, 31)                                # the network's answer was not used here
         return resample(img, w, h)
 
     def _range_view(self, w, h):
         """Geometry of the range picture: pixels per metre, the pixel of the middle of the car, its
         x in the chassis frame, and the height of the part above the lidar's range image."""
         rig = self.sim.sensor
-        hh = h - (3 * rig.LIDAR_H + 18 if rig.lidar is not None else 0)
+        hh = h - (2 * rig.LIDAR_H + 18 if rig.lidar is not None else 0)
         return min(w, hh) / (2.0 * self.RANGE_SPAN), 0.5 * w, 0.5 * hh, 0.5 * (rig.own[0] + rig.own[1]), hh
 
     def _range_picture(self, w, h):
@@ -3646,10 +4007,11 @@ class Viewer:
                 u, v = (cx + r * s * np.cos(a)).astype(int), (cy + r * s * np.sin(a)).astype(int)
                 ok = (u >= 0) & (u < w) & (v >= 0) & (v < hh)
                 bg[v[ok], u[ok]] = (46, 50, 60)
-            for dev, half, reach in [(c, 0.5 * rig.CAM_HFOV, rig.CAM_RANGE) for c in rig.cameras] + \
-                    [(d, 0.5 * rig.RADAR_HFOV, rig.RADAR_RANGE) for d in rig.radars]:
-                for a in (-half, half):                             # the edges of what each sensor looks at
-                    d = dev["R"] @ np.array([math.cos(a), math.sin(a), 0.0])
+            for dev, half, reach in [(c, 0.5 * rig.CAM_HFOV, c["reach"]) for c in rig.cameras if "reach" in c] + \
+                    ([(rig.lidar, 0.5 * rig.LIDAR_HFOV, rig.LIDAR_RANGE)] if rig.lidar is not None else []):
+                yaw = math.atan2(*dev.get("R", np.eye(3))[1::-1, 0])
+                for a in (yaw - half, yaw + half):                  # the edges of what each sensor looks at
+                    d = np.array([math.cos(a), math.sin(a), 0.0])
                     self._stroke(bg[:hh], px(dev["pos"]), px(dev["pos"] + reach * d), (62, 74, 104))
             self.range_bg = bg
         img = self.range_bg.copy()
@@ -3670,13 +4032,10 @@ class Viewer:
                 for dv in range(size):
                     img[v + dv, u + du] = colour
 
-        other = rig.lidar is not None or bool(rig.radars)
-        for cam in rig.cameras:
-            plot(cam.get("cloud"), 1, 0.7 if other else 1.0)
+        for cam in rig.cameras:                                    # depth from one camera is the least certain
+            plot(cam.get("cloud"), 1, 0.45 if cam["role"] == "mono" else 0.7 if rig.lidar is not None else 1.0)
         if rig.lidar is not None:
             plot(rig.lidar.get("cloud"), 2, 1.0)
-        for radar in rig.radars:
-            plot(radar.get("cloud"), 3, 1.0, (255, 255, 255))
         x0, x1, hw = rig.own
         c = [px(q) for q in ((x1, hw), (x1, -hw), (x0, -hw), (x0, hw))]
         for k in range(4):
@@ -3684,12 +4043,11 @@ class Viewer:
         self._stroke(img[:hh], px((x1 - 0.9, hw)), px((x1, 0.0)), (240, 242, 246))       # the nose
         self._stroke(img[:hh], px((x1 - 0.9, -hw)), px((x1, 0.0)), (240, 242, 246))
         if rig.lidar is not None and "range" in rig.lidar:
-            # one row per beam, the highest on top. The columns go round the car: the middle
-            # looks forward, the left half shows the left side, both ends look back.
+            # one row per beam, the highest on top, and the left of the car on the left
             r = rig.lidar["range"][::-1, ::-1][:, np.arange(w) * rig.LIDAR_W // w]
             strip = RAMP[(255.0 * (1.0 - np.clip(r / rig.LIDAR_RANGE, 0.0, 1.0))).astype(np.uint8)]
             strip[r < 0.05] = (24, 26, 31)
-            img[h - 3 * rig.LIDAR_H:] = np.repeat(strip, 3, axis=0)
+            img[h - 2 * rig.LIDAR_H:] = np.repeat(strip, 2, axis=0)
         return img
 
     def _scale_bar(self, x, y, ramp, lo, hi):
@@ -3709,7 +4067,7 @@ class Viewer:
         self._rect(irr.SColor(150, 0, 0, 0), r[0] + 8, r[1] + 8, r[0] + 20 + max(12 * len(title), 6 * len(sub)), r[1] + 41)
         self._text(title, r[0] + 14, r[1] + 11)
         self._text(sub, r[0] + 14, r[1] + 30, 1, rgb=grey)
-        if key[1] == "depth":
+        if key[1] == "range":
             self._scale_bar(r[0] + 14, r[3] - 17, RAMP[::-1], "0", "%.0f M" % self.DEPTH_SCALE)
         if key[0] == "range":
             s, cx, cy, _, hh = self._range_view(r[2] - r[0], r[3] - r[1])
@@ -3717,7 +4075,7 @@ class Viewer:
                 self._text("%d M" % ring, r[0] + int(cx) + 4, r[1] + int(cy - ring * s) + 3, 1, rgb=(120, 128, 142))
             self._scale_bar(r[0] + 14, r[1] + hh - 17, RAMP, "HEIGHT 0", "%.1f M" % self.HEIGHT_SCALE)
             if rig.lidar is not None:
-                self._text("LIDAR RANGE IMAGE, ALL ROUND, FORWARD IN THE MIDDLE, 0 TO %.0f M" % rig.LIDAR_RANGE,
+                self._text("LIDAR RANGE IMAGE, %.0f DEG FORWARD, 0 TO %.0f M" % (math.degrees(rig.LIDAR_HFOV), rig.LIDAR_RANGE),
                            r[0] + 14, r[1] + hh + 6, 1, rgb=grey)
 
     def _hud(self):
@@ -3993,7 +4351,7 @@ class Viewer:
                             self.cam_rects.append((irr.SColor(255, *self.CAM_PALETTE[int(img[row, a])]),
                                                    x0 + int(a), y + 12 + row, x0 + int(b), y + 13 + row))
             for k, c in enumerate(cams):
-                self._text(c["label"].upper() + " CAMERA, AS READ", x + k * (c["view"].shape[1] + 14), y, 1, rgb=grey)
+                self._text(c["label"].upper() + ", AS READ", x + k * (c["view"].shape[1] + 14), y, 1, rgb=grey)
             for col, x0, y0, x1, y1 in self.cam_rects:
                 self._rect(col, x0, y0, x1, y1)
             y += 12 + cams[0]["view"].shape[0] + 6
@@ -4069,10 +4427,21 @@ def parse_args(argv=None):
     ap.add_argument("--tire", choices=("tmeasy", "pac02"), default="tmeasy",
                     help="tire model of the simulated sedan (TMeasy or Pacejka 2002)")
     ap.add_argument("--sensors", choices=("auto", "sim") + SensorRig.MODES, default="auto",
-                    help="what the car perceives with. camera: Chrono::Sensor stereo cameras looking forward and "
-                         "back. camera+lidar, camera+radar: the same plus a roof lidar or a radar on each side. "
-                         "sim: detections computed from the scenario, no sensor simulated. auto (default): "
-                         "camera if this PyChrono has the ray-traced sensors, otherwise sim")
+                    help="what the car perceives with. camera: Chrono::Sensor cameras, a stereo pair behind the "
+                         "windshield, one at the tail and one on the front bumper, with depth computed from the "
+                         "images by neural networks. camera+lidar: the same plus a forward-facing lidar. sim: "
+                         "detections computed from the scenario, no sensor simulated. auto (default): camera if "
+                         "this PyChrono has the ray-traced sensors and the networks are set up, otherwise sim")
+    ap.add_argument("--stereo", choices=("igev", "rt"), default="igev",
+                    help="stereo network: IGEV++ or its real-time version, which is three times faster and "
+                         "a little less accurate")
+    ap.add_argument("--sky", choices=("auto",) + tuple(SKIES), default="auto",
+                    help="light for the sensors: a clear sky with the sun at 41 degrees, a low sun at 32 degrees, "
+                         "or an overcast sky. auto picks by the seed")
+    ap.add_argument("--depth-python", default=None, metavar="PYTHON",
+                    help="the Python that runs the depth networks (default: one that has torch, timm and transformers)")
+    ap.add_argument("--igev", default=None, metavar="DIR",
+                    help="checkout of the IGEV++ repository with its weights (default: third_party/IGEV-plusplus)")
     ap.add_argument("--noise", type=float, default=1.0, help="perception noise scale (0 = perfect)")
     ap.add_argument("--seed", type=int, default=1, help="random seed (layout details and noise)")
     ap.add_argument("--tour", action="store_true", help="play through a set of scenarios one after another")
@@ -4096,10 +4465,12 @@ def parse_args(argv=None):
         args.target = (x, y, math.radians(deg))
     if args.snapshots:
         os.makedirs(args.snapshots, exist_ok=True)
+    if args.sky == "auto":
+        args.sky = tuple(SKIES)[(args.seed - 1) % len(SKIES)]
     if args.sensors == "auto":
-        args.sensors = "camera" if HAVE_SENSORS else "sim"
+        args.sensors = "camera" if HAVE_SENSORS and find_depth_python(args.depth_python) else "sim"
     elif args.sensors != "sim" and not HAVE_SENSORS:
-        ap.error("--sensors %s needs a PyChrono whose sensor module has cameras, lidar and radar (a build "
+        ap.error("--sensors %s needs a PyChrono whose sensor module has cameras and lidar (a build "
                  "with a ray-tracing backend and Python bindings for it, see docs/sensors.md). This one has %s. "
                  "Use --sensors sim to run without simulated sensors." %
                  (args.sensors, "no sensor module" if sens is None else "only GPS and IMU sensors"))

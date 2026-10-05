@@ -9,7 +9,7 @@ ray is known to be free) and a list of line segments.
 
 | Source | `--sensors` | What it is |
 | --- | --- | --- |
-| `SensorRig` | `camera`, `camera+lidar`, `camera+radar` | cameras, lidar and radar ray traced by Chrono::Sensor. See [sensors.md](sensors.md) |
+| `SensorRig` | `camera`, `camera+lidar` | cameras and a lidar ray traced by Chrono::Sensor, with depth computed from the images by neural networks. See [sensors.md](sensors.md) |
 | `Perception` | `sim` | detections computed from the scenario and corrupted. Described here |
 
 This document describes the stand-in and the mapping. Where the mapping does something only
@@ -207,14 +207,16 @@ parallel) so that a neighbour parked close to the line does not count:
 | Result | Condition |
 | --- | --- |
 | occupied | at least 4 occupied cells inside |
-| free | at most 1 occupied cell **and** enough of the stall seen free in two or more scans: 60 percent of it, or 80 percent of its first 2.5 m and 30 percent overall |
+| free | at most 1 occupied cell **and** enough of the stall seen free in two or more scans: 60 percent of it, or 80 percent of its first 2.5 m and 30 percent overall. With a sensor rig also: 55 percent of its first 2.5 m, 25 percent overall, and free ground seen 2 m into it |
 | unknown | anything else |
 
 "Free" needs positive evidence. A stall the car has not looked into yet is unknown, not free. For
 a stall between two parked cars the stand-in perception sees the interior when the car is roughly
 level with it. A camera that looks along the lane never sees the far end of such a stall, which
 lies in the shadow of the nearer car. The second way to be free is for that case: a parked car
-would show at the mouth of the stall, so a mouth that is seen to be empty is enough.
+would show at the mouth of the stall, so a mouth that is seen to be empty is enough. The third is
+for a rig whose only range sensor with two cameras looks forward. It sees an empty stall as a
+wedge, see [sensors.md](sensors.md#free-means-a-wedge-of-the-mouth-is-empty).
 
 The same pass counts occupied cells just outside each line, which tells whether there is a
 neighbour on each side.
