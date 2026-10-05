@@ -52,6 +52,11 @@ def parse_args(argv=None):
                          "or an overcast sky. auto picks by the seed")
     ap.add_argument("--depth-python", default=None, metavar="PYTHON",
                     help="the Python that runs the depth networks (default: one that has torch, timm and transformers)")
+    ap.add_argument("--depth-host", default=None, metavar="HOST",
+                    help="run the depth networks on another machine, reached with ssh. It needs a copy of this "
+                         "repository with third_party/IGEV-plusplus, and --depth-python names its Python")
+    ap.add_argument("--depth-dir", default="chrono-parking", metavar="DIR",
+                    help="where that copy is on the other machine")
     ap.add_argument("--igev", default=None, metavar="DIR",
                     help="checkout of the IGEV++ repository with its weights (default: third_party/IGEV-plusplus)")
     ap.add_argument("--noise", type=float, default=1.0, help="perception noise scale (0 = perfect)")
@@ -80,7 +85,7 @@ def parse_args(argv=None):
     if args.sky == "auto":
         args.sky = tuple(SKIES)[(args.seed - 1) % len(SKIES)]
     if args.sensors == "auto":
-        args.sensors = "camera" if HAVE_SENSORS and find_depth_python(args.depth_python) else "sim"
+        args.sensors = "camera" if HAVE_SENSORS and (args.depth_host or find_depth_python(args.depth_python)) else "sim"
     elif args.sensors != "sim" and not HAVE_SENSORS:
         ap.error("--sensors %s needs a PyChrono whose sensor module has cameras and lidar (a build "
                  "with a ray-tracing backend and Python bindings for it, see docs/sensors.md). This one has %s. "

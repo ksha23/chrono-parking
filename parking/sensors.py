@@ -23,15 +23,17 @@ from .world import light_scene
 class DepthWorker:
     """The process that runs the depth networks (stereo_worker.py). Requests are answered in the
     order they were made; a thread keeps reading the answers so that neither side waits on a
-    full pipe."""
+    full pipe. The process may be on another machine: its pipes then run through ssh, and the
+    answers come back as 16 bit floats, which is half the data."""
 
-    def __init__(self, python, options):
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stereo_worker.py")
-        self.proc = subprocess.Popen([python, script] + options, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    def __init__(self, command, remote=False):
+        self.remote = remote
+        self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         line = self.proc.stdout.readline()
         if not line:
-            raise RuntimeError("the depth networks did not start. Try: %s %s --check" % (python, script))
+            raise RuntimeError("the depth networks did not start. Try: %s --check" % " ".join(command))
         self.info = json.loads(line)
+        self.info["where"] = command[-2] if remote else "this machine"
         self.replies = queue.Queue()
         self.sent, self.seconds = 0, 0.0
         threading.Thread(target=self._read, daemon=True).start()
@@ -45,7 +47,8 @@ class DepthWorker:
                     break
                 head = json.loads(line)
                 size = head["h"] * head["w"]
-                maps = [np.frombuffer(out.read(4 * size), np.float32).reshape(head["h"], head["w"])
+                kind = np.dtype(head.get("dtype", "float32"))
+                maps = [np.frombuffer(out.read(kind.itemsize * size), kind).reshape(head["h"], head["w"]).astype(np.float32)
                         for _ in range(head["n"])]
                 self.replies.put((head, maps))
         finally:
@@ -57,7 +60,7 @@ class DepthWorker:
         self.sent += 1
         h, w = images[0].shape[:2]
         pipe = self.proc.stdin
-        pipe.write((json.dumps(dict(id=self.sent, op=op, h=h, w=w, n=len(images))) + "\n").encode())
+        pipe.write((json.dumps(dict(id=self.sent, op=op, h=h, w=w, n=len(images), half=self.remote)) + "\n").encode())
         for img in images:
             pipe.write(np.ascontiguousarray(img).tobytes())
         pipe.flush()

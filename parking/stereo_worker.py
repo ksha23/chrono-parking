@@ -23,7 +23,8 @@
 #              "w": columns, "n": images}, then the images, each rows x columns
 #              x 3 bytes (RGB, top row first). A stereo request has two: left, right
 #   reply      one line of JSON {"id": n, "h": rows, "w": columns, "n": maps,
-#              "seconds": t}, then the maps, each rows x columns float32
+#              "seconds": t, "dtype": type}, then the maps, each rows x columns
+#              float32, or float16 if the request said "half": true (for a slow link)
 #
 # After loading the networks it prints one line {"ready": true, ...}. Everything
 # else it has to say goes to stderr.
@@ -151,10 +152,11 @@ def serve(matcher, mono, info):
         images = [np.frombuffer(read_exact(stdin, h * w * 3), np.uint8).reshape(h, w, 3) for _ in range(n)]
         t0 = time.perf_counter()
         maps = [matcher.disparity(*images)] if req.get("op", "stereo") == "stereo" else mono.inverse_depth(images)
-        reply = dict(id=req.get("id"), h=h, w=w, n=len(maps), seconds=round(time.perf_counter() - t0, 4))
+        kind = "float16" if req.get("half") else "float32"
+        reply = dict(id=req.get("id"), h=h, w=w, n=len(maps), seconds=round(time.perf_counter() - t0, 4), dtype=kind)
         stdout.write((json.dumps(reply) + "\n").encode())
         for m in maps:
-            stdout.write(m.tobytes())
+            stdout.write(m.astype(kind).tobytes())
         stdout.flush()
 
 

@@ -24,6 +24,14 @@ from .world import World
 
 def start_depth_worker(args):
     """Start the process with the depth networks, or exit with what is missing."""
+    if args.depth_host:
+        # on another machine, which has a copy of this repository and a Python with PyTorch
+        there = "%s %s/parking/stereo_worker.py --repo %s/third_party/IGEV-plusplus --model %s" % (
+            args.depth_python or "python3", args.depth_dir, args.depth_dir, args.stereo)
+        try:
+            return DepthWorker(["ssh", "-T", "-o", "BatchMode=yes", args.depth_host, there], remote=True)
+        except RuntimeError as exc:
+            sys.exit("[parking] %s" % exc)
     python = find_depth_python(args.depth_python)
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     repo = args.igev or os.environ.get("IGEV_ROOT") or os.path.join(root, "third_party", "IGEV-plusplus")
@@ -32,7 +40,8 @@ def start_depth_worker(args):
                  "transformers. None was found: name one with --depth-python, or see docs/sensors.md. "
                  "--sensors sim runs without sensors." % args.sensors)
     try:
-        return DepthWorker(python, ["--repo", repo, "--model", args.stereo])
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stereo_worker.py")
+        return DepthWorker([python, script, "--repo", repo, "--model", args.stereo])
     except RuntimeError as exc:
         sys.exit("[parking] %s" % exc)
 
@@ -90,8 +99,9 @@ class ParkingSim:
         print("[parking] perception: %s" % self.sensor.name, flush=True)
         if rig:
             info = self.sensor.depth.info
-            print("[parking] depth from images: %s (%s) for the stereo pair, %s for the single cameras, on %s; "
-                  "sky: %s" % (info["model"], info["weights"], info["mono"], info["device"], args.sky), flush=True)
+            print("[parking] depth from images: %s (%s) for the stereo pair, %s for the single cameras, on %s of %s; "
+                  "sky: %s" % (info["model"], info["weights"], info["mono"], info["device"], info["where"], args.sky),
+                  flush=True)
 
     @property
     def time(self):
