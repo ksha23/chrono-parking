@@ -8,6 +8,7 @@ Needs a Python with PyChrono (parking_sim.py imports it), takes about ten second
 import math
 import os
 import sys
+import types
 
 import numpy as np
 
@@ -22,6 +23,7 @@ from parking.reeds_shepp import rs_length_table, rs_paths, rs_sample
 from parking.sensors import SensorRig
 from parking.vehicle import EGO
 from parking.world import surface_textures
+from parking.stalls import JoinedLine, join_collinear
 
 
 def test_reeds_shepp():
@@ -299,6 +301,23 @@ def test_paint_in_light_and_shade():
     print("paint in sun and shade, shadow edges, light spots: ok")
 
 
+def test_lines_in_pieces():
+    """Collinear pieces of a line are joined over a gap, and nothing else is."""
+    def piece(x, y0, y1, hits=6):
+        t = types.SimpleNamespace(c=np.array([x, 0.5 * (y0 + y1)]), d=np.array([0.0, 1.0]), length=abs(y1 - y0), hits=hits)
+        t.ends = lambda: (np.array([x, y0]), np.array([x, y1]))
+        return t
+
+    tick = [piece(7.2, -4.23, -3.77), piece(7.21, -2.73, -1.77)]           # a tick with a metre missing in the middle
+    other = [piece(0.0, -4.2, -1.8), piece(7.2, 3.5, 9.0), piece(7.6, -3.6, -2.9)]
+    out = join_collinear(tick + other)                                 # across the lane and 40 cm to the side: not joined
+    assert len(out) == 4
+    joined = [t for t in out if isinstance(t, JoinedLine)]
+    assert len(joined) == 1 and abs(joined[0].length - 2.46) < 0.01 and joined[0].hits == 12
+    assert abs(joined[0].c[0] - 7.207) < 0.005 and abs(joined[0].c[1] + 3.0) < 0.01
+    print("lines seen in pieces: ok")
+
+
 def test_surfaces():
     """The road surface images exist, are PNG files and have the reflectance of asphalt."""
     files = surface_textures()
@@ -324,5 +343,6 @@ if __name__ == "__main__":
     test_pictures()
     test_depth_from_images()
     test_paint_in_light_and_shade()
+    test_lines_in_pieces()
     test_surfaces()
     print("all checks passed")

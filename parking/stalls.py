@@ -35,6 +35,54 @@ class Slot:
                 self.center[1] - EGO.center * math.sin(th), wrap(th))
 
 
+class JoinedLine:
+    """Pieces of one painted line with gaps between them, taken as one line. It has what a
+    LineTrack has that the stall inference reads."""
+
+    def __init__(self, parts):
+        d = max(parts, key=lambda t: t.length).d
+        n = np.array([-d[1], d[0]])
+        w = np.array([t.length for t in parts])
+        across = float(sum(wi * (t.c @ n) for wi, t in zip(w, parts)) / w.sum())
+        s = np.array([q @ d for t in parts for q in t.ends()])
+        self.d, self.hits, self.length = d, sum(t.hits for t in parts), float(s.max() - s.min())
+        self.c = 0.5 * (s.max() + s.min()) * d + across * n
+        self._ends = (s.min() * d + across * n, s.max() * d + across * n)
+
+    def ends(self):
+        return self._ends
+
+
+def join_collinear(tracks, gap=1.5):
+    """Line tracks that lie on one straight line less than 'gap' apart, each such group as one
+    line. A camera often sees a stripe in pieces: paint wears off, and where the edge of a shadow
+    runs along a stripe, the stripe is not lighter than the ground on both sides and goes
+    unseen. Two half-metre pieces of a tick are not a tick, but they are the same tick."""
+    group = list(range(len(tracks)))
+
+    def root(i):
+        while group[i] != i:
+            i = group[i]
+        return i
+
+    for i in range(len(tracks)):
+        for j in range(i + 1, len(tracks)):
+            a, b = (tracks[i], tracks[j]) if tracks[i].length >= tracks[j].length else (tracks[j], tracks[i])
+            n = np.array([-a.d[1], a.d[0]])
+            if max(abs((q - a.c) @ n) for q in b.ends()) > 0.15:           # not on the same line
+                continue
+            if b.length >= 1.2 and abs(a.d[0] * b.d[1] - a.d[1] * b.d[0]) > 0.09:
+                continue
+            sa, sb = sorted(q @ a.d for q in a.ends()), sorted(q @ a.d for q in b.ends())
+            between = max(sa[0], sb[0]) - min(sa[1], sb[1])              # the gap, negative if they overlap
+            if -0.3 < between < gap:
+                group[root(j)] = root(i)
+    parts = {}
+    for i, t in enumerate(tracks):
+        parts.setdefault(root(i), []).append(t)
+    return [v[0] if len(v) == 1 else JoinedLine(v) for v in parts.values()]
+
+
 def find_slots(tracks, trail, grid, stubs=False):
     """Pair up line tracks into stalls and classify them with the occupancy grid.
     trail: recent ego positions (N,2), used to tell the open end of a stall from its back.
@@ -42,6 +90,11 @@ def find_slots(tracks, trail, grid, stubs=False):
     camera sees the far line of an empty stall through the stall, but of the near line only the
     end that sticks out between the cars; such a stall is one line of some length and a stub."""
     slots = []
+    if stubs:
+        tracks = join_collinear(tracks)
+    # The shortest piece of paint that counts as the tick of a parallel stall. A camera that looks
+    # along the lane sees less of a tick next to a parked car: the car hides the part beside it.
+    tick = 1.2 if stubs else 1.5
     n = len(tracks)
     trail = np.asarray(trail)
     for i in range(n):
@@ -80,8 +133,8 @@ def find_slots(tracks, trail, grid, stubs=False):
                 parallel = False
             elif 2.2 <= abs(sep) <= 3.5 and whole:
                 parallel = False
-            elif (5.0 <= abs(sep) <= 7.8 and 1.5 <= a.length <= 3.6 and 1.5 <= b.length <= 3.6
-                  and overlap >= 1.2):
+            elif (5.0 <= abs(sep) <= 7.8 and tick <= a.length <= 3.6 and tick <= b.length <= 3.6
+                  and overlap >= tick - 0.3):
                 # the two ticks must be neighbours: no third tick in between
                 na, nb = sorted((a.c @ nv, b.c @ nv))
                 if any(abs(k.d @ nv) < 0.2 and na + 1.0 < k.c @ nv < nb - 1.0 and
