@@ -8,7 +8,6 @@ Needs a Python that has PyChrono and matplotlib:
 Three headless simulations are run one after another (about a minute in total), with the stand-in
 perception. The figures of the sensors are made by make_sensor_figures.py."""
 
-import importlib.util
 import math
 import os
 import sys
@@ -22,10 +21,18 @@ from matplotlib.patches import Polygon
 HERE = os.path.dirname(os.path.abspath(__file__))
 IMG = os.path.join(HERE, "img")
 os.makedirs(IMG, exist_ok=True)
-spec = importlib.util.spec_from_file_location("parking_sim", os.path.join(HERE, "..", "parking_sim.py"))
-ps = importlib.util.module_from_spec(spec)
-sys.modules["parking_sim"] = ps
-spec.loader.exec_module(ps)
+sys.path.insert(0, os.path.join(HERE, ".."))
+from parking.agent import ParkingSim
+from parking.cli import parse_args
+from parking.config import STEER_RATE
+from parking.control import LateralMPC
+from parking.geometry import ego_poly, rect_poly, wrap
+from parking.mapping import LineMap
+from parking.perception import Perception
+from parking.planner import CSpace, holonomic_distance
+from parking.reeds_shepp import rs_paths, rs_sample
+from parking.scenario import make_scenario
+from parking.vehicle import EGO
 
 C = dict(fwd="#2f6fe0", rev="#d63ec8", free="#22a745", occ="#d9412b", track="#0aa5c4", det="#e0a800",
          car="#b02a2a", mpc="#d4a000", grey="#8a8f98", obstacle="#c9ccd1")
@@ -62,14 +69,14 @@ def args_for(kind, cars, seed=1, extra=()):
     # these figures show the pipeline with the stand-in perception, which every PyChrono can run
     sys.argv = ["parking_sim.py", "--headless", "--sensors", "sim", "--type", kind, "--cars", cars, "--seed", str(seed), *extra]
     try:
-        return ps.parse_args()
+        return parse_args()
     finally:
         sys.argv = old
 
 
 def run(kind, cars, seed=1):
     """Run one scenario, recording what the figures need."""
-    sim = ps.ParkingSim(args_for(kind, cars, seed))
+    sim = ParkingSim(args_for(kind, cars, seed))
     rec = dict(sim=sim, t=[], pose=[], v=[], vcmd=[], steer=[], drive=[], brake=[], e=[], psi=[], gf=[], gr=[], state=[],
                frame=None, plan=None, mpc=None)
     while sim.result is None and sim.time < 200.0:
@@ -122,11 +129,11 @@ def fig_scenarios():
     for ax, (kind, title) in zip(axes, (("perpendicular", "perpendicular stalls, 7.0 m two-way aisle"),
                                         ("angled", "60 degree stalls, 5.5 m one-way aisle"),
                                         ("parallel", "parallel stalls 7.2 m x 2.5 m along the kerb"))):
-        scn = ps.make_scenario(kind, "both", "right", 60.0, 1)
+        scn = make_scenario(kind, "both", "right", 60.0, 1)
         draw_scene(ax, scn, stalls=True)
         x, y, th = scn.start
         ax.annotate("", xy=(scn.route_end, y), xytext=(x, y), arrowprops=dict(arrowstyle="->", color=C["fwd"], lw=1.2, ls="--"))
-        ax.add_patch(Polygon(ps.rect_poly(x, y, th, -2.45, 2.45, 0.925), closed=True, fc=C["car"], ec="k", lw=0.6, zorder=3))
+        ax.add_patch(Polygon(rect_poly(x, y, th, -2.45, 2.45, 0.925), closed=True, fc=C["car"], ec="k", lw=0.6, zorder=3))
         ax.set_title(title + "  (search route dashed, free stall green)")
         x0, y0, x1, y1 = scn.bounds
         ax.set_xlim(x0 + 2, x1 - 2)
@@ -139,17 +146,17 @@ def fig_perception(rec):
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.2))
     for ax in axes:
         draw_scene(ax, sim.scn)
-        outline(ax, ps.ego_poly(fr["pose"]), color=C["car"], lw=1.5, zorder=5)
+        outline(ax, ego_poly(fr["pose"]), color=C["car"], lw=1.5, zorder=5)
         ax.set_xlim(fr["pose"][0] - 13, fr["pose"][0] + 17)
         ax.set_ylim(-10.5, 10.5)
     ax = axes[0]
     for x1, y1, x2, y2, r in fr["dets"]:
         ax.plot([x1, x2], [y1, y2], color=C["det"], lw=2.0, zorder=4)
-    ax.add_patch(plt.Circle((fr["pose"][0] + ps.EGO.center * math.cos(fr["pose"][2]), fr["pose"][1]), ps.Perception.LINE_RANGE,
+    ax.add_patch(plt.Circle((fr["pose"][0] + EGO.center * math.cos(fr["pose"][2]), fr["pose"][1]), Perception.LINE_RANGE,
                             fc="none", ec=C["grey"], ls=":", lw=0.8))
     ax.set_title("line detections of one frame (yellow): noisy, clipped by range and by occlusion, with clutter")
     ax = axes[1]
-    ox, oy = fr["pose"][0] + ps.EGO.center * math.cos(fr["pose"][2]), fr["pose"][1] + ps.EGO.center * math.sin(fr["pose"][2])
+    ox, oy = fr["pose"][0] + EGO.center * math.cos(fr["pose"][2]), fr["pose"][1] + EGO.center * math.sin(fr["pose"][2])
     for px, py in fr["scan"][::3]:
         ax.plot([ox, px], [oy, py], color="#f08a24", lw=0.25, alpha=0.6, zorder=3)
     ax.plot(fr["scan"][:, 0], fr["scan"][:, 1], ".", color=C["occ"], ms=2.5, zorder=4)
@@ -170,8 +177,8 @@ def fig_mapping(rec):
     for x1, y1, x2, y2, _ in sim.scn.lines:
         ax.plot([x1, x2], [y1, y2], color="#b9bdc4", lw=0.8)
     for (a, b), hits in pl["tracks"]:
-        ax.plot([a[0], b[0]], [a[1], b[1]], color=C["track"] if hits >= ps.LineMap.MIN_HITS else "#9fd8e6", lw=2.2 if hits >= 5 else 1.0)
-    outline(ax, ps.ego_poly(pl["pose"]), color=C["car"], lw=1.5)
+        ax.plot([a[0], b[0]], [a[1], b[1]], color=C["track"] if hits >= LineMap.MIN_HITS else "#9fd8e6", lw=2.2 if hits >= 5 else 1.0)
+    outline(ax, ego_poly(pl["pose"]), color=C["car"], lw=1.5)
     ax.set_title("map when the car stops to plan: seen free (white), never seen (grey), obstacle cells (red), line tracks (cyan)")
     ax = axes[1]
     ax.imshow(np.where(pl["occ"], 0.78, 1.0), origin="lower", extent=extent(g), cmap="gray", vmin=0, vmax=1, interpolation="nearest")
@@ -179,8 +186,8 @@ def fig_mapping(rec):
         col = dict(free=C["free"], occupied=C["occ"], unknown=C["grey"])[status]
         ax.add_patch(Polygon(corners, closed=True, fc=col, alpha=0.30 if not is_target else 0.55, ec=col, lw=1.2))
         ax.annotate("", xy=center + 1.6 * u_in, xytext=center - 0.2 * u_in, arrowprops=dict(arrowstyle="->", color=col, lw=1.2))
-    outline(ax, ps.ego_poly(pl["pose"]), color=C["car"], lw=1.5)
-    outline(ax, ps.ego_poly(pl["goal"]), color="k", lw=1.2, ls="--")
+    outline(ax, ego_poly(pl["pose"]), color=C["car"], lw=1.5)
+    outline(ax, ego_poly(pl["goal"]), color="k", lw=1.2, ls="--")
     ax.set_title("planning map (grey = blocked: obstacle or never seen) with the inferred stalls: free (green), occupied (red), "
                  "arrows point into the stall, dashed = goal pose")
     for ax in axes:
@@ -194,7 +201,7 @@ def fig_mapping(rec):
 def fig_cspace(rec):
     sim, pl = rec["sim"], rec["plan"]
     g = sim.grid
-    cs = ps.CSpace(pl["occ"], g.x0, g.y0, g.RES, 0.25, 0.30)
+    cs = CSpace(pl["occ"], g.x0, g.y0, g.RES, 0.25, 0.30)
     fig, axes = plt.subplots(3, 1, figsize=(11, 10.5))
     for ax, deg in zip(axes, (0, 45, 90)):
         k = int(round(math.radians(deg) * cs.NTH / (2 * math.pi)))
@@ -204,7 +211,7 @@ def fig_cspace(rec):
         rgb[pl["occ"]] = (0.25, 0.27, 0.30)
         ax.imshow(rgb, origin="lower", extent=extent(g), interpolation="nearest")
         pose = (pl["pose"][0] + 3.0, 0.0, math.radians(deg))
-        outline(ax, ps.ego_poly(pose, 0.0), color=C["car"], lw=1.4)
+        outline(ax, ego_poly(pose, 0.0), color=C["car"], lw=1.4)
         ax.plot(pose[0], pose[1], "o", color=C["car"], ms=4)
         ax.set_title("heading %d deg: rear-axle positions in collision (grey), within 0.30 m of it (orange), free (white). "
                      "Blocked cells dark, footprint drawn for scale" % deg)
@@ -234,7 +241,7 @@ def fig_heuristic(rec):
         ax.set_xlim(-15, 15)
         ax.set_ylim(-15, 15)
     fig.colorbar(im, ax=axes[:2], shrink=0.8)
-    dist, cell = ps.holonomic_distance(pl["occ"], g.RES, pl["goal"][:2], g.x0, g.y0)
+    dist, cell = holonomic_distance(pl["occ"], g.RES, pl["goal"][:2], g.x0, g.y0)
     ax = axes[2]
     d = np.where(np.isfinite(dist), dist, np.nan)
     im2 = ax.imshow(d, origin="lower", extent=(g.x0, g.x0 + dist.shape[1] * cell, g.y0, g.y0 + dist.shape[0] * cell), cmap="magma_r")
@@ -248,11 +255,11 @@ def fig_heuristic(rec):
 
 def fig_reeds_shepp():
     fig, axes = plt.subplots(1, 4, figsize=(15, 4.2))
-    R = ps.EGO.radius
+    R = EGO.radius
     for ax, goal in zip(axes, ((9.0, 4.0, 0.0), (0.0, 5.0, math.pi), (-6.0, -6.0, math.pi / 2), (2.0, 3.0, -math.pi / 2))):
-        cands = sorted(ps.rs_paths(goal[0] / R, goal[1] / R, goal[2]), key=lambda c: sum(abs(l) for l in c[1]))
+        cands = sorted(rs_paths(goal[0] / R, goal[1] / R, goal[2]), key=lambda c: sum(abs(l) for l in c[1]))
         for rank, (word, lens) in enumerate(cands[:3][::-1]):
-            rows = ps.rs_sample((0.0, 0.0, 0.0), word, lens, R, 0.1)
+            rows = rs_sample((0.0, 0.0, 0.0), word, lens, R, 0.1)
             best = rank == 2
             start = np.array([[0.0, 0.0]])
             pts = np.vstack([start, rows[:, :2]])
@@ -262,7 +269,7 @@ def fig_reeds_shepp():
                 ax.plot(m[:, 0], m[:, 1], color=col, lw=2.4 if best else 0.8, alpha=1.0 if best else 0.45)
         w, lens = cands[0]
         for pose, col in (((0.0, 0.0, 0.0), "k"), (goal, C["free"])):
-            outline(ax, ps.ego_poly(pose), color=col, lw=1.2)
+            outline(ax, ego_poly(pose), color=col, lw=1.2)
         ax.set_title("shortest word %s, %.1f m" % (w, sum(abs(l) for l in lens) * R))
         ax.set_aspect("equal")
         ax.set_xlabel("x [m]")
@@ -279,8 +286,8 @@ def fig_docking():
     gx, gy, gth = goal
     c, s = math.cos(gth), math.sin(gth)
     ly = -(node[0] - gx) * s + (node[1] - gy) * c
-    lth = ps.wrap(node[2] - gth)
-    k = -sg * math.copysign(ps.EGO.kappa, lth)
+    lth = wrap(node[2] - gth)
+    k = -sg * math.copysign(EGO.kappa, lth)
     lead = ((1.0 - math.cos(lth)) / k - ly) / (sg * math.sin(lth))
     s_arc = -lth / k
     p1 = (node[0] + sg * lead * math.cos(node[2]), node[1] + sg * lead * math.sin(node[2]))
@@ -297,7 +304,7 @@ def fig_docking():
     ax.plot([ctr[0], arc[-1, 0]], [ctr[1], arc[-1, 1]], color="#7a3fd0", lw=0.6, ls="--")
     for pose, col, name in ((node, "k", "search node"), ((p1[0], p1[1], node[2]), C["rev"], ""), ((arc[-1, 0], arc[-1, 1], gth), "#7a3fd0", ""),
                             (goal, C["free"], "parked pose")):
-        outline(ax, ps.ego_poly(pose), color=col, lw=1.1)
+        outline(ax, ego_poly(pose), color=col, lw=1.1)
         ax.plot(pose[0], pose[1], "o", color=col, ms=3.5)
         if name:
             ax.annotate(name, (pose[0], pose[1]), textcoords="offset points", xytext=(8, -12), color=col)
@@ -326,7 +333,7 @@ def fig_plans(recs):
         ax.plot(pose[drive, 0], pose[drive, 1], "k-", lw=0.8, zorder=7)
         idx = np.flatnonzero(drive)
         for i in list(idx[::40]) + [idx[-1]]:
-            outline(ax, ps.ego_poly(pose[i]), color=C["car"], lw=0.5 if i != idx[-1] else 1.8, zorder=5)
+            outline(ax, ego_poly(pose[i]), color=C["car"], lw=0.5 if i != idx[-1] else 1.8, zorder=5)
         st = pl["stats"]
         ax.set_title("%s: %s   (%d expansions, cost %.1f, margin %.2f m)\nsearch tree in teal, planned path in colour, driven path black" % (
             sim.scn.name, " + ".join("%s %.1f m" % ("fwd" if d > 0 else "rev", np.hypot(np.diff(x), np.diff(y)).sum()) for x, y, th, d in pl["segs"]),
@@ -340,13 +347,13 @@ def fig_plans(recs):
 
 def fig_mpc(rec):
     m = rec["mpc"]
-    mpc = ps.LateralMPC()
+    mpc = LateralMPC()
     N, h = mpc.N, mpc.H
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.3))
-    k_now, k_max = m["g"] * math.tan(m["steer"]), m["g"] * math.tan(ps.EGO.steer_max)
-    dk = min(m["g"] * (1.0 + math.tan(m["steer"]) ** 2) * ps.STEER_RATE * h / max(abs(m["v"]), 0.3), 2.0 * k_max)
+    k_now, k_max = m["g"] * math.tan(m["steer"]), m["g"] * math.tan(EGO.steer_max)
+    dk = min(m["g"] * (1.0 + math.tan(m["steer"]) ** 2) * STEER_RATE * h / max(abs(m["v"]), 0.3), 2.0 * k_max)
     K, pred = mpc.solve(m["d"], m["e"], m["psi"], k_now, m["k_ref"], k_max, dk)
-    Ku, predu = ps.LateralMPC().solve(m["d"], m["e"], m["psi"], k_now, m["k_ref"], 10.0, 10.0)
+    Ku, predu = LateralMPC().solve(m["d"], m["e"], m["psi"], k_now, m["k_ref"], 10.0, 10.0)
     s = (np.arange(N) + 0.5) * h
     ax = axes[0]
     ax.step(s, m["k_ref"], where="mid", color=C["grey"], lw=1.5, label="path curvature (reference)")
@@ -372,7 +379,7 @@ def fig_mpc(rec):
     ax = axes[2]
     ax.plot(m["seg"][0], m["seg"][1], color=C["rev"] if m["d"] < 0 else C["fwd"], lw=2.0, label="planned path")
     ax.plot(m["horizon"][:, 0], m["horizon"][:, 1], "o-", color=C["mpc"], ms=3, lw=1.2, label="MPC prediction (rear axle)")
-    outline(ax, ps.ego_poly(m["pose"]), color=C["car"], lw=1.3)
+    outline(ax, ego_poly(m["pose"]), color=C["car"], lw=1.3)
     ax.set_aspect("equal")
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
@@ -410,15 +417,15 @@ def fig_tracking(rec, name):
     axes[1].set_ylabel("N m")
     axes[1].legend(frameon=False, ncol=2, loc="lower left")
     axes[2].plot(t, np.degrees(rec["steer"]), color=C["fwd"], lw=1.4)
-    axes[2].axhline(math.degrees(ps.EGO.steer_max), color=C["occ"], lw=0.8, ls=":")
-    axes[2].axhline(-math.degrees(ps.EGO.steer_max), color=C["occ"], lw=0.8, ls=":")
+    axes[2].axhline(math.degrees(EGO.steer_max), color=C["occ"], lw=0.8, ls=":")
+    axes[2].axhline(-math.degrees(EGO.steer_max), color=C["occ"], lw=0.8, ls=":")
     axes[2].set_ylabel("road-wheel angle [deg]")
     axes[2].set_ylim(-40, 40)
     axes[3].plot(t, 100 * rec["e"], color=C["track"], lw=1.4, label="lateral error [cm]")
     axes[3].plot(t, np.degrees(rec["psi"]), color="#e07a10", lw=1.4, label="heading error [deg]")
     axes[3].set_ylim(-9, 9)
     axes[3].legend(frameon=False, ncol=2, loc="lower left")
-    axes[4].axhline(1.0 / ps.EGO.wheelbase, color=C["grey"], lw=1.0, ls="--", label="ideal bicycle, 1 / wheelbase")
+    axes[4].axhline(1.0 / EGO.wheelbase, color=C["grey"], lw=1.0, ls="--", label="ideal bicycle, 1 / wheelbase")
     axes[4].plot(t, rec["gf"], color=C["fwd"], lw=1.6, label="identified gain, forward")
     axes[4].plot(t, rec["gr"], color=C["rev"], lw=1.6, label="identified gain, reverse")
     axes[4].set_ylabel("curvature / tan(angle) [1/m]")

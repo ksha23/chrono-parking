@@ -1,8 +1,8 @@
 # Architecture
 
-This document describes how `parking_sim.py` is put together: the data flow, the rates at which
+This document describes how the simulator is put together: the data flow, the rates at which
 things run, the state machine that sequences a parking maneuver, and where each part lives in the
-file. The other documents go into each stage:
+code. The other documents go into each stage:
 
 - [sensors.md](sensors.md): the Chrono::Sensor cameras and lidar, the networks that compute depth from the images, and how that becomes scans and line segments
 - [perception-and-mapping.md](perception-and-mapping.md): the stand-in perception, line tracks, occupancy grid, stall inference, stall choice
@@ -140,27 +140,34 @@ Three events can interrupt `DRIVE`:
   positive left), drive torque at the wheels (N m, negative drives backwards) and brake torque
   (N m). Chrono's normalized pedal inputs are not used by the agent.
 
-## Where things are in the file
+## Where things are
 
-`parking_sim.py` is a single file on purpose, so it can be dropped next to any PyChrono
-installation and run. It is organised in sections, in this order:
+`parking_sim.py` is only the entry point. The code is the package `parking/`, one module per
+concern. Nothing in it imports "upwards": the agent uses everything below it, the viewer uses the
+agent, and `cli.py` starts one or both.
 
-| Section | Main names |
-| --- | --- |
-| Ego vehicle | `Ego`, `EGO` (geometry, mass and limits read from the Chrono model) |
-| Geometry helpers | `rect_poly`, `ego_poly`, `poly_distance`, `footprint_hits` |
-| Scenarios | `Scenario`, `make_lot`, `make_street`, `parked_model` |
-| Perception | `Perception` (stand-in), `SensorRig`, `planar_scan`, `paint_segments` (Chrono::Sensor) |
-| Mapping | `GridMap`, `LineTrack`, `LineMap` |
-| Stall inference | `Slot`, `find_slots`, `_classify`, `_align_with_kerb` |
-| Reeds-Shepp | `_rs_words`, `rs_paths`, `rs_length_table`, `rs_sample` |
-| Configuration space | `CSpace`, `holonomic_distance` |
-| Planner | `Planner` (`search`, `shoot`, `_rs_shot`, `_arc_shot`), `Segment`, `split_segments` |
-| Control | `LateralMPC`, `SteeringGain`, `MpcTracker` |
-| Chrono world | `World` (the model, the scene, and the physical actuation in `step`) |
-| Agent | `ParkingSim` (state machine, decision, planning requests, refinement, monitor) |
-| Viewer | `MouseKeys`, `Viewer` |
-| Entry point | `parse_args`, `main` |
+| Module | Lines | Main names |
+| --- | --- | --- |
+| `cli.py` | 133 | `parse_args`, `main` |
+| `agent.py` | 632 | `ParkingSim` (state machine, decision, planning requests, refinement, monitor) |
+| `chrono_env.py` | 53 | the PyChrono imports, and the rerun in a Python that has PyChrono |
+| `config.py` | 14 | `STEP`, `CONTROL_DT`, `PERCEPTION_DT`, speeds and acceleration limits |
+| `vehicle.py` | 51 | `Ego`, `EGO` (geometry, mass and limits read from the Chrono model) |
+| `geometry.py` | 66 | `rect_poly`, `ego_poly`, `poly_distance`, `footprint_hits` |
+| `scenario.py` | 216 | `Scenario`, `make_lot`, `make_street`, `parked_model` |
+| `world.py` | 277 | `World` (the model, the scene, the physical actuation in `step`), `surface_textures`, `light_scene` |
+| `perception.py` | 231 | `Perception` (stand-in), `planar_scan`, `paint_segments`, the ray helpers |
+| `sensors.py` | 502 | `SensorRig`, `DepthWorker`, `sensor_mounts` |
+| `stereo_worker.py` | 217 | the process that runs IGEV++ and Depth Anything V2 |
+| `mapping.py` | 266 | `GridMap`, `LineTrack`, `LineMap` |
+| `stalls.py` | 213 | `Slot`, `find_slots`, `_classify`, `_align_with_kerb` |
+| `reeds_shepp.py` | 179 | `_rs_words`, `rs_paths`, `rs_length_table`, `rs_sample` |
+| `planner.py` | 446 | `CSpace`, `holonomic_distance`, `Planner` (`search`, `shoot`, `_rs_shot`, `_arc_shot`), `Segment`, `split_segments` |
+| `control.py` | 262 | `LateralMPC`, `SteeringGain`, `MpcTracker` |
+| `viewer.py` | 511 | `Viewer`: the views, the overlays, the input handling |
+| `viewer_pictures.py` | 184 | `PicturesMixin`: the sensor pictures and how they reach Irrlicht |
+| `viewer_panel.py` | 224 | `PanelMixin`: the internals panel |
+| `draw.py`, `inputs.py` | 137 | pixel font, colour scale, `resample`, and `MouseKeys` |
 
 ## Design choices worth knowing
 

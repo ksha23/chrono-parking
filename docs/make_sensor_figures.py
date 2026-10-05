@@ -19,11 +19,12 @@ a plane, so the true range of every pixel that shows the road follows from where
 and the true range to the nearest obstacle on a bearing follows from the outlines of the parked
 cars and the kerbs."""
 
-import importlib.util
+import importlib
 import math
 import os
 import pickle
 import sys
+import types
 
 import numpy as np
 
@@ -34,10 +35,11 @@ KIND = {"front": 0, "rear": 1, "bumper": 2}
 
 
 def load_sim():
-    spec = importlib.util.spec_from_file_location("parking_sim", os.path.join(HERE, "..", "parking_sim.py"))
-    ps = importlib.util.module_from_spec(spec)
-    sys.modules["parking_sim"] = ps
-    spec.loader.exec_module(ps)
+    """The simulator's modules as one namespace. Imported late: drawing does not need PyChrono."""
+    sys.path.insert(0, os.path.join(HERE, ".."))
+    ps = types.SimpleNamespace()
+    for name in ("chrono_env", "geometry", "agent", "sensors", "cli"):
+        vars(ps).update(vars(importlib.import_module("parking." + name)))
     return ps
 
 

@@ -28,7 +28,7 @@
 # After loading the networks it prints one line {"ready": true, ...}. Everything
 # else it has to say goes to stderr.
 #
-#   python stereo_worker.py --check
+#   python parking/stereo_worker.py --check
 #
 # runs made-up images through the networks and prints the times, to test the set-up.
 # =============================================================================
@@ -161,7 +161,8 @@ def serve(matcher, mono, info):
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description="Depth networks for parking_sim.py: IGEV++ and Depth Anything V2")
-    ap.add_argument("--repo", default=os.environ.get("IGEV_ROOT", os.path.join(here, "third_party", "IGEV-plusplus")),
+    ap.add_argument("--repo", default=os.environ.get("IGEV_ROOT", os.path.join(os.path.dirname(here), "third_party",
+                                                                          "IGEV-plusplus")),
                     help="checkout of github.com/gangweiX/IGEV-plusplus")
     ap.add_argument("--model", choices=("igev", "rt"), default="igev", help="IGEV++ or its real-time version")
     ap.add_argument("--weights", default=None, help="checkpoint file (default: the repository's pretrained_models)")

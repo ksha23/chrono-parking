@@ -148,7 +148,7 @@ lidar saw of a car counted as touching it.
 
 *`python parking_sim.py --sensors camera+lidar`, reversing into the stall.*
 
-One Irrlicht window, drawn by the script itself. With a sensor rig it has three parts.
+One Irrlicht window, drawn by the viewer itself. With a sensor rig it has three parts.
 
 **Two views of the scene** on the left. They are rendered by the viewer, not by a sensor, and they
 show the whole world, including what the car cannot see. What the car knows is drawn on top.
@@ -250,7 +250,7 @@ shaped the implementation:
   with filled rectangles.
 - **Pictures.** The bindings can draw a texture (`draw2DImage`) but cannot make one from pixels.
   The call for that, `IVideoDriver::addTexture(name, image)`, takes an Irrlicht string, and the
-  bindings have no conversion for it. So the script fills an `IImage` through the pointer its
+  bindings have no conversion for it. So the viewer fills an `IImage` through the pointer its
   `lock()` returns, and calls `CNullDriver::addTexture` through `ctypes`, by its C++ symbol and
   with the string built by hand as a struct. A texture cannot be written to from Python either,
   so every new picture replaces the old texture. That takes 0.5 ms.

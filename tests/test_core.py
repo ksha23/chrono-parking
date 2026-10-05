@@ -5,7 +5,6 @@
 
 Needs a Python with PyChrono (parking_sim.py imports it), takes about ten seconds."""
 
-import importlib.util
 import math
 import os
 import sys
@@ -13,10 +12,16 @@ import sys
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-spec = importlib.util.spec_from_file_location("parking_sim", os.path.join(HERE, "..", "parking_sim.py"))
-ps = importlib.util.module_from_spec(spec)
-sys.modules["parking_sim"] = ps
-spec.loader.exec_module(ps)
+sys.path.insert(0, os.path.join(HERE, ".."))
+from parking.control import LateralMPC
+from parking.draw import RAMP, resample
+from parking.geometry import footprint_hits, poly_distance, rect_poly, wrap
+from parking.mapping import GridMap, LineTrack
+from parking.perception import _rot_y, paint_segments, pinhole_rays, planar_scan
+from parking.reeds_shepp import rs_length_table, rs_paths, rs_sample
+from parking.sensors import SensorRig
+from parking.vehicle import EGO
+from parking.world import surface_textures
 
 
 def test_reeds_shepp():
@@ -25,11 +30,11 @@ def test_reeds_shepp():
     words, bad = set(), 0
     for _ in range(2000):
         x, y, phi = rng.uniform(-6, 6), rng.uniform(-6, 6), rng.uniform(-math.pi, math.pi)
-        paths = ps.rs_paths(x, y, phi)
+        paths = rs_paths(x, y, phi)
         assert paths, "no Reeds-Shepp path found"
         for word, lens in paths:
-            rows = ps.rs_sample((0.0, 0.0, 0.0), word, lens, 1.0, 0.05)
-            err = math.hypot(rows[-1, 0] - x, rows[-1, 1] - y) + abs(ps.wrap(rows[-1, 2] - phi))
+            rows = rs_sample((0.0, 0.0, 0.0), word, lens, 1.0, 0.05)
+            err = math.hypot(rows[-1, 0] - x, rows[-1, 1] - y) + abs(wrap(rows[-1, 2] - phi))
             bad += err > 1e-6
             words.add(word)
         # no path can be shorter than the straight-line distance
@@ -37,9 +42,9 @@ def test_reeds_shepp():
     assert len(words) == 18, "expected all 18 word types, saw %d" % len(words)
     assert bad <= 5, "%d candidates did not end at the goal" % bad      # the planner filters these out
     xs, ph = np.linspace(-5, 5, 11), np.linspace(-3, 3, 7)
-    table = ps.rs_length_table(xs, xs, ph)
+    table = rs_length_table(xs, xs, ph)
     for i, j, k in ((0, 2, 0), (5, 9, 3), (10, 4, 6), (7, 7, 2)):
-        best = min(sum(abs(l) for l in lens) for _, lens in ps.rs_paths(xs[i], xs[j], ph[k]))
+        best = min(sum(abs(l) for l in lens) for _, lens in rs_paths(xs[i], xs[j], ph[k]))
         assert abs(best - table[i, j, k]) < 1e-5
     print("Reeds-Shepp: 18 word types, %d of ~13000 candidates off the goal, backends agree" % bad)
 
@@ -60,7 +65,7 @@ def _qp(mpc, d, e0, psi0, k_prev, k_ref):
 def test_mpc_solver():
     """The MPC's QP solve against the closed form (no active constraints) and against a slow
     projected-gradient solve of the same problem (active constraints)."""
-    mpc = ps.LateralMPC()
+    mpc = LateralMPC()
     N = mpc.N
     rng = np.random.default_rng(1)
     worst_free, worst_viol, worst_gap, iters = 0.0, 0.0, -1.0, []
@@ -100,26 +105,26 @@ def test_mpc_solver():
 
 
 def test_footprint_and_distance():
-    old = (ps.EGO.rear, ps.EGO.front, ps.EGO.half_width)
-    ps.EGO.rear, ps.EGO.front, ps.EGO.half_width = 1.0, 3.8, 0.9
+    old = (EGO.rear, EGO.front, EGO.half_width)
+    EGO.rear, EGO.front, EGO.half_width = 1.0, 3.8, 0.9
     try:
         poses = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, math.pi / 2]])
         pts = np.array([[3.0, 0.0], [0.0, 3.0], [5.0, 5.0]])
-        assert ps.footprint_hits(poses, pts[:1], 0.0).tolist() == [True, False]
-        assert ps.footprint_hits(poses, pts[1:2], 0.0).tolist() == [False, True]
-        assert not ps.footprint_hits(poses, pts[2:], 0.5).any()
-        a = ps.rect_poly(0.0, 0.0, 0.0, -1.0, 1.0, 1.0)
-        assert ps.poly_distance(a, ps.rect_poly(4.0, 0.0, 0.0, -1.0, 1.0, 1.0)) == 2.0
-        assert ps.poly_distance(a, ps.rect_poly(1.5, 0.5, 0.3, -1.0, 1.0, 1.0)) == 0.0
+        assert footprint_hits(poses, pts[:1], 0.0).tolist() == [True, False]
+        assert footprint_hits(poses, pts[1:2], 0.0).tolist() == [False, True]
+        assert not footprint_hits(poses, pts[2:], 0.5).any()
+        a = rect_poly(0.0, 0.0, 0.0, -1.0, 1.0, 1.0)
+        assert poly_distance(a, rect_poly(4.0, 0.0, 0.0, -1.0, 1.0, 1.0)) == 2.0
+        assert poly_distance(a, rect_poly(1.5, 0.5, 0.3, -1.0, 1.0, 1.0)) == 0.0
     finally:
-        ps.EGO.rear, ps.EGO.front, ps.EGO.half_width = old
+        EGO.rear, EGO.front, EGO.half_width = old
     print("footprint test and polygon distance: ok")
 
 
 def test_sensor_geometry():
     """Pixel rays, the planar scan made from classified 3D points, and the stripe detector."""
     w, h, hfov = 96, 54, math.radians(120.0)
-    rays = ps.pinhole_rays(w, h, hfov)
+    rays = pinhole_rays(w, h, hfov)
     assert np.allclose(np.linalg.norm(rays, axis=-1), 1.0, atol=1e-6)
     assert rays[0, 0, 1] > 0 and rays[0, 0, 2] < 0, "the buffer starts at the bottom-left pixel"
     edge = math.atan2(rays[h // 2, 0, 1], rays[h // 2, 0, 0])
@@ -135,7 +140,7 @@ def test_sensor_geometry():
     kerb = np.stack([kx.ravel(), ky.ravel(), np.full(kx.size, 0.15)], axis=1)
     P = np.concatenate([wall, ground, kerb])[None]
     obstacle, on_ground = P[..., 2] > 0.1, np.abs(P[..., 2]) < 0.05
-    ang, r_hit, r_free, r_stop, before = ps.planar_scan(P, (0.0, 0.0), obstacle, on_ground, ~on_ground, 240,
+    ang, r_hit, r_free, r_stop, before = planar_scan(P, (0.0, 0.0), obstacle, on_ground, ~on_ground, 240,
                                                         math.radians(60.0), 0.0, 12.0)
     assert np.all(before <= np.where(np.isfinite(r_stop), r_stop, np.inf) + 1e-9)
     ahead = np.abs(ang) < math.radians(8.0)
@@ -154,7 +159,7 @@ def test_sensor_geometry():
         return np.array(p) + t * d + rng.uniform(-0.06, 0.06, (n, 1)) * nrm
     pts = np.concatenate([stripe((2.0, 1.0), (2.0, 4.0), 900), stripe((2.0, 5.5), (2.0, 8.0), 800),
                           stripe((4.0, 2.0), (7.0, 2.5), 900), rng.uniform(0.0, 9.0, (60, 2))])
-    segs = ps.paint_segments(pts, np.zeros(2))
+    segs = paint_segments(pts, np.zeros(2))
     found = sorted((round(min(s[1], s[3]), 1), round(max(s[1], s[3]), 1)) for s in segs if abs(s[0] - 2.0) < 0.05
                    and abs(s[2] - 2.0) < 0.05)
     assert found == [(1.0, 4.0), (5.5, 8.0)], found
@@ -165,24 +170,24 @@ def test_sensor_geometry():
 
 def test_mapping():
     """Line tracks that remember where paint was seen, and the tentative layer of the grid."""
-    trk = ps.LineTrack((0.0, 0.0, 0.0, 2.0, 8.0), 0.0, keep=True)       # the mouth of a line, seen from far
+    trk = LineTrack((0.0, 0.0, 0.0, 2.0, 8.0), 0.0, keep=True)       # the mouth of a line, seen from far
     for _ in range(12):
         trk.add((0.0, 0.0, 0.0, 2.0, 8.0))
     for _ in range(200):                                                # then only its far end, from close
         trk.add((0.0, 3.0, 0.0, 5.5, 2.0))
     lo = min(e[1] for e in trk.ends())
     assert lo < 0.15, "the track forgot the stretch it saw from far away (starts at %.2f)" % lo
-    plain = ps.LineTrack((0.0, 0.0, 0.0, 2.0, 8.0), 0.0)
+    plain = LineTrack((0.0, 0.0, 0.0, 2.0, 8.0), 0.0)
     for _ in range(12):
         plain.add((0.0, 0.0, 0.0, 2.0, 8.0))
     for _ in range(200):
         plain.add((0.0, 3.0, 0.0, 5.5, 2.0))
     assert min(e[1] for e in plain.ends()) > 2.5                        # (what happens without the memory)
 
-    old = (ps.EGO.rear, ps.EGO.front, ps.EGO.half_width, ps.EGO.length)
-    ps.EGO.rear, ps.EGO.front, ps.EGO.half_width, ps.EGO.length = 1.0, 3.8, 0.9, 4.8
+    old = (EGO.rear, EGO.front, EGO.half_width, EGO.length)
+    EGO.rear, EGO.front, EGO.half_width, EGO.length = 1.0, 3.8, 0.9, 4.8
     try:
-        g = ps.GridMap((0.0, -5.0, 20.0, 5.0))
+        g = GridMap((0.0, -5.0, 20.0, 5.0))
         ang = np.radians(np.arange(-30.0, 30.0, 0.5))
         none = np.full(len(ang), np.nan)
         for _ in range(4):      # sure of the first 6 m, ground seen up to 11 m
@@ -199,31 +204,31 @@ def test_mapping():
         g.mark_free((15.0, 3.0, 0.0))
         assert not g.blocked()[cell(16.0, 3.0)], "the ground under the car is free"
     finally:
-        ps.EGO.rear, ps.EGO.front, ps.EGO.half_width, ps.EGO.length = old
+        EGO.rear, EGO.front, EGO.half_width, EGO.length = old
     print("line memory and tentative map layer: ok")
 
 
 def test_pictures():
     """The pictures of the viewer are made at the size they are drawn at."""
     flat = np.full((540, 960, 3), (10, 120, 250), np.uint8)
-    out = ps.resample(flat, 400, 225)
+    out = resample(flat, 400, 225)
     assert out.shape == (225, 400, 3) and out.dtype == np.uint8 and np.all(out == (10, 120, 250))
     board = np.zeros((540, 960, 3), np.uint8)              # one pixel on, one off: averages to grey
     board[::2, ::2] = board[1::2, 1::2] = 255
-    out = ps.resample(board, 400, 225)
+    out = resample(board, 400, 225)
     assert out.min() >= 126 and out.max() <= 128
     ramp = np.repeat((np.arange(480) // 2).astype(np.uint8)[None, :, None], 3, axis=2).repeat(270, axis=0)
-    out = ps.resample(ramp, 400, 225)                      # a gradient stays one, end to end
+    out = resample(ramp, 400, 225)                      # a gradient stays one, end to end
     assert np.all(np.diff(out[100, :, 0].astype(int)) >= 0) and out[100, 0, 0] <= 1 and out[100, -1, 0] >= 238
-    assert np.array_equal(ps.resample(ramp, 480, 270), ramp)
-    assert ps.RAMP.shape == (256, 3) and tuple(ps.RAMP[0]) == (46, 58, 150) and tuple(ps.RAMP[-1]) == (222, 44, 32)
+    assert np.array_equal(resample(ramp, 480, 270), ramp)
+    assert RAMP.shape == (256, 3) and tuple(RAMP[0]) == (46, 58, 150) and tuple(RAMP[-1]) == (222, 44, 32)
     print("picture resampling: ok")
 
 
 def _rig():
     """A sensor rig without sensors: enough of one to run its image processing on made-up data."""
-    rig = ps.SensorRig.__new__(ps.SensorRig)
-    rig.rays = ps.pinhole_rays(rig.CAM_W // 2, rig.CAM_H // 2, rig.CAM_HFOV)
+    rig = SensorRig.__new__(SensorRig)
+    rig.rays = pinhole_rays(rig.CAM_W // 2, rig.CAM_H // 2, rig.CAM_HFOV)
     rig.linear = ((np.arange(256) / 255.0) ** 2.2).astype(np.float32)
     return rig
 
@@ -231,10 +236,10 @@ def _rig():
 def _ground_view(rig, height, pitch, shade=lambda x, y: np.ones_like(x), paint=lambda x, y: np.zeros(x.shape, bool)):
     """What a camera 'height' above the ground and pitched down sees of a flat road: the image
     (bottom row first) and the true depth along the optical axis at half size."""
-    R = ps._rot_y(pitch)
+    R = _rot_y(pitch)
     out = []
     for w, h in ((rig.CAM_W, rig.CAM_H), (rig.CAM_W // 2, rig.CAM_H // 2)):
-        d = ps.pinhole_rays(w, h, rig.CAM_HFOV) @ R.T.astype(np.float32)
+        d = pinhole_rays(w, h, rig.CAM_HFOV) @ R.T.astype(np.float32)
         t = np.where(d[..., 2] < -1e-3, -height / np.minimum(d[..., 2], -1e-3), np.inf)      # range to the ground
         out.append((d, t))
     (d, t), (dh, th) = out
@@ -262,7 +267,7 @@ def test_depth_from_images():
     assert np.all(r[100:145, 239:241] == 0.0) and np.all(r[100:145, 236] > 0.0) and np.all(r[100:145, 243] > 0.0)
 
     # a network's inverse depth with an unknown scale and offset, of a road with a wall across it
-    cam = dict(pos=np.array([0.0, 0.0, 1.09]), R=ps._rot_y(math.radians(25.0)))
+    cam = dict(pos=np.array([0.0, 0.0, 1.09]), R=_rot_y(math.radians(25.0)))
     _, z, _ = _ground_view(rig, 1.09, math.radians(25.0))
     wall = np.minimum(z, 2.5 / np.maximum(rig.rays[..., 0], 1e-3) * rig.rays[..., 0])       # depth 2.5 m at most
     zf = np.repeat(np.repeat(np.minimum(wall, 30.0), 2, axis=0), 2, axis=1)
@@ -285,18 +290,18 @@ def test_paint_in_light_and_shade():
     assert len(xy) > 80 and np.abs(xy[:, 1] - 0.8).max() < 0.10                           # nothing off the stripe
     along = np.sort(xy[:, 0])
     assert along[0] < 1.15 and along[-1] > 4.3 and np.diff(along).max() < 0.12            # and all of it, lit and shaded
-    segs = ps.paint_segments(xy, np.zeros(2), min_count=1)
+    segs = paint_segments(xy, np.zeros(2), min_count=1)
     assert len(segs) == 1 and abs(math.hypot(segs[0][2] - segs[0][0], segs[0][3] - segs[0][1]) - 3.5) < 0.2
     # a light spot half a metre beyond the end of a stripe does not make the stripe longer
     spot = np.stack(np.meshgrid(np.arange(5.0, 5.2, 0.05), np.arange(0.75, 0.9, 0.05)), axis=-1).reshape(-1, 2)
-    segs = ps.paint_segments(np.concatenate([xy, spot]), np.zeros(2), min_count=1)
+    segs = paint_segments(np.concatenate([xy, spot]), np.zeros(2), min_count=1)
     assert len(segs) == 1 and max(segs[0][0], segs[0][2]) < 4.6
     print("paint in sun and shade, shadow edges, light spots: ok")
 
 
 def test_surfaces():
     """The road surface images exist, are PNG files and have the reflectance of asphalt."""
-    files = ps.surface_textures()
+    files = surface_textures()
     raw = open(files["asphalt"], "rb").read()
     assert raw[:8] == b"\x89PNG\r\n\x1a\n" and raw[12:16] == b"IHDR"
     w, h = int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")

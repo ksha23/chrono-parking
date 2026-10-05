@@ -4,7 +4,7 @@ With `--sensors camera` or `camera+lidar` the car perceives through sensors that
 ray traces in the scene. Nothing is read from the scenario, and nothing is read from the renderer
 except what a real sensor would deliver: colour images, and lidar returns. In particular there is
 no depth camera. Range is computed from the images by neural networks. Code: `SensorRig`,
-`DepthWorker`, `stereo_worker.py`, `planar_scan`, `paint_segments`, and the parts of `GridMap`,
+`DepthWorker`, `parking/stereo_worker.py`, `planar_scan`, `paint_segments`, and the parts of `GridMap`,
 `LineTrack` and `find_slots` that exist because a camera does not see everything.
 
 | `--sensors` | The car has | Lines from | Obstacles and free ground from |
@@ -47,7 +47,7 @@ the other backends may render differently (textures without mip-maps, glass as p
 transparency, the exposure and vignette settings of the scene), so expect to retune the light on
 OptiX or Vulkan RT.
 
-**The depth networks.** They run in a process of their own, `stereo_worker.py`, with a Python
+**The depth networks.** They run in a process of their own, `parking/stereo_worker.py`, with a Python
 that has PyTorch:
 
 ```
@@ -58,7 +58,7 @@ git clone https://github.com/gangweiX/IGEV-plusplus third_party/IGEV-plusplus
 cd third_party/IGEV-plusplus
 gdown --folder https://drive.google.com/drive/folders/1eubNsu03MlhUfTtrbtN7bfAsl39s2ywJ -O pretrained_models
 
-python stereo_worker.py --check      # with that Python: runs both networks once and prints the time
+python parking/stereo_worker.py --check    # with that Python: runs both networks once and prints the time
 ```
 
 `parking_sim.py` finds a Python that has `torch`, `timm` and `transformers` among the conda

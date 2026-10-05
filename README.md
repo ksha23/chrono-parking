@@ -1,7 +1,6 @@
 # chrono-parking
 
-Automated parking in [Project Chrono](https://projectchrono.org). The simulator is one Python
-script. The neural networks that compute depth from its camera images run in a second, small one.
+Automated parking in [Project Chrono](https://projectchrono.org), in Python.
 
 A full multibody Chrono::Vehicle sedan drives down a parking aisle. From what its sensors show
 it builds a map of the painted stall lines and the obstacles, decides which stall to take, plans
@@ -43,7 +42,7 @@ The sensors need two more things, both described in
   Chrono built with Metal RT (macOS) or Vulkan RT needs a small patch to its Python bindings,
   which is in this repository. Everything here was developed with Metal RT.
 - A Python with PyTorch for the depth networks, which run in a process of their own
-  (`stereo_worker.py`), and a checkout of IGEV++ with its published weights.
+  (`parking/stereo_worker.py`), and a checkout of IGEV++ with its published weights.
 
 ```
 python parking_sim.py                                   # perpendicular stalls, a car on each side
@@ -144,8 +143,21 @@ and lines against the geometry of the scenario.
 ## Layout
 
 ```
-parking_sim.py                  the whole simulator, about 4500 lines
-stereo_worker.py                the depth networks (IGEV++, Depth Anything V2), a process of their own
+parking_sim.py                  entry point: python parking_sim.py [options]
+parking/
+  cli.py                        options, the tour, the main loop
+  agent.py                      the parking agent: one state machine from search to parked
+  chrono_env.py                 finds and imports PyChrono
+  config.py, vehicle.py         rates and speeds, the car as read from the Chrono model
+  geometry.py                   footprints and distances
+  scenario.py, world.py         the lot and its ground truth, the Chrono world built from it
+  perception.py                 the stand-in perception, planar scans, line segments from paint
+  sensors.py                    the sensor rig: cameras, lidar, depth from the images
+  stereo_worker.py              the depth networks (IGEV++, Depth Anything V2), a process of their own
+  mapping.py, stalls.py         occupancy grid and line tracks, stalls inferred from them
+  reeds_shepp.py, planner.py    Reeds-Shepp curves, configuration space, Hybrid A*
+  control.py                    steering MPC, online steering gain, speed control
+  viewer.py                     the window, with viewer_pictures.py, viewer_panel.py, draw.py, inputs.py
 tests/test_core.py              checks of the planner curves, the MPC solver, the image processing and the map
 docs/                           design documents and figures
 docs/make_figures.py            regenerates the figures of the pipeline from real runs
