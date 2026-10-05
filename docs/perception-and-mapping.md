@@ -163,6 +163,10 @@ pair of confirmed tracks whose directions agree within about 8 degrees.
 For a parallel stall the two "lines" are the short ticks painted across the parking strip at its
 front and back, so the car ends up perpendicular to them.
 
+With a sensor rig, tracks on one straight line less than 1.5 m apart are first joined into one
+line, a tick may be 1.2 m long, and a stall starts on a line along the lane even if one of its
+lines was seen to start late (see [sensors.md](sensors.md#a-line-in-pieces-is-one-line)).
+
 With a sensor rig a third kind of pair is accepted: one line of at least 2 m and a stub, which is
 what a camera looking along the lane sees of a stall between two cars
 ([sensors.md](sensors.md#a-stall-is-one-line-and-a-stub)).

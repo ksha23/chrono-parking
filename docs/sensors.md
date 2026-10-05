@@ -69,6 +69,28 @@ first time it is used.
 It is a separate process for two reasons. The Python that has PyChrono usually has no PyTorch.
 And on macOS the two bring their own OpenMP runtimes, which abort when loaded into one process.
 
+**The networks on another machine.** Because they are a process that talks over a pipe, they can
+run somewhere else:
+
+```
+python parking_sim.py --depth-host HOST --depth-dir chrono-parking --depth-python PYTHON
+```
+
+starts `parking/stereo_worker.py` on `HOST` through ssh. That machine needs a copy of this
+repository at `--depth-dir` (relative to the home directory there) with `third_party/IGEV-plusplus`,
+and `--depth-python` names its Python with PyTorch. The images are sent as they are, and the
+answers come back as 16 bit floats. Measured with an RTX 5070 Ti reached at 20 MB/s:
+
+| | On the M4 Pro | On the RTX 5070 Ti |
+| --- | --- | --- |
+| IGEV++, one pair | 0.9 s | 0.16 s |
+| Depth Anything V2, two images | 0.11 s | 0.03 s |
+| batch of runs, per minute | 0.37 with two at a time | 0.79 with four at a time |
+
+The first row of the result table (`--type perpendicular --cars both`) comes out the same to the
+last printed digit either way. The link matters: a stereo request is 3.5 MB, so over a 2 MB/s
+link the transfer alone takes longer than computing here.
+
 **Memory and time.** Measured on an Apple M4 Pro with 48 GB:
 
 | | Value |
@@ -410,6 +432,36 @@ This also covers an angled stall at the end of a row, of which the pair sees onl
 both lines that are near the lane: far parts of a line 6 to 8 m to the side come into the 105
 degree view only beyond the 11 m to which paint is looked for.
 
+### A line in pieces is one line
+
+A camera often sees a stripe in pieces. Paint wears off. And where the edge of a shadow runs
+along a stripe, the stripe is not lighter than the ground on both sides of it, so the detector
+does not see it there. A tick line of a parallel stall came out as a 0.95 m piece and a 0.45 m
+piece with a metre missing between them, under the shadow of the car parked next to it. Neither
+piece is a tick, and the car drove past a free stall.
+
+So before stalls are inferred, line tracks that lie on one straight line are joined
+(`join_collinear`): within 15 cm of the same line, within 5 degrees if the shorter is long enough
+to have a direction, and less than 1.5 m apart. The lines of two rows across the aisle are on one
+line too, but 7 m apart, and stay separate.
+
+### A tick next to a parked car is short
+
+Of the tick between a parallel stall and a parked car, the car hides the part beside it. What
+shows from the lane is 1.4 to 1.8 m of its 2.5 m. With a rig a tick may therefore be 1.2 m long.
+The stand-in keeps 1.5 m.
+
+### A stall starts on a line along the lane
+
+The mouth of a stall was taken where the later of its two lines starts, which is the safe choice
+if a line can only be seen too long. With worn paint it is seen too short: the first half-metre
+piece of one line was gone in one run, the stall came out half a metre short, and the car parked
+40 cm too deep.
+
+The two lines of a stall start on one line along the lane, whatever the angle of the stall. So
+if one was seen to start between 0.1 and 0.75 m further in than the other, measured across the
+lane, the stall starts where the other one does. The lane direction is the way the car has come.
+
 While the car backs in, the rear camera sees both lines of the stall at close range. The
 estimate then rests on those, and the plan follows it (see
 [control.md](control.md#keeping-the-plan-attached-to-the-stall)).
@@ -489,6 +541,9 @@ made of that data shows up in three more places:
   stall relies on what the stereo pair mapped while driving past.
 - **A sliver of sun can pass for paint.** A sunlit strip between two shadows that is 10 to 20 cm
   wide and longer than 25 cm is taken for a line. Nothing in a grey image tells the two apart.
+- **A stripe along a shadow edge goes unseen.** Paint has to be lighter than the ground on both
+  sides. With the edge of a shadow within 20 cm of a stripe, it is not. The pieces on either side
+  are joined, which covers gaps up to 1.5 m.
 - **The lines are found by a rule, not learned.** A scene with other bright, narrow things on
   the ground would produce false ones.
 - **The networks were not trained for this.** They run with published weights. IGEV++ does well
