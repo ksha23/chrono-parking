@@ -3,12 +3,16 @@
 # Automated parking in Project Chrono (PyChrono)
 #
 # A Chrono::Vehicle sedan (full multibody model, TMeasy or Pacejka tires) cruises
-# down a parking aisle, builds a map of the stall lines and obstacles from noisy
-# simulated perception, decides which stall to take, plans a forward/reverse
+# down a parking aisle, builds a map of the stall lines and obstacles from what
+# its sensors show, decides which stall to take, plans a forward/reverse
 # maneuver into it and tracks that plan with model predictive control. One
-# window shows four live camera views and a panel with the internals.
+# window shows four live views and a panel with the internals.
 #
-#   perception : noisy line-segment detections + a noisy 2D range scan
+#   perception : Chrono::Sensor stereo cameras looking forward and back (lines
+#                from the colour image, obstacles and free ground from depth),
+#                optionally a roof lidar or side radars. No camera looks
+#                sideways. Without ray-traced sensors: noisy detections
+#                computed from the scenario
 #   mapping    : line tracks (total least squares) + occupancy grid
 #   decision   : stalls are inferred from pairs of tracked lines, classified
 #                free / occupied / unknown, and scored
@@ -18,12 +22,17 @@
 #
 # The car is driven by physical commands, not pedal positions: road-wheel steering
 # angle [rad], drive torque at the wheels [N m] and brake torque [N m]. Nothing
-# about the car is hard-coded: its geometry, mass and actuator limits are read
-# from the Chrono model at start-up. The design is documented in docs/.
+# about the car is hard-coded: its geometry, mass, actuator limits and the places
+# where the sensors are mounted are read from the Chrono model at start-up. The
+# design is documented in docs/.
 #
-# Examples (any Python with PyChrono's vehicle and irrlicht modules):
+# Examples (any Python with PyChrono's vehicle and irrlicht modules; the sensors
+# also need its sensor module with cameras, lidar and radar, see docs/sensors.md):
 #
 #   python parking_sim.py                                  perpendicular, car on each side
+#   python parking_sim.py --sensors camera+lidar           cameras and a roof lidar
+#   python parking_sim.py --sensors camera+radar           cameras and side radars
+#   python parking_sim.py --sensors sim                    no sensors, detections from the scenario
 #   python parking_sim.py --type angled --cars none        60 deg stalls, empty lot
 #   python parking_sim.py --type parallel --cars both      parallel park between two cars
 #   python parking_sim.py --type perpendicular --cars left --park forward
@@ -82,6 +91,12 @@ try:
 except ImportError:
     _reexec_in_chrono_env()
     sys.exit("PyChrono with the vehicle and irrlicht modules is required (see docs/ for the setup)")
+try:
+    import pychrono.sensor as sens
+except ImportError:
+    sens = None
+# Cameras, lidar and radar need a PyChrono whose sensor module wraps the ray-traced sensors
+HAVE_SENSORS = sens is not None and hasattr(sens, "ChCameraSensor")
 
 # =============================================================================
 # Ego vehicle. Nothing about the car is hard-coded: its geometry and steering
@@ -95,6 +110,7 @@ class Ego:
         self.wheelbase = self.rear = self.front = self.half_width = None
         self.ref_to_rear = self.length = self.center = self.kappa = self.radius = None
         self.mass = self.wheel_radius = self.steer_max = self.brake_torque_max = None
+        self.roof = None       # (x of the rear edge, x of the front edge, height), chassis frame
 
     def read(self, car):
         """Query the Chrono vehicle: wheelbase, axle position, body outline, steering limit."""
@@ -109,8 +125,10 @@ class Ego:
         model = body.GetCollisionModel()
         for i in range(model.GetNumShapes()):
             hull = chrono.CastToChCollisionShapeConvexHull(model.GetShapeInstance(i).shape)
-            pts += [(q.x, q.y) for q in hull.GetPoints()]
+            pts += [(q.x, q.y, q.z) for q in hull.GetPoints()]
         pts = np.array(pts)
+        top = pts[pts[:, 2] > pts[:, 2].max() - 0.10]       # where sensors can be mounted
+        self.roof = (float(top[:, 0].min()), float(top[:, 0].max()), float(pts[:, 2].max()))
         self.rear = -self.ref_to_rear - pts[:, 0].min()     # rear axle -> rear bumper
         self.front = pts[:, 0].max() + self.ref_to_rear     # rear axle -> front bumper
         self.half_width = float(np.abs(pts[:, 1]).max())
@@ -207,7 +225,9 @@ def footprint_hits(poses, pts, margin):
 
 # Parked-car models, built from the vehicle meshes that ship with Chrono. Only the wheel hub
 # positions (x, y, z of the front and rear left hubs, from Chrono's vehicle definitions) are
-# listed here; the footprint and ride height come from the meshes themselves.
+# listed here; the outline and ride height come from the meshes themselves. The outline is that
+# of the body seen from above, taken below half height, which leaves out the mirrors. It is what
+# the car collides with, what clearance is measured against, and what a sensor sees of it.
 PARKED = {
     "audi": dict(mesh="audi/audi_chassis_%s.obj", wheels=((1.441, 0.798, 0.13), (-1.480, 0.798, 0.13)),
                  rim="audi/audi_rim.obj", tire="audi/audi_tire.obj",
@@ -222,18 +242,31 @@ PARKED = {
 _PARKED_GEOMETRY = {}
 
 
+def _outline(pts, n=32):
+    """Convex outline of a set of 2D points: the furthest point in each of n directions,
+    counter-clockwise. Always n vertices, some of which may coincide."""
+    a = np.arange(n) * (2.0 * math.pi / n)
+    return pts[np.argmax(pts @ np.stack([np.cos(a), np.sin(a)]), axis=0)]
+
+
 def parked_model(name):
-    """A parked-car model with its footprint (x0, x1, hw in the mesh frame) and ride height z."""
+    """A parked-car model with its extent (x0, x1, hw), its outline in the mesh frame, and its
+    ride height z."""
     m = _PARKED_GEOMETRY.get(name)
     if m is None:
         m = dict(PARKED[name], x0=-2.45, x1=2.45, hw=1.05, z=0.25)
+        m["outline"] = _outline(np.array([(-2.45, -1.05), (2.45, -1.05), (2.45, 1.05), (-2.45, 1.05)]))
         data = chrono.GetChronoDataPath() + "vehicle/"
         body, tire = data + m["mesh"] % m["colors"][0], data + m["tire"]
         if os.path.exists(body) and os.path.exists(tire):
-            box = chrono.ChTriangleMeshConnected.CreateFromWavefrontFile(body, False, False).GetBoundingBox()
+            mesh = chrono.ChTriangleMeshConnected.CreateFromWavefrontFile(body, False, False)
+            box = mesh.GetBoundingBox()
             wheel = chrono.ChTriangleMeshConnected.CreateFromWavefrontFile(tire, False, False).GetBoundingBox()
             hub = sum(w[2] for w in m["wheels"]) / len(m["wheels"])
-            m.update(x0=box.min.x, x1=box.max.x, hw=max(-box.min.y, box.max.y),
+            v = mesh.GetCoordsVertices()         # (indexed: iterating it ends in an uncaught exception on some builds)
+            pts = np.array([(v[i].x, v[i].y, v[i].z) for i in range(len(v))])
+            low = pts[pts[:, 2] < 0.5 * (box.min.z + box.max.z), :2]
+            m.update(x0=box.min.x, x1=box.max.x, hw=float(np.abs(low[:, 1]).max()), outline=_outline(low),
                      z=0.5 * (wheel.max.z - wheel.min.z) - hub)       # tires resting on the ground
         _PARKED_GEOMETRY[name] = m
     return m
@@ -261,8 +294,9 @@ class Scenario:
         model = models[int(rng.integers(len(models)))]
         m = parked_model(model)
         color = m["colors"][int(rng.integers(len(m["colors"])))]
-        half = 0.5 * (m["x1"] - m["x0"])
-        poly = rect_poly(cx, cy, yaw, -half, half, m["hw"])
+        c, s = math.cos(yaw), math.sin(yaw)
+        o = m["outline"] - (0.5 * (m["x0"] + m["x1"]), 0.0)          # about the middle of the car
+        poly = np.stack([cx + o[:, 0] * c - o[:, 1] * s, cy + o[:, 0] * s + o[:, 1] * c], axis=1)
         self.cars.append(dict(model=model, color=color, cx=cx, cy=cy, yaw=yaw, poly=poly))
 
     def obstacle_polys(self):
@@ -396,13 +430,21 @@ def make_scenario(kind, cars, side, angle, seed):
 
 
 # =============================================================================
-# Simulated perception: noisy stall-line segments and a noisy planar range scan
+# Perception. Two interchangeable sources feed the same mapping code:
+#   Perception   noisy line segments and a noisy 360 degree range scan, computed from the scenario
+#   SensorRig    Chrono::Sensor cameras (and optionally a lidar or radars) mounted on the car
+# Both return, every tick, a list of planar scans (origin, bearings, range of the nearest
+# obstacle per bearing or NaN, range known to be free per bearing) and a list of line
+# segments (x1, y1, x2, y2, distance from the sensor).
 # =============================================================================
 
 class Perception:
+    """Stand-in for a perception stack: no sensor is simulated, the detections are computed
+    from the scenario and corrupted with noise, dropouts, fragmentation and clutter."""
     N_RAYS = 360
     SCAN_RANGE = 16.0
     LINE_RANGE = 12.0
+    name = "simulated detections"
 
     def __init__(self, scn, noise, rng):
         self.noise = noise
@@ -418,8 +460,7 @@ class Perception:
             self.line_pts.append(np.linspace((x1, y1), (x2, y2), n))
 
     def sense(self, pose):
-        """Returns (origin, ray angles, measured ranges, line detections).
-        Ranges are NaN where a ray was dropped and inf where nothing was hit."""
+        """Returns (scans, line detections) for the car at this rear-axle pose."""
         rng, k = self.rng, self.noise
         ox = pose[0] + EGO.center * math.cos(pose[2])
         oy = pose[1] + EGO.center * math.sin(pose[2])
@@ -473,15 +514,420 @@ class Perception:
             cx, cy = ox + r * math.cos(b), oy + r * math.sin(b)
             dets.append((cx - half * math.cos(a), cy - half * math.sin(a),
                          cx + half * math.cos(a), cy + half * math.sin(a), r))
-        return (ox, oy), ang, r_meas, dets
+        # a dropped ray (NaN) says nothing; a ray that hit nothing (inf) is free over the whole range
+        r_hit = np.where(np.isfinite(r_meas), r_meas, np.nan)
+        r_free = np.where(np.isnan(r_meas), 0.0, np.minimum(r_meas, self.SCAN_RANGE) - 0.1)
+        return [((ox, oy), ang, r_hit, r_free)], dets
 
 
 # =============================================================================
-# Mapping: occupancy grid from the scan, line tracks from the line detections
+# Perception from Chrono::Sensor. The car carries a stereo camera (colour image + depth) that
+# looks forward and one that looks back, and optionally a roof lidar or four corner radars.
+# There is no camera to the sides: what is beside the car is known only from what was seen
+# before, or from the lidar or the radars.
+# =============================================================================
+
+def _rot_y(a):
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+
+
+def _rot_z(a):
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def pinhole_rays(w, h, hfov):
+    """Unit ray of every pixel in the camera frame (x forward, y left, z up). Chrono image
+    buffers start at the bottom-left pixel."""
+    f = 0.5 * w / math.tan(0.5 * hfov)
+    U, V = np.meshgrid(np.arange(w) + 0.5 - 0.5 * w, np.arange(h) + 0.5 - 0.5 * h)
+    d = np.stack([np.full_like(U, f), -U, V], axis=-1)
+    return (d / np.linalg.norm(d, axis=-1, keepdims=True)).astype(np.float32)
+
+
+def angular_rays(w, h, hfov, el_min, el_max, inclusive):
+    """Unit rays of a scanning sensor: one per bearing and elevation. The lidar spaces its beams
+    from end to end of each range (inclusive); the radar puts them at the cell centres."""
+    if inclusive:
+        az = -0.5 * hfov + np.arange(w) / (w - 1) * hfov
+        el = el_min + np.arange(h) / (h - 1) * (el_max - el_min)
+    else:
+        az = -0.5 * hfov + (np.arange(w) + 0.5) / w * hfov
+        el = el_min + (np.arange(h) + 0.5) / h * (el_max - el_min)
+    EL, AZ = np.meshgrid(el, az, indexing="ij")
+    return np.stack([np.cos(EL) * np.cos(AZ), np.cos(EL) * np.sin(AZ), np.sin(EL)], axis=-1).astype(np.float32)
+
+
+def smooth_noise(rng, shape, block=8):
+    """Unit-variance noise that varies smoothly over an image, like the error of a stereo matcher."""
+    h, w = shape
+    g = rng.normal(0.0, 1.0, (h // block + 2, w // block + 2))
+    y, x = (np.arange(h) + 0.5) / block, (np.arange(w) + 0.5) / block
+    y0, x0 = y.astype(int), x.astype(int)
+    fy, fx = (y - y0)[:, None], (x - x0)[None, :]
+    top = g[y0][:, x0] * (1.0 - fx) + g[y0][:, x0 + 1] * fx
+    bot = g[y0 + 1][:, x0] * (1.0 - fx) + g[y0 + 1][:, x0 + 1] * fx
+    return ((top * (1.0 - fy) + bot * fy) / 0.75).astype(np.float32)   # blending lowers the variance
+
+
+def planar_scan(P, origin, obstacle, ground, blocking, n_bins, half_fov, heading, r_max, r_cell=0.1):
+    """Collapse classified 3D points into a planar scan around the sensor: per bearing, the range
+    of the nearest obstacle (NaN if none), the range known to be free, the range of the first
+    thing that is not ground, and the range of the last ground seen in front of that. Anything
+    that is not clearly ground ends the free part of a ray, but only a clear obstacle counts as
+    a hit."""
+    dx, dy = P[..., 0] - origin[0], P[..., 1] - origin[1]
+    rho = np.hypot(dx, dy)
+    rel = (np.arctan2(dy, dx) - heading + math.pi) % (2.0 * math.pi) - math.pi
+    b = np.floor((rel + half_fov) / (2.0 * half_fov) * n_bins).astype(np.int64)
+    ok = (b >= 0) & (b < n_bins) & (rho < r_max)
+    nr = int(r_max / r_cell) + 1
+    ir = np.minimum((rho / r_cell).astype(np.int64), nr - 1)
+
+    def nearest(mask, few):
+        """Range of the first point along each bearing that has company: at least `few` points
+        within 0.3 m behind it. A stray pixel does not make an obstacle, and the answer is the
+        range of the point itself, so the front edge of a low, flat thing like a kerb is not
+        pushed back by all the points on top of it."""
+        m = ok & mask
+        key = b[m] * nr + ir[m]
+        hist = np.bincount(key, minlength=n_bins * nr).reshape(n_bins, nr)
+        near = np.full(n_bins * nr, np.inf)
+        np.minimum.at(near, key, rho[m])
+        pad = np.pad(hist, ((0, 0), (0, 2)))
+        good = (hist > 0) & (pad[:, :-2] + pad[:, 1:-1] + pad[:, 2:] >= few)
+        first = good.argmax(axis=1)
+        return np.where(good.any(axis=1), near.reshape(n_bins, nr)[np.arange(n_bins), first], np.nan)
+
+    few = 3 if P.shape[0] * P.shape[1] > 20000 else 1    # an image has pixels to spare, a scanner has not
+    r_hit = nearest(obstacle, few)
+    r_stop = nearest(blocking, few)
+    m = ok & ground
+    far = np.zeros(n_bins)
+    np.maximum.at(far, b[m], rho[m])
+    m[m] = ~(rho[m] > r_stop[b[m]])                    # (ground in front of the first thing that is not)
+    before = np.zeros(n_bins)
+    np.maximum.at(before, b[m], rho[m])
+    ang = heading - half_fov + (np.arange(n_bins) + 0.5) * (2.0 * half_fov / n_bins)
+    return ang, r_hit, np.maximum(np.fmin(far, r_stop - 0.15), 0.0), r_stop, before
+
+
+def paint_segments(pts, origin, cell=0.05, r_max=14.0, max_lines=20, min_len=0.35):
+    """Straight stripes among the ground points classified as paint. A Hough vote finds a line,
+    a total least squares fit over its cells refines it, gaps split it into segments.
+    Returns a list of (x1, y1, x2, y2, distance from the sensor)."""
+    if len(pts) < 20:
+        return []
+    ij = np.floor((pts - origin) / cell).astype(np.int64)
+    off = int(r_max / cell) + 2
+    ij = ij[(np.abs(ij) < off).all(axis=1)]
+    key, cnt = np.unique((ij[:, 0] + off) * (2 * off + 1) + (ij[:, 1] + off), return_counts=True)
+    key = key[cnt >= 2]                                   # single pixels are speckle
+    if len(key) < 12:
+        return []
+    c = (np.stack([key // (2 * off + 1) - off, key % (2 * off + 1) - off], axis=1) + 0.5) * cell
+    th = np.radians(np.arange(0.0, 180.0, 1.0))
+    ct, st = np.cos(th), np.sin(th)
+    span = 1.5 * r_max
+    nr = int(2.0 * span / cell) + 1
+
+    def votes(q):
+        r = q[:, :1] * ct[None, :] + q[:, 1:] * st[None, :]
+        return (np.arange(len(th))[None, :] * nr + np.round((r + span) / cell).astype(np.int64)).ravel()
+
+    acc = np.bincount(votes(c), minlength=len(th) * nr)
+    alive = np.ones(len(c), dtype=bool)
+    out = []
+    for _ in range(max_lines):
+        k = int(acc.argmax())
+        if acc[k] < 5:
+            break
+        it, ir = divmod(k, nr)
+        near = alive & (np.abs(c @ np.array([ct[it], st[it]]) - (ir * cell - span)) < 0.12)
+        if near.sum() < 6:
+            acc[k] = 0
+            continue
+        m = c[near].mean(axis=0)
+        cov = (c[near] - m).T @ (c[near] - m)
+        ang = 0.5 * math.atan2(2.0 * cov[0, 1], cov[0, 0] - cov[1, 1])
+        d = np.array([math.cos(ang), math.sin(ang)])
+        off_n = (c - m) @ np.array([-d[1], d[0]])
+        inl = alive & (np.abs(off_n) < 0.10)
+        s = np.sort((c[inl] - m) @ d)
+        cut = np.flatnonzero(np.diff(s) > 0.45)
+        for a, b in zip(np.concatenate(([0], cut + 1)), np.concatenate((cut, [len(s) - 1]))):
+            if s[b] - s[a] >= min_len and (b - a + 1) >= 0.35 * (s[b] - s[a]) / cell:
+                p1, p2 = origin + m + s[a] * d, origin + m + s[b] * d
+                out.append((p1[0], p1[1], p2[0], p2[1], float(np.hypot(*(m + 0.5 * (s[a] + s[b]) * d)))))
+        acc -= np.bincount(votes(c[inl]), minlength=len(acc))
+        alive &= ~inl
+    return out
+
+
+class SensorRig:
+    """The car's sensors, simulated with Chrono::Sensor, and what is computed from their data.
+
+    camera        a stereo camera at the front edge of the roof and one at its rear edge. Each gives
+                  a colour image and a depth image with an error that grows with the square of the
+                  range, as stereo depth does. Painted lines come from the colour image, obstacles
+                  and free ground from the depth image.
+    camera+lidar  the same, plus a 16 channel lidar on a mast above the roof (obstacles all round)
+    camera+radar  the same, plus a radar on each side of the car, covering the sectors that the
+                  cameras cannot see
+    """
+    MODES = ("camera", "camera+lidar", "camera+radar")
+
+    CAM_W, CAM_H, CAM_HFOV = 960, 540, math.radians(120.0)     # depth is rendered at half that size
+    CAM_PITCH = math.radians(10.0)
+    CAM_RANGE = 12.0           # obstacles and free ground are taken from the depth image up to here at most
+    PAINT_RANGE = 11.0
+    DEPTH_ERR = 0.003          # stereo depth error at 1 m [m]; it grows with the square of the range
+    RANGE_TOL, HEIGHT_TOL = 0.15, 0.04     # errors beyond which the depth image does not settle what a cell is
+    LIDAR_W, LIDAR_H = 720, 16
+    LIDAR_EL = (math.radians(-25.0), math.radians(5.0))
+    LIDAR_RANGE = 20.0
+    RADAR_W, RADAR_H = 96, 6
+    RADAR_HFOV, RADAR_VFOV = math.radians(130.0), math.radians(9.0)
+    RADAR_RANGE = 20.0
+    Z_GROUND, Z_OBSTACLE, Z_TOP = 0.05, 0.08, 2.3     # a kerb is 0.15 m high
+    Z_LIDAR = 0.30             # lidar returns below this are not placed in the map as obstacles
+
+    def __init__(self, world, mode, noise, rng):
+        self.mode, self.noise, self.rng = mode, noise, rng
+        self.name = "Chrono::Sensor " + mode.replace("+", " + ")
+        self.body = world.car.GetChassisBody()
+        self.system = world.system
+        # the car's outline in the chassis frame: its own body shows up in every sensor
+        mid = -EGO.ref_to_rear
+        self.own = (mid - EGO.rear, mid + EGO.front, EGO.half_width)
+        x_rear, x_front, top = EGO.roof
+
+        self.manager = sens.ChSensorManager(self.system)
+        self.manager.scene.SetAmbientLight(chrono.ChVector3f(0.5, 0.5, 0.5))
+        self.manager.scene.AddPointLight(chrono.ChVector3f(30.0, -40.0, 120.0), chrono.ChColor(0.45, 0.45, 0.45), 2000.0)
+        sky = sens.Background()
+        sky.mode = sens.BackgroundMode_SOLID_COLOR
+        sky.color_zenith = chrono.ChVector3f(0.55, 0.65, 0.85)
+        self.manager.scene.SetBackground(sky)
+
+        rate = 1.05 / PERCEPTION_DT        # a little faster than it is read, so every read is fresh
+        self.cameras, self.radars, self.lidar = [], [], None
+        self.rays = pinhole_rays(self.CAM_W, self.CAM_H, self.CAM_HFOV)
+        self.rays_depth = pinhole_rays(self.CAM_W // 2, self.CAM_H // 2, self.CAM_HFOV)
+        focal = 0.5 * self.CAM_W / math.tan(0.5 * self.CAM_HFOV)
+        self.ground_rows = min(self.CAM_H, int(0.5 * self.CAM_H + focal * math.tan(self.CAM_PITCH + 0.05)))
+        for label, x, yaw in (("front", x_front + 0.10, 0.0), ("rear", x_rear - 0.10, math.pi)):
+            R = _rot_z(yaw) @ _rot_y(self.CAM_PITCH)
+            pos = np.array([x, 0.0, top + 0.05])
+            frame = chrono.ChFramed(chrono.ChVector3d(*pos), chrono.QuatFromAngleZ(yaw) * chrono.QuatFromAngleY(self.CAM_PITCH))
+            colour = sens.ChCameraSensor(self.body, rate, frame, self.CAM_W, self.CAM_H, self.CAM_HFOV)
+            colour.PushFilter(sens.ChFilterRGBA8Access())
+            depth = sens.ChDepthCamera(self.body, rate, frame, self.CAM_W // 2, self.CAM_H // 2, self.CAM_HFOV, 30.0)
+            for s in (colour, depth):
+                self._add(s, label + " camera")
+            self.cameras.append(dict(label=label, colour=colour, depth=depth, pos=pos, R=R, stamp=-1.0))
+        if mode == "camera+lidar":
+            pos = np.array([0.5 * (x_rear + x_front), 0.0, top + 0.35])
+            self.lidar = dict(pos=pos, stamp=-1.0, rays=angular_rays(self.LIDAR_W, self.LIDAR_H, 2.0 * math.pi,
+                                                                     *self.LIDAR_EL, inclusive=True))
+            self.lidar["sensor"] = sens.ChLidarSensor(
+                self.body, rate, chrono.ChFramed(chrono.ChVector3d(*pos), chrono.QUNIT), self.LIDAR_W, self.LIDAR_H,
+                2.0 * math.pi, self.LIDAR_EL[1], self.LIDAR_EL[0], 1.5 * self.LIDAR_RANGE)
+            self.lidar["sensor"].PushFilter(sens.ChFilterDIAccess())
+            self._add(self.lidar["sensor"], "lidar")
+        if mode == "camera+radar":
+            rays = angular_rays(self.RADAR_W, self.RADAR_H, self.RADAR_HFOV, -0.5 * self.RADAR_VFOV,
+                                0.5 * self.RADAR_VFOV, inclusive=False)
+            x0, x1, hw = self.own
+            for y, yaw in ((hw + 0.02, 0.5 * math.pi), (-hw - 0.02, -0.5 * math.pi)):
+                pos = np.array([0.5 * (x0 + x1), y, 0.45])
+                radar = sens.ChRadarSensor(self.body, rate, chrono.ChFramed(chrono.ChVector3d(*pos), chrono.QuatFromAngleZ(yaw)),
+                                           self.RADAR_W, self.RADAR_H, self.RADAR_HFOV, self.RADAR_VFOV,
+                                           1.5 * self.RADAR_RANGE)
+                radar.PushFilter(sens.ChFilterRadarAccess())
+                self._add(radar, "radar")
+                self.radars.append(dict(sensor=radar, pos=pos, R=_rot_z(yaw), rays=rays, stamp=-1.0))
+        self.frames = collections.OrderedDict()      # chassis frame at the time of each render
+        self.paint = np.zeros((0, 2))                 # for the viewer: where paint was seen this tick
+        self.fans = []                                # for the viewer: (origin, heading, half fov, range) per sensor
+
+    def _add(self, sensor, name):
+        sensor.SetName(name)
+        sensor.SetLag(0.0)
+        sensor.SetCollectionWindow(0.0)
+        self.manager.AddSensor(sensor)
+
+    def _frame(self):
+        f = self.body.GetFrameRefToAbs()
+        p, R = f.GetPos(), f.GetRotMat()
+        ax, ay, az = R.GetAxisX(), R.GetAxisY(), R.GetAxisZ()
+        return np.array([p.x, p.y, p.z]), np.array([[ax.x, ay.x, az.x], [ax.y, ay.y, az.y], [ax.z, ay.z, az.z]])
+
+    def sense(self, pose):
+        """Render the sensors for the current state of the simulation and process what they give.
+        Returns (scans, line detections)."""
+        t = round(self.system.GetChTime(), 4)
+        self.frames[t] = self._frame()
+        while len(self.frames) > 8:
+            self.frames.popitem(last=False)
+        self.manager.Update()
+        scans, dets, paint, self.fans = [], [], [], []
+        for cam in self.cameras:
+            colour, depth = cam["colour"].GetMostRecentRGBA8Buffer(), cam["depth"].GetMostRecentDepthBuffer()
+            if not (colour.HasData() and depth.HasData()):
+                continue
+            stamp = round(depth.TimeStamp, 4)
+            if stamp == cam["stamp"] or stamp not in self.frames or round(colour.TimeStamp, 4) != stamp:
+                continue                               # nothing new, or the two images are not a pair
+            cam["stamp"] = stamp
+            scan, xy, segs = self._camera(cam, colour.GetRGBA8Data(), depth.GetDepthData()[..., 0], *self.frames[stamp])
+            scans.append(scan)
+            dets += segs
+            paint.append(xy)
+        if self.lidar is not None:
+            buf = self.lidar["sensor"].GetMostRecentDIBuffer()
+            stamp = round(buf.TimeStamp, 4) if buf.HasData() else -1.0
+            if stamp != self.lidar["stamp"] and stamp in self.frames:
+                self.lidar["stamp"] = stamp
+                scans.append(self._scanner(self.lidar, buf.GetDIData()[..., 0], *self.frames[stamp], self.LIDAR_RANGE,
+                                           0.02, 0.01, self.LIDAR_W, math.pi, False, self.Z_LIDAR))
+        for radar in self.radars:
+            buf = radar["sensor"].GetMostRecentRadarBuffer()
+            # (older bindings do not show the time stamp of a radar buffer; it is the current time)
+            stamp = round(getattr(buf, "TimeStamp", t), 4) if buf.HasData() else -1.0
+            if stamp != radar["stamp"] and stamp in self.frames:
+                radar["stamp"] = stamp
+                scans.append(self._scanner(radar, buf.GetRadarData()[..., 0], *self.frames[stamp], self.RADAR_RANGE,
+                                           0.08, 0.15, self.RADAR_W, 0.5 * self.RADAR_HFOV, True))
+        self.paint = np.concatenate(paint) if paint else np.zeros((0, 2))
+        return scans, dets
+
+    def _is_own(self, P, ref_p, ref_R, grow):
+        loc = (P - ref_p.astype(np.float32)) @ ref_R.astype(np.float32)
+        x0, x1, hw = self.own
+        return (loc[..., 0] > x0 - grow) & (loc[..., 0] < x1 + grow) & (np.abs(loc[..., 1]) < hw + grow)
+
+    def _camera(self, cam, rgb, depth, ref_p, ref_R):
+        """One stereo camera: obstacles and free ground from the depth image, painted lines from
+        the colour image. rgb is (h, w, 4) uint8, depth (h/2, w/2) is the range along each pixel's
+        ray; the chassis frame is the one at the time the images were rendered."""
+        k = self.noise
+        p, R = ref_p + ref_R @ cam["pos"], (ref_R @ cam["R"]).astype(np.float32)
+        if k > 0.0:
+            depth = depth * (1.0 + self.rng.normal(0.0, 0.004 * k)) + \
+                smooth_noise(self.rng, depth.shape) * (self.DEPTH_ERR * k) * depth * depth
+        sig = self.DEPTH_ERR * max(k, 0.3)                # the accuracy the processing assumes
+        # The map takes obstacles and free ground only from as far as the depth is good enough:
+        # an obstacle must be placed to RANGE_TOL, and ground must be told from a kerb, which
+        # needs the height of a point to HEIGHT_TOL. Ground seen further out, up to where even the
+        # top of a kerb would pass for ground, is reported as probably free.
+        reach = min(self.CAM_RANGE, math.sqrt(self.RANGE_TOL / sig), self.HEIGHT_TOL / (sig * p[2]))
+        reach_far = min(self.CAM_RANGE, 1.65 * self.HEIGHT_TOL / (sig * p[2]))
+        dw = self.rays_depth @ R.T
+        P = p.astype(np.float32) + depth[..., None] * dw
+        z = P[..., 2]
+        zs = sig * depth * depth * np.abs(dw[..., 2])     # height error that the depth error causes
+        own = self._is_own(P, ref_p, ref_R, 0.15)
+        seen = (depth > 0.3) & (depth < 28.0) & (z < self.Z_TOP) & ~own
+        ground = seen & (np.abs(z) < self.Z_GROUND + 1.25 * zs)
+        obstacle = seen & (z > self.Z_OBSTACLE + 2.5 * zs)
+        head = math.atan2(R[1, 0], R[0, 0])
+        n_bins = int(round(math.degrees(self.CAM_HFOV) / 0.5))
+        ang, r_hit, r_free, r_stop, _ = planar_scan(P, p, obstacle, ground, seen & ~ground, n_bins,
+                                                    0.5 * self.CAM_HFOV, head, reach)
+        r_far = r_free
+        if reach_far > reach + 0.5:
+            maybe = seen & (np.abs(z) < self.Z_GROUND + 1.5 * zs)
+            r_far = np.maximum(r_free, planar_scan(P, p, maybe & False, maybe, seen & ~maybe, n_bins,
+                                                   0.5 * self.CAM_HFOV, head, reach_far)[2])
+            r_far = np.where(np.isfinite(r_stop), r_free, r_far)      # not past something that stands up
+        self.fans.append((p[:2], head, 0.5 * self.CAM_HFOV, reach))
+
+        # paint: clearly brighter than the road surface, a narrow stripe, and on the ground plane.
+        # Only the rows below the horizon can show the ground (the buffer starts at the bottom row).
+        rows = self.ground_rows
+        bright = np.maximum(np.maximum(rgb[:rows, :, 0], rgb[:rows, :, 1]), rgb[:rows, :, 2])
+        lo = bright[::2, ::2]
+        road = float(np.median(lo[ground[:lo.shape[0]]])) if ground[:lo.shape[0]].sum() > 50 else 120.0
+        thr = max(1.3 * road, road + 35.0)
+        vv, uu = np.nonzero(bright > thr - 12.0 * k)
+        if k > 0.0:                                       # image noise decides the pixels near the threshold
+            keep = bright[vv, uu] + self.rng.normal(0.0, 3.0 * k, len(vv)) > thr
+            vv, uu = vv[keep], uu[keep]
+        dc = self.rays[vv, uu] @ R.T
+        t = -p[2] / np.minimum(dc[:, 2], -1e-6)           # range to the ground plane along the pixel ray
+        keep = (dc[:, 2] < -0.03) & (t < self.PAINT_RANGE)
+        vv, uu, dc, t = vv[keep], uu[keep], dc[keep], t[keep]
+        xy = p[:2] + t[:, None] * dc[:, :2]
+        # a stripe covers little of its surroundings; the top of a kerb or a pavement covers all of it
+        cell, n = 0.1, int(2 * self.PAINT_RANGE / 0.1) + 8
+        ij = np.floor((xy - p[:2]) / cell).astype(np.int64) + n // 2
+        occ = np.zeros((n, n), dtype=np.int32)
+        occ[ij[:, 1], ij[:, 0]] = 1
+        ii = np.pad(occ, ((4, 3), (4, 3))).cumsum(axis=0).cumsum(axis=1)
+        dens = (ii[7:, 7:] - ii[:-7, 7:] - ii[7:, :-7] + ii[:-7, :-7]) / 49.0
+        # (and the rim of such an area is not a stripe either: at a corner of it the count is low)
+        wide = GridMap.grow((occ > 0) & (dens >= 0.42), 3)
+        stripe = ~wide[ij[:, 1], ij[:, 0]]
+        # the depth image has to agree that the pixel is on the ground: a white car is not, nor is
+        # the top of a kerb
+        vd, ud = np.minimum(vv // 2, depth.shape[0] - 1), np.minimum(uu // 2, depth.shape[1] - 1)
+        keep = stripe & ground[vd, ud] & (np.abs(depth[vd, ud] - t) < 0.10 + 0.035 * t + 2.5 * sig * t * t)
+        keep[keep] = ~self._is_own(np.concatenate([xy[keep], np.zeros((keep.sum(), 1))], axis=1).astype(np.float32),
+                                   np.array([ref_p[0], ref_p[1], 0.0]), ref_R, 0.3)
+        # and nothing past the first thing that stands up from the ground on its bearing is a line
+        rel = (np.arctan2(xy[:, 1] - p[1], xy[:, 0] - p[0]) - head + math.pi) % (2.0 * math.pi) - math.pi
+        b = np.clip(np.floor((rel + 0.5 * self.CAM_HFOV) / self.CAM_HFOV * n_bins).astype(int), 0, n_bins - 1)
+        keep &= ~(np.hypot(xy[:, 0] - p[0], xy[:, 1] - p[1]) > r_stop[b] + 0.1)
+        xy = xy[keep]
+        # a small picture of what the camera is read as, for the viewer (top row first):
+        # 0 nothing, 1 ground, 2 obstacle, 3 the car itself, 4 unclear, 5 paint
+        view = np.where(own, 3, np.where(obstacle, 2, np.where(ground, 1, np.where(seen, 4, 0)))).astype(np.uint8)
+        view[vd[keep], ud[keep]] = 5
+        cam["view"] = view[::-3, ::3]
+        return (p[:2], ang, r_hit, r_free, r_far, r_stop), xy, paint_segments(xy, p[:2])
+
+    def _scanner(self, dev, r, ref_p, ref_R, r_max, sigma, dropout, n_bins, half_fov, radar, z_min=0.0):
+        """A lidar or a radar: a range per beam (0 where nothing came back).
+        z_min: returns from lower than this end the free part of a ray but are not obstacles. The
+        beams of a lidar are far apart on the ground, so a kerb is hit somewhere on its top, not at
+        its face, and placing those returns in the map blurs where the kerb is. The cameras see it."""
+        k = self.noise
+        p, R = ref_p + ref_R @ dev["pos"], (ref_R @ dev.get("R", np.eye(3))).astype(np.float32)
+        r = np.array(r, dtype=np.float32)
+        if k > 0.0:
+            r = r + self.rng.normal(0.0, sigma * k, r.shape).astype(np.float32) * (r > 0.0)
+            r[self.rng.random(r.shape) < dropout * k] = 0.0
+        P = p.astype(np.float32) + r[..., None] * (dev["rays"] @ R.T)
+        z = P[..., 2]
+        seen = (r > 0.3) & (r < r_max) & (z < self.Z_TOP) & ~self._is_own(P, ref_p, ref_R, 0.15)
+        ground = seen & (np.abs(z) < self.Z_GROUND + 1.5 * sigma * max(k, 0.3))
+        obstacle = seen & (z > max(z_min, self.Z_OBSTACLE + 2.5 * sigma * max(k, 0.3)))
+        head = math.atan2(R[1, 0], R[0, 0])
+        ang, r_hit, r_free, r_stop, before = planar_scan(P, p, obstacle, ground, seen & ~ground, n_bins,
+                                                         half_fov, head, r_max)
+        if z_min > 0.0:
+            # Where the first thing a ray meets is low, the beam that found it came in over its
+            # edge: the ground is free only as far as it was seen in front of it. Otherwise the
+            # lidar would keep clearing the face of a kerb that the cameras put in the map.
+            low = np.isfinite(r_stop) & ~(r_hit < r_stop + 0.3)
+            r_free = np.where(low, np.minimum(r_free, before), r_free)
+        if radar:
+            # a radar return says where something is and that the way to it is clear; no return
+            # says nothing, since the beam is narrow in height and passes over low things
+            r_free = np.where(np.isfinite(r_hit), np.maximum(r_hit - 0.3, 0.0), 0.0)
+        self.fans.append((p[:2], head, half_fov, r_max))
+        return p[:2], ang, r_hit, r_free
+
+
+# =============================================================================
+# Mapping: occupancy grid from the scans, line tracks from the line detections
 # =============================================================================
 
 class GridMap:
     RES = 0.1
+    RANGE = 20.0           # longest ray any sensor contributes
 
     def __init__(self, bounds):
         self.x0, self.y0 = bounds[0], bounds[1]
@@ -489,7 +935,12 @@ class GridMap:
         self.ny = int(math.ceil((bounds[3] - bounds[1]) / self.RES))
         self.hits = np.zeros((self.ny, self.nx), dtype=np.uint16)
         self.free = np.zeros((self.ny, self.nx), dtype=np.uint16)
-        self._t = np.arange(0.1, Perception.SCAN_RANGE, 0.2)
+        # A camera sees ground further than it can tell ground from a kerb. That far ground is kept
+        # apart: it lets the planner use the road ahead, but it is no evidence against an obstacle,
+        # and a closer look that finds something there (stop) overrules it.
+        self.far = np.zeros((self.ny, self.nx), dtype=np.uint16)
+        self.stop = np.zeros((self.ny, self.nx), dtype=np.uint16)
+        self._t = np.arange(0.1, self.RANGE, 0.2)
 
     def cells(self, x, y):
         ix = np.floor((np.asarray(x) - self.x0) / self.RES).astype(int)
@@ -497,19 +948,39 @@ class GridMap:
         ok = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
         return ix, iy, ok
 
-    def update(self, origin, ang, r):
-        seen = np.isfinite(r)
-        hx, hy = origin[0] + r[seen] * np.cos(ang[seen]), origin[1] + r[seen] * np.sin(ang[seen])
-        ix, iy, ok = self.cells(hx, hy)
-        np.add.at(self.hits, (iy[ok], ix[ok]), 1)
-        reach = np.where(np.isnan(r), 0.0, np.minimum(r, Perception.SCAN_RANGE) - 0.1)
-        m = self._t[None, :] < reach[:, None]
-        fx = (origin[0] + self._t[None, :] * np.cos(ang)[:, None])[m]
-        fy = (origin[1] + self._t[None, :] * np.sin(ang)[:, None])[m]
-        ix, iy, ok = self.cells(fx, fy)
-        once = np.zeros_like(self.free, dtype=bool)
-        once[iy[ok], ix[ok]] = True
-        self.free += once
+    def update(self, origin, ang, r_hit, r_free, r_far=None, r_stop=None):
+        """One planar scan: an obstacle at range r_hit along each bearing (NaN: none), and free
+        space along the bearing up to r_free. Optionally, ground that looks free but is too far
+        to be sure, from r_free to r_far, and the range r_stop at which something that is not
+        ground was seen. A scan counts once per cell, however many of its rays cross the cell."""
+        def mark(counter, m, r=None):
+            if r is None:           # all cells along the rays selected by m
+                x = (origin[0] + self._t[None, :] * np.cos(ang)[:, None])[m]
+                y = (origin[1] + self._t[None, :] * np.sin(ang)[:, None])[m]
+            else:                   # the cell at range r of each ray selected by m
+                x, y = origin[0] + r[m] * np.cos(ang[m]), origin[1] + r[m] * np.sin(ang[m])
+            ix, iy, ok = self.cells(x, y)
+            once = np.zeros_like(self.free, dtype=bool)
+            once[iy[ok], ix[ok]] = True
+            counter += once
+
+        mark(self.hits, np.isfinite(r_hit), r_hit)
+        mark(self.free, self._t[None, :] < r_free[:, None])
+        if r_far is not None:
+            mark(self.far, (self._t[None, :] >= r_free[:, None]) & (self._t[None, :] < r_far[:, None]))
+        if r_stop is not None:
+            mark(self.stop, np.isfinite(r_stop), r_stop)
+
+    def mark_free(self, pose):
+        """The ground the car stands on is free, whether a sensor looks at it or not."""
+        x, y, th = pose
+        win = self.window(x - EGO.length, y - EGO.length, x + EGO.length, y + EGO.length)
+        if win is None:
+            return
+        X, Y, sl = win
+        c, s = math.cos(th), math.sin(th)
+        lon, lat = (X - x) * c + (Y - y) * s, -(X - x) * s + (Y - y) * c
+        self.free[sl] += (lon > -EGO.rear) & (lon < EGO.front) & (np.abs(lat) < EGO.half_width)
 
     def occupied(self):
         # a real surface stops the rays; a cell they mostly pass through only caught range noise
@@ -518,12 +989,24 @@ class GridMap:
     def blocked(self):
         """Planning map: cells with an obstacle in them, or that were never seen to be free
         (the far side of a parked car is unknown, not empty)."""
-        seen = np.pad(self.free >= 1, 2)
-        known = np.zeros((self.ny, self.nx), dtype=bool)
-        for dy in range(5):                 # grow by 2 cells to close the gaps between rays
-            for dx in range(5):
-                known |= seen[dy:dy + self.ny, dx:dx + self.nx]
+        known = self.grow(self.free >= 1, 2)       # 2 cells, to close the gaps between rays
+        if self.far.any():
+            # Far ground is located to a few tens of centimetres at best: use it only 0.4 m in
+            # from where it ends, so that a plan keeps that distance from what is still unknown.
+            maybe = self.grow((self.far >= 3) & (self.stop == 0), 2) & (self.stop == 0)
+            known |= ~self.grow(~(known | maybe), 6)
         return self.occupied() | ~known
+
+    @staticmethod
+    def grow(mask, r):
+        """The mask with every cell within r cells of it added (a square neighbourhood)."""
+        for axis in (0, 1):
+            pad = np.pad(mask, [(r, r) if a == axis else (0, 0) for a in (0, 1)])
+            n = mask.shape[axis]
+            mask = np.zeros_like(mask)
+            for k in range(2 * r + 1):
+                mask |= pad[k:k + n] if axis == 0 else pad[:, k:k + n]
+        return mask
 
     def occupied_points(self):
         iy, ix = np.nonzero(self.occupied())
@@ -542,16 +1025,25 @@ class GridMap:
 
 
 class LineTrack:
-    """One painted line, estimated from every detection associated with it."""
-    MAX_DETS = 160
+    """One painted line, estimated from every detection associated with it.
 
-    def __init__(self, det, t):
+    With `keep`, the track remembers along which stretch paint has been seen, also after the
+    detections that showed it have been forgotten. A sensor with a limited view needs that: close
+    to a stall the camera sees only the far part of its lines, and the part at the mouth, which it
+    saw from further away, must not fade."""
+    MAX_DETS = 160
+    BIN = 0.1
+
+    def __init__(self, det, t, keep=False):
         self.dets = [det]
         self.born = t
         self.c = np.zeros(2)
         self.d = np.array([1.0, 0.0])
         self.lo = self.hi = 0.0
-        self.fit()
+        self.keep = keep
+        self.anchor = 0.5 * (np.array(det[0:2]) + np.array(det[2:4]))
+        self.seen = {}               # bin along the line (from the anchor) -> accumulated weight
+        self.fit((det,))
 
     @property
     def hits(self):
@@ -568,10 +1060,18 @@ class LineTrack:
         self.dets.append(det)
         if len(self.dets) > self.MAX_DETS:           # forget the least informative detection
             self.dets.pop(int(np.argmax([d[4] for d in self.dets])))
-        self.fit()
+        self.fit((det,))
 
-    def fit(self):
-        """Weighted total least squares line + extent from the coverage of the detections."""
+    def cover(self, det, d):
+        """Record the stretch of the line that a detection shows."""
+        a, b = sorted(((np.array(det[0:2]) - self.anchor) @ d, (np.array(det[2:4]) - self.anchor) @ d))
+        w = 1.0 / (0.05 + 0.02 * det[4]) ** 2
+        for k in range(int(math.floor(a / self.BIN)), int(math.floor(b / self.BIN)) + 1):
+            self.seen[k] = self.seen.get(k, 0.0) + w
+
+    def fit(self, fresh=()):
+        """Weighted total least squares line + extent from the coverage of the detections.
+        fresh: the detections that are new since the last fit."""
         D = np.asarray(self.dets)
         w = 1.0 / (0.05 + 0.02 * D[:, 4]) ** 2
         P = np.concatenate([D[:, 0:2], D[:, 2:4]])
@@ -603,17 +1103,34 @@ class LineTrack:
                     cw = np.cumsum(w[near][order])
                     med = vals[near][order][np.searchsorted(cw, 0.5 * cw[-1])]
                     lo, hi = (med, hi) if is_lo else (lo, med)
+        if self.keep:
+            for det in fresh:
+                self.cover(det, d)
+            ks = np.array(sorted(self.seen))
+            ws = np.array([self.seen[k] for k in ks])
+            ks = ks[ws >= min(0.25 * ws.max(), 150.0)]
+            off = (self.anchor - c) @ d
+            k_lo, k_hi = off + ks[0] * self.BIN, off + (ks[-1] + 1) * self.BIN
+            # the remembered stretch is known to the size of a bin: where the current detections
+            # put an end close to it, theirs is the better value
+            lo = lo if 0.0 <= lo - k_lo < 0.3 else min(lo, k_lo)
+            hi = hi if 0.0 <= k_hi - hi < 0.3 else max(hi, k_hi)
         self.c, self.d, self.lo, self.hi = c, d, lo, hi
 
 
 class LineMap:
     MIN_HITS = 5
 
-    def __init__(self):
+    def __init__(self, keep=False):
         self.tracks = []
+        self.keep = keep             # see LineTrack
 
     def confirmed(self):
         return [t for t in self.tracks if t.hits >= self.MIN_HITS and t.length > 1.2]
+
+    def markers(self):
+        """Confirmed lines plus the short stubs that are all a camera sees of a line between two cars."""
+        return [t for t in self.tracks if t.hits >= self.MIN_HITS and t.length > 0.35]
 
     def update(self, dets, t):
         for det in dets:
@@ -625,8 +1142,8 @@ class LineMap:
             e /= ln
             best, best_d = None, 1e9
             for trk in self.tracks:
-                if abs(e[0] * trk.d[1] - e[1] * trk.d[0]) > 0.21:
-                    continue
+                if min(ln, trk.length) > 1.0 and abs(e[0] * trk.d[1] - e[1] * trk.d[0]) > 0.21:
+                    continue                    # (a short piece has no direction worth comparing)
                 q1, q2 = p1 - trk.c, p2 - trk.c
                 perp = max(abs(q1[0] * trk.d[1] - q1[1] * trk.d[0]), abs(q2[0] * trk.d[1] - q2[1] * trk.d[0]))
                 if perp > 0.35 + 0.03 * det[4]:
@@ -637,7 +1154,7 @@ class LineMap:
                 if perp < best_d:
                     best, best_d = trk, perp
             if best is None:
-                self.tracks.append(LineTrack(det, t))
+                self.tracks.append(LineTrack(det, t, self.keep))
             else:
                 best.add(det)
         self.tracks = [k for k in self.tracks if k.hits >= 3 or t - k.born < 2.5]
@@ -657,6 +1174,9 @@ class LineMap:
                     if max(a.lo - s2, s1 - a.hi) < 0.4:
                         a.dets += b.dets
                         a.born = min(a.born, b.born)
+                        for k, w in b.seen.items():          # what b remembers, in a's bins
+                            ka = int(math.floor(((b.anchor + (k + 0.5) * b.BIN * b.d - a.anchor) @ a.d) / a.BIN))
+                            a.seen[ka] = a.seen.get(ka, 0.0) + w
                         a.fit()
                         del self.tracks[j]
                         continue
@@ -695,33 +1215,53 @@ class Slot:
                 self.center[1] - EGO.center * math.sin(th), wrap(th))
 
 
-def find_slots(tracks, trail, grid):
-    """Pair up confirmed line tracks into stalls and classify them with the occupancy grid.
-    trail: recent ego positions (N,2), used to tell the open end of a stall from its back."""
+def find_slots(tracks, trail, grid, stubs=False):
+    """Pair up line tracks into stalls and classify them with the occupancy grid.
+    trail: recent ego positions (N,2), used to tell the open end of a stall from its back.
+    stubs: also accept a stall of which the lines are only partly seen. Looking along the lane, a
+    camera sees the far line of an empty stall through the stall, but of the near line only the
+    end that sticks out between the cars; such a stall is one line of some length and a stub."""
     slots = []
     n = len(tracks)
     trail = np.asarray(trail)
     for i in range(n):
         for j in range(i + 1, n):
             a, b = tracks[i], tracks[j]
+            partial = stubs and min(a.length, b.length) < 3.5 and max(a.length, b.length) >= 2.0
             db = b.d if a.d @ b.d >= 0.0 else -b.d
-            if abs(a.d[0] * db[1] - a.d[1] * db[0]) > 0.14:
+            if partial and min(a.length, b.length) < 1.2:
+                d = a.d if a.length > b.length else db       # a stub has no direction of its own
+            elif abs(a.d[0] * db[1] - a.d[1] * db[0]) > 0.14:
                 continue
-            d = a.d * a.length + db * b.length
-            d = d / np.hypot(*d)
+            else:
+                d = a.d * a.length + db * b.length
+                d = d / np.hypot(*d)
             nv = np.array([-d[1], d[0]])
             sep = (b.c - a.c) @ nv
             sa = np.sort(np.array(a.ends()) @ d)
             sb = np.sort(np.array(b.ends()) @ d)
             overlap = min(sa[1], sb[1]) - max(sa[0], sb[0])
-            if 2.2 <= abs(sep) <= 3.5 and min(a.length, b.length) >= 3.5 and overlap >= 3.0:
+            if partial and 2.2 <= abs(sep) <= 3.5:
+                # the shorter piece marks the mouth of the stall: one of its ends lies near the
+                # matching end of the longer one (further off the more the stalls are angled)
+                lng, sht = (sa, sb) if a.length > b.length else (sb, sa)
+                reach = 1.2 * abs(sep) + 0.5
+                if lng[0] - reach < sht[0] < lng[0] + 1.5:
+                    sht = np.array([sht[0], sht[0] + lng[1] - lng[0]])      # as deep as the longer one
+                elif lng[1] - 1.5 < sht[1] < lng[1] + reach:
+                    sht = np.array([sht[1] - lng[1] + lng[0], sht[1]])
+                else:
+                    continue
+                sa, sb = (lng, sht) if a.length > b.length else (sht, lng)
+                parallel = False
+            elif 2.2 <= abs(sep) <= 3.5 and min(a.length, b.length) >= 3.5 and overlap >= 3.0:
                 parallel = False
             elif (5.0 <= abs(sep) <= 7.8 and 1.5 <= a.length <= 3.6 and 1.5 <= b.length <= 3.6
                   and overlap >= 1.2):
                 # the two ticks must be neighbours: no third tick in between
                 na, nb = sorted((a.c @ nv, b.c @ nv))
                 if any(abs(k.d @ nv) < 0.2 and na + 1.0 < k.c @ nv < nb - 1.0 and
-                       sa[0] - 2.0 < k.c @ d < sa[1] + 2.0 and k.length < 3.6
+                       sa[0] - 2.0 < k.c @ d < sa[1] + 2.0 and 1.2 <= k.length < 3.6
                        for k in tracks if k is not a and k is not b):
                     continue
                 parallel = True
@@ -742,6 +1282,10 @@ def find_slots(tracks, trail, grid):
             nu = np.array([-u_in[1], u_in[0]])
             la, lb = a.c @ nu, b.c @ nu
             s0, s1 = max(in_a, in_b), min(bk_a, bk_b)
+            if partial and not parallel and s1 < s0 + EGO.length + 0.7:
+                # the far end of the lines is out of sight: take the stall to be deep enough for the car
+                s1 = s0 + EGO.length + 0.7
+                bk_a, bk_b = max(bk_a, s1), max(bk_b, s1)
             corners = np.array([u_in * in_a + nu * la, u_in * in_b + nu * lb,
                                 u_in * bk_b + nu * lb, u_in * bk_a + nu * la])
             if parallel:
@@ -754,7 +1298,7 @@ def find_slots(tracks, trail, grid):
                 slot = Slot("perpendicular" if skew < 0.2 else "angled",
                             u_in * s_c + nu * 0.5 * (la + lb), u_in, nu, abs(sep), s1 - s0, corners)
             slot.hits = min(a.hits, b.hits)
-            _classify(slot, grid, s0, s1, min(la, lb), max(la, lb))
+            _classify(slot, grid, s0, s1, min(la, lb), max(la, lb), deep=stubs and not parallel)
             if parallel:
                 _align_with_kerb(slot, grid, s1, min(la, lb), max(la, lb))
             slots.append(slot)
@@ -775,11 +1319,18 @@ def _align_with_kerb(slot, grid, s1, l0, l1):
     if m.sum() < 25 or np.ptp(Lc[m]) < 3.5:
         return
     mid = 0.5 * (l0 + l1)
-    b, a = np.polyfit(Lc[m] - mid, S[m], 1)
-    keep = np.abs(S[m] - (a + b * (Lc[m] - mid))) < 0.15
-    if keep.sum() < 20:
+    # the face of the kerb is the lane-side edge of what was hit: a sensor that looks down on the
+    # kerb also returns points from its top. Per 0.2 m along the kerb, keep the nearest cells.
+    col = np.floor((Lc[m] - l0) / 0.2).astype(int)
+    first = np.full(col.max() + 1, np.inf)
+    np.minimum.at(first, col, S[m])
+    edge = S[m] < first[col] + 0.12
+    Le, Se = Lc[m][edge], S[m][edge]
+    b, a = np.polyfit(Le - mid, Se, 1)
+    keep = np.abs(Se - (a + b * (Le - mid))) < 0.15
+    if keep.sum() < 15:
         return
-    b, a = np.polyfit(Lc[m][keep] - mid, S[m][keep], 1)
+    b, a = np.polyfit(Le[keep] - mid, Se[keep], 1)
     along = (nu + b * u) / math.hypot(1.0, b)
     u_k = np.array([along[1], -along[0]])
     if u_k @ u < 0.0:
@@ -789,8 +1340,9 @@ def _align_with_kerb(slot, grid, s1, l0, l1):
     slot.u_in, slot.along = u_k, along
 
 
-def _classify(slot, grid, s0, s1, l0, l1):
-    """Free / occupied / unknown from the grid cells inside the stall, plus neighbours."""
+def _classify(slot, grid, s0, s1, l0, l1, deep=False):
+    """Free / occupied / unknown from the grid cells inside the stall, plus neighbours.
+    deep: the far end of the stall may be out of sight (a sensor rig that looks along the lane)."""
     c = slot.corners
     win = grid.window(c[:, 0].min() - 3.0, c[:, 1].min() - 3.0, c[:, 0].max() + 3.0, c[:, 1].max() + 3.0)
     if win is None:
@@ -800,22 +1352,35 @@ def _classify(slot, grid, s0, s1, l0, l1):
     S = X * u[0] + Y * u[1]
     Lc = X * nu[0] + Y * nu[1]
     occ = grid.occupied()[sl]
-    free = (grid.free[sl] >= 2) & ~occ
+    # (ground seen from too far to rule out a kerb also counts here: a parked car stands tall
+    # enough to be recognised at that range, and it is a parked car this test is about)
+    free = ((grid.free[sl] >= 2) | ((grid.far[sl] >= 3) & (grid.stop[sl] == 0))) & ~occ
     lat = 0.35 if slot.kind != "parallel" else 0.6
     back = 0.45
     inside = (S > s0 + 0.1) & (S < s1 - back) & (Lc > l0 + lat) & (Lc < l1 - lat)
     cells = max(int(inside.sum()), 1)
     n_occ = int((occ & inside).sum())
     frac_free = (free & inside).sum() / cells
+    # Seen from along the lane, the far end of a stall between two cars lies in the shadow of the
+    # nearer car. A parked car would show at the mouth of the stall, so a stall whose mouth is seen
+    # to be empty counts as free; what is deeper in comes into view while backing in.
+    mouth = inside & (S < s0 + 2.5)
+    frac_mouth = (free & mouth).sum() / max(int(mouth.sum()), 1)
     if n_occ >= 4:
         slot.status = Slot.OCCUPIED
-    elif n_occ <= 1 and frac_free >= 0.6:
+    elif n_occ <= 1 and (frac_free >= 0.6 or (frac_mouth >= 0.8 and frac_free >= 0.3)):
         slot.status = Slot.FREE
     side = (S > s0 - 0.3) & (S < s1 - back)
     reach = 2.4 if slot.kind != "parallel" else 3.0
     slot.neighbors = [bool((occ & side & (Lc < l0 - 0.05) & (Lc > l0 - reach)).sum() >= 4),
                       bool((occ & side & (Lc > l1 + 0.05) & (Lc < l1 + reach)).sum() >= 4)]
-    slot.region = (S > s0 - 1.0) & (S < s1 - 0.2) & (Lc > l0 + 0.1) & (Lc < l1 - 0.1), sl
+    # The cells the planner may take to be free once this stall is chosen. If the far end is out
+    # of sight, that has to reach as far as the parked car does, plus the planner's margin: a
+    # stall is a place that holds a car. What is really there shows up on the way in.
+    end = s1 - 0.2
+    if deep:
+        end = max(end, slot.center @ u + 0.5 * EGO.length + 0.35)
+    slot.region = (S > s0 - 1.0) & (S < end) & (Lc > l0 + 0.1) & (Lc < l1 - 0.1), sl
 
 
 # =============================================================================
@@ -1808,6 +2373,7 @@ class World:
 
     def _parked_cars(self, visual):
         data = chrono.GetChronoDataPath() + "vehicle/"
+        meshes = {}                # each mesh file is loaded once and shared by the cars that use it
         for car in self.scn.cars:
             m = parked_model(car["model"])
             half = 0.5 * (m["x1"] - m["x0"])
@@ -1817,8 +2383,11 @@ class World:
             body.SetFixed(True)
             body.SetPos(chrono.ChVector3d(car["cx"] - mid * c, car["cy"] - mid * s, m["z"]))
             body.SetRot(chrono.QuatFromAngleZ(car["yaw"]))
-            shape = chrono.ChCollisionShapeBox(self.contact_mat, 2.0 * half, 2.0 * m["hw"], 1.2)
-            body.AddCollisionShape(shape, chrono.ChFramed(chrono.ChVector3d(mid, 0.0, 0.5), chrono.QUNIT))
+            hull = chrono.vector_ChVector3d()        # the body outline, from 0.1 m below to 1.1 m above the mesh origin
+            for z in (-0.1, 1.1):
+                for x, y in m["outline"]:
+                    hull.push_back(chrono.ChVector3d(float(x), float(y), z))
+            body.AddCollisionShape(chrono.ChCollisionShapeConvexHull(self.contact_mat, hull), chrono.ChFramed())
             body.EnableCollision(True)
             if visual:
                 mesh = data + m["mesh"] % car["color"]
@@ -1829,8 +2398,9 @@ class World:
                             for f in (m["rim"], m["tire"]):
                                 parts.append((data + f, (wx, sgn * wy, wz), 0.0 if sgn > 0 else math.pi))
                     for f, pos, yaw in parts:
-                        mesh_obj = chrono.ChTriangleMeshConnected.CreateFromWavefrontFile(f, True, True)
-                        shape = chrono.ChVisualShapeTriangleMesh(mesh_obj, True)     # keeps the .mtl colours
+                        if f not in meshes:
+                            meshes[f] = chrono.ChTriangleMeshConnected.CreateFromWavefrontFile(f, True, True)
+                        shape = chrono.ChVisualShapeTriangleMesh(meshes[f], True)    # keeps the .mtl colours
                         body.AddVisualShape(shape, chrono.ChFramed(chrono.ChVector3d(*pos),
                                                                    chrono.QuatFromAngleZ(yaw)))
                 else:
@@ -1858,10 +2428,12 @@ class ParkingSim:
         self.args = args
         self.scn = make_scenario(args.type, args.cars, args.side, args.angle, args.seed)
         rng = np.random.default_rng(args.seed + 7919)
-        self.world = World(self.scn, visual=not args.headless, tire=args.tire)
-        self.sensor = Perception(self.scn, args.noise, rng)
+        rig = args.sensors != "sim"
+        self.world = World(self.scn, visual=rig or not args.headless, tire=args.tire)   # sensors render the visual assets
+        self.sensor = SensorRig(self.world, args.sensors, args.noise, rng) if rig else \
+            Perception(self.scn, args.noise, rng)
         self.grid = GridMap(self.scn.bounds)
-        self.lines = LineMap()
+        self.lines = LineMap(keep=rig)
         self.planner = Planner()
         self.planner.table()          # tabulate the Reeds-Shepp heuristic up front (~1 s)
         self.tracker = MpcTracker()
@@ -1882,6 +2454,7 @@ class ParkingSim:
         self.t_still = None
         self.replans = self.corrections = self.blocked = 0
         self.must_replan = False
+        self.watch_margin = True       # whether the path monitor still asks for more margin on this plan
         self.plan_info = None          # statistics and search tree of the last plan
         self.plan_thread = self.plan_result = None
         self.plan_time = 0.0
@@ -1897,6 +2470,7 @@ class ParkingSim:
                   car.GetSuspension(0).GetTemplateName(), car.GetSuspension(1).GetTemplateName(),
                   car.GetSteering(0).GetTemplateName(), car.GetDriveline().GetTemplateName(),
                   car.GetTire(0, veh.LEFT).GetTemplateName()), flush=True)
+        print("[parking] perception: %s" % self.sensor.name, flush=True)
 
     @property
     def time(self):
@@ -1973,23 +2547,28 @@ class ParkingSim:
             self.cmd = (self.tracker.delta, 0.0, EGO.torque(A_BRAKE))
 
     def _perceive(self):
-        origin, ang, r, dets = self.sensor.sense(self.pose)
-        self.grid.update(origin, ang, r)
+        scans, dets = self.sensor.sense(self.pose)
+        hits = [np.zeros((0, 2))]
+        for origin, ang, r_hit, r_free, *more in scans:
+            self.grid.update(origin, ang, r_hit, r_free, *more)
+            ok = np.isfinite(r_hit)
+            hits.append(np.stack([origin[0] + r_hit[ok] * np.cos(ang[ok]), origin[1] + r_hit[ok] * np.sin(ang[ok])], axis=1))
+        self.grid.mark_free(self.pose)
         self.lines.update(dets, self.time)
-        ok = np.isfinite(r)
-        self.scan = np.stack([origin[0] + r[ok] * np.cos(ang[ok]), origin[1] + r[ok] * np.sin(ang[ok])], axis=1)
+        self.scan = np.concatenate(hits)
         self.dets = dets
         # The trail tells the stall inference which end of a stall faces the lane. Only the drive
         # along the lane counts: once the car is parking, its track runs inside the stall.
         p = np.array(self.pose[:2])
         if self.state in ("SETTLE", "WAIT", "SEARCH") and np.hypot(*(p - self.trail[-1])) > 0.5:
             self.trail.append(p)
-        self.slots = find_slots(self.lines.confirmed(), self.trail, self.grid)
+        rig = isinstance(self.sensor, SensorRig)
+        self.slots = find_slots(self.lines.markers() if rig else self.lines.confirmed(), self.trail, self.grid, rig)
 
         ego = ego_poly(self.pose)
         ctr = ego.mean(axis=0)
         for poly in self.obstacles:
-            if np.hypot(*(poly.mean(axis=0) - ctr)) < 0.5 * np.hypot(*(poly[2] - poly[0])) + 6.0:
+            if np.hypot(*(poly.mean(axis=0) - ctr)) < np.ptp(poly, axis=0).max() + 6.0:
                 self.min_clearance = min(self.min_clearance, poly_distance(ego, poly))
 
         if self.state == "SEARCH":
@@ -2131,12 +2710,14 @@ class ParkingSim:
                 return dict(kind=s.kind, nominal=nominal, u=s.u_in, signs=(1.0,), runs=(1.6, 1.1, 0.6, 0.0),
                             trials=sorted((abs(a) + 2.0 * b, a, b) for a in np.arange(-0.6, 0.61, 0.1)
                                           for b in np.arange(0.0, 0.31, 0.05)),
-                            margins=((0.12, 0.22), (0.08, 0.15), (0.06, 0.12)))
+                            margins=((0.20, 0.30), (0.12, 0.22), (0.10, 0.18)) if isinstance(self.sensor, SensorRig)
+                            else ((0.12, 0.22), (0.08, 0.15), (0.06, 0.12)))
             return dict(kind=s.kind, nominal=nominal, u=s.u_in, signs=(1.0 if self.nose_in else -1.0,),
                         runs=(3.5, 2.5, 1.5, 0.8),
                         trials=sorted((abs(a) + b, a, b) for a in np.arange(-0.3, 0.31, 0.05)
                                       for b in np.arange(0.0, 0.61, 0.15)),
-                        margins=((0.25, 0.30), (0.15, 0.20), (0.08, 0.12)))
+                        margins=((0.30, 0.35), (0.20, 0.25), (0.12, 0.15)) if isinstance(self.sensor, SensorRig)
+                        else ((0.25, 0.30), (0.15, 0.20), (0.08, 0.12)))
         x, y, th = self.manual
         nominal = (x - EGO.center * math.cos(th), y - EGO.center * math.sin(th), th)
         return dict(kind="manual", nominal=nominal, u=np.array([math.cos(th), math.sin(th)]),
@@ -2150,6 +2731,11 @@ class ParkingSim:
         region = self.target.region if self.target is not None else self._box_cells(0.3)
         if region is not None:       # the chosen spot was judged free (by the map, or by the user)
             mask, sl = region
+            if isinstance(self.sensor, SensorRig) and self.target is not None and self.target.kind == "parallel":
+                # A parallel stall lies open to the lane: what a camera has not seen of it is small.
+                # Only fill gaps, within 0.5 m of ground seen to be free. Its far side is the kerb,
+                # which a camera cannot tell from the road until it is close.
+                mask = mask & self.grid.grow(self.grid.free >= 1, 5)[sl]
             occ[sl] &= ~mask | self.grid.occupied()[sl]
         self.state = "PLAN"
         self.say("planning ...")
@@ -2205,6 +2791,7 @@ class ParkingSim:
         for sign in spec["signs"]:
             goal = None
             for _, a, b in spec["trials"]:
+                shift = (a, b)
                 p = (nominal[0] + a * nu[0] - b * u[0], nominal[1] + a * nu[1] - b * u[1], th)
                 if footprint_hits(np.array([p]), pts, tight)[0] or sub[
                         min(max(int((p[1] - wy0) / res), 0), sub.shape[0] - 1),
@@ -2231,7 +2818,7 @@ class ParkingSim:
             if any(footprint_hits(sg.poses(), pts, 0.03).any() for sg in segs):
                 continue
             if best is None or stats["cost"] < best["stats"]["cost"]:
-                best = dict(segments=segs, goal=goal, nominal=nominal, margin=m_lat, stats=stats,
+                best = dict(segments=segs, goal=goal, nominal=nominal, margin=m_lat, stats=stats, shift=shift,
                             explored=self.planner.explored)
         return best
 
@@ -2265,12 +2852,15 @@ class ParkingSim:
             return
         segs = res["segments"]
         self.goal, self.nominal = res["goal"], res["nominal"]
-        self.blocked, self.must_replan = 0, False
+        self.blocked, self.must_replan, self.watch_margin = 0, False, True
         self.plan_info = dict(res["stats"], margin=res["margin"], explored=res["explored"])
         st = res["stats"]
+        a, b = res["shift"]
+        moved = "" if abs(a) < 0.01 and abs(b) < 0.01 else \
+            ", goal shifted %.2f m sideways and %.2f m outward to stay clear" % (abs(a), b)
         self.say("plan: %s  (%d expansions, %.1f s, margin %.2f m)" % (
             " + ".join("%s %.1f m" % ("fwd" if s.dir > 0 else "rev", s.length) for s in segs) or "already there",
-            st["iterations"], time.time() - self._plan_wall, res["margin"]))
+            st["iterations"], time.time() - self._plan_wall, res["margin"]) + moved)
         self.path, self.seg_i = segs, 0
         if not segs:
             self._finish(True, "parked")
@@ -2296,6 +2886,7 @@ class ParkingSim:
         old = self.nominal
         d, dth = math.hypot(new[0] - old[0], new[1] - old[1]), abs(wrap(new[2] - old[2]))
         if d < 0.01 and dth < 0.003:
+            self._recentre()
             return
         if d > 0.5 or dth > 0.1:
             if self.replans < self.MAX_REPLANS:
@@ -2315,6 +2906,29 @@ class ParkingSim:
         dx, dy = self.goal[0] - old[0], self.goal[1] - old[1]
         self.goal = (new[0] + dx * c - dy * s, new[1] + dx * s + dy * c, wrap(self.goal[2] + new[2] - old[2]))
         self.nominal = new
+        self._recentre()
+
+    def _recentre(self):
+        """A goal that was planned off the stall centre, to stay clear of something the map showed
+        there, goes back towards the centre once the map says the way is clear. From a distance a
+        camera places the side of a parked car to a decimetre or two. Up close it knows better."""
+        off = np.array(self.goal[:2]) - np.array(self.nominal[:2])
+        cur = self.path[self.seg_i]
+        rest = cur.s[-1] - cur.s[min(self.tracker.i, len(cur.s) - 1)] + sum(sg.length for sg in self.path[self.seg_i + 1:])
+        if np.hypot(*off) < 0.02 or rest < 3.0:          # (the car needs some distance to follow the move)
+            return
+        step = off * max(0.3, min(1.0, 0.02 / np.hypot(*off)))
+        cand = (self.goal[0] - step[0], self.goal[1] - step[1], self.goal[2])
+        pts = self.grid.occupied_points()
+        if len(pts):
+            pts = pts[np.hypot(pts[:, 0] - cand[0], pts[:, 1] - cand[1]) < 8.0]
+            if len(pts) and footprint_hits(np.array([cand]), pts, 0.12)[0]:
+                return
+        beyond = 0.0
+        for seg in reversed(self.path[self.seg_i:]):
+            seg.reanchor(self.goal, cand, beyond)
+            beyond += seg.length
+        self.goal = cand
 
     def _monitor(self):
         """Stop and replan if newly seen obstacles are in the way of the remaining path."""
@@ -2324,11 +2938,20 @@ class ParkingSim:
         poses = [self.path[self.seg_i].poses(self.tracker.i)] + [s.poses() for s in self.path[self.seg_i + 1:]]
         poses = np.concatenate(poses)
         near = pts[np.hypot(pts[:, 0] - self.pose[0], pts[:, 1] - self.pose[1]) < 25.0]
-        self.blocked = self.blocked + 1 if footprint_hits(poses, near, 0.0).any() else 0
+        hard = bool(footprint_hits(poses, near, 0.0).any())
+        # With cameras, an obstacle is only placed exactly once it is close, often after the plan
+        # was made: also react when it turns out to be nearer to the path than the plan allowed
+        # for. That asks for a better plan. If there is none, the current one is still drivable.
+        margin = min(0.10, self.plan_info["margin"] - 0.03) if isinstance(self.sensor, SensorRig) else 0.0
+        close = not hard and margin > 0.0 and self.watch_margin and self.replans < self.MAX_REPLANS and \
+            bool(footprint_hits(poses, near, margin).any())
+        self.blocked = self.blocked + 1 if hard or close else 0
         if self.blocked >= 2:
             self.replans += 1
-            self.must_replan = True            # the current plan cannot be driven any further
-            self.say("the path is blocked by something newly seen, replanning")
+            self.must_replan = hard            # the current plan cannot be driven any further
+            self.watch_margin = hard           # (asked once per plan)
+            self.say("the path is blocked by something newly seen, replanning" if hard else
+                     "an obstacle is nearer to the path than planned for, replanning")
             self.tracker.stop()
             self.state, self.t_still = "BRAKE", None
 
@@ -2481,7 +3104,10 @@ class MouseKeys:
 class Viewer:
     COLORS = dict(det=(1.0, 0.9, 0.1), track=(0.1, 0.9, 1.0), free=(0.2, 1.0, 0.3), occupied=(1.0, 0.25, 0.2),
                   unknown=(0.6, 0.6, 0.6), fwd=(0.3, 0.55, 1.0), rev=(1.0, 0.35, 0.9), goal=(1.0, 1.0, 1.0),
-                  scan=(1.0, 0.45, 0.1), box=(1.0, 1.0, 1.0), box_bad=(1.0, 0.2, 0.2), mpc=(1.0, 0.95, 0.2))
+                  scan=(1.0, 0.45, 0.1), box=(1.0, 1.0, 1.0), box_bad=(1.0, 0.2, 0.2), mpc=(1.0, 0.95, 0.2),
+                  fan=(0.45, 0.6, 0.95), stub=(0.1, 0.55, 0.65))
+    CAM_PALETTE = {0: (34, 38, 48), 1: (84, 88, 96), 2: (255, 120, 40), 3: (112, 44, 44), 4: (150, 120, 70),
+                   5: (255, 240, 60)}
 
     def __init__(self, sim, args):
         global irr
@@ -2542,6 +3168,7 @@ class Viewer:
         self.hist_step = -10 ** 9
         self.map_img, self.map_time = None, -1.0       # cached raster of the planning map
         self.panel_rects = None
+        self.cam_stamp, self.cam_rects = None, []       # cached picture of what the cameras are read as
         self.next_shot = 0.0
         self.t_done = None
 
@@ -2611,8 +3238,14 @@ class Viewer:
         self.items = []
         for x1, y1, x2, y2, _ in sim.dets:
             self._line([(x1, y1), (x2, y2)], C["det"], z=0.07, thick=1)
-        for t in sim.lines.confirmed():
-            self._line(t.ends(), C["track"], z=0.04)
+        for origin, head, half, reach in getattr(sim.sensor, "fans", ()):      # what each sensor looks at
+            arc = [(origin[0] + reach * math.cos(head + a), origin[1] + reach * math.sin(head + a))
+                   for a in np.linspace(-half, half, max(3, int(half / 0.12)))]
+            pts = np.array(arc if half > 3.0 else [tuple(origin)] + arc + [tuple(origin)])
+            self.scan_items.append((self._vec(pts, 0.3), chrono.ChColor(*C["fan"])))      # top view only
+        confirmed = sim.lines.confirmed()
+        for t in sim.lines.markers():
+            self._line(t.ends(), C["track"] if t in confirmed else C["stub"], z=0.04)
         for s in sim.slots:
             if s is sim.target:
                 continue
@@ -3028,7 +3661,8 @@ class Viewer:
 
         free = sum(sl.status == Slot.FREE for sl in sim.slots)
         occ = sum(sl.status == Slot.OCCUPIED for sl in sim.slots)
-        rows = ["LINE TRACKS %d (%d CONFIRMED)" % (len(sim.lines.tracks), len(sim.lines.confirmed())),
+        rows = ["PERCEPTION: " + sim.sensor.name.upper().replace("::", " "),
+                "LINE TRACKS %d (%d CONFIRMED)" % (len(sim.lines.tracks), len(sim.lines.confirmed())),
                 "STALLS %d: %d FREE, %d OCCUPIED" % (len(sim.slots), free, occ),
                 "CAR %.2f X %.2f M, WHEELBASE %.2f M" % (EGO.length, 2.0 * EGO.half_width, EGO.wheelbase),
                 "%.0f KG, STEERING +-%.1f DEG, BRAKES %.0f NM" % (EGO.mass, math.degrees(EGO.steer_max), EGO.brake_torque_max),
@@ -3038,6 +3672,30 @@ class Viewer:
         for k, row in enumerate(rows):
             if y + 12 * k + 10 < self.H:
                 self._text(row, x, y + 12 * k, 1, rgb=grey)
+        y += 12 * len(rows) + 10
+        cams = [c for c in getattr(sim.sensor, "cameras", ()) if "view" in c]
+        if cams and y + 12 + cams[0]["view"].shape[0] + 14 < self.H:
+            stamp = tuple(c["stamp"] for c in cams)
+            if stamp != self.cam_stamp:          # new images: turn each row into runs of one colour
+                self.cam_stamp, self.cam_rects = stamp, []
+                for k, c in enumerate(cams):
+                    img = c["view"]
+                    x0 = x + k * (img.shape[1] + 14)
+                    for row in range(img.shape[0]):
+                        cuts = np.flatnonzero(np.diff(img[row])) + 1
+                        for a, b in zip(np.concatenate([[0], cuts]), np.concatenate([cuts, [img.shape[1]]])):
+                            self.cam_rects.append((irr.SColor(255, *self.CAM_PALETTE[int(img[row, a])]),
+                                                   x0 + int(a), y + 12 + row, x0 + int(b), y + 13 + row))
+            for k, c in enumerate(cams):
+                self._text(c["label"].upper() + " CAMERA, AS READ", x + k * (c["view"].shape[1] + 14), y, 1, rgb=grey)
+            for col, x0, y0, x1, y1 in self.cam_rects:
+                self._rect(col, x0, y0, x1, y1)
+            y += 12 + cams[0]["view"].shape[0] + 6
+            lx = x
+            for name, key in (("GROUND", 1), ("OBSTACLE", 2), ("UNCLEAR", 4), ("PAINT", 5), ("OWN BODY", 3)):
+                self._rect(irr.SColor(255, *self.CAM_PALETTE[key]), lx, y, lx + 8, y + 8)
+                self._text(name, lx + 11, y + 1, 1, rgb=grey)
+                lx += 17 + 6 * len(name)
 
     def loop(self):
         sim, args = self.sim, self.args
@@ -3104,6 +3762,11 @@ def parse_args(argv=None):
                     help="with --target: park exactly where the box is, do not align with a detected stall")
     ap.add_argument("--tire", choices=("tmeasy", "pac02"), default="tmeasy",
                     help="tire model of the simulated sedan (TMeasy or Pacejka 2002)")
+    ap.add_argument("--sensors", choices=("auto", "sim") + SensorRig.MODES, default="auto",
+                    help="what the car perceives with. camera: Chrono::Sensor stereo cameras looking forward and "
+                         "back. camera+lidar, camera+radar: the same plus a roof lidar or four corner radars. "
+                         "sim: detections computed from the scenario, no sensor simulated. auto (default): "
+                         "camera if this PyChrono has the ray-traced sensors, otherwise sim")
     ap.add_argument("--noise", type=float, default=1.0, help="perception noise scale (0 = perfect)")
     ap.add_argument("--seed", type=int, default=1, help="random seed (layout details and noise)")
     ap.add_argument("--tour", action="store_true", help="play through a set of scenarios one after another")
@@ -3127,6 +3790,13 @@ def parse_args(argv=None):
         args.layout = "wide" if args.target == "drag" else "quad"
     if args.snapshots:
         os.makedirs(args.snapshots, exist_ok=True)
+    if args.sensors == "auto":
+        args.sensors = "camera" if HAVE_SENSORS else "sim"
+    elif args.sensors != "sim" and not HAVE_SENSORS:
+        ap.error("--sensors %s needs a PyChrono whose sensor module has cameras, lidar and radar (a build "
+                 "with a ray-tracing backend and Python bindings for it, see docs/sensors.md). This one has %s. "
+                 "Use --sensors sim to run without simulated sensors." %
+                 (args.sensors, "no sensor module" if sens is None else "only GPS and IMU sensors"))
     return args
 
 
@@ -3149,6 +3819,9 @@ def main():
             sim.advance(500)
         if sim.result is None:
             sim._finish(False, "timed out")
+        sys.stdout.flush()               # leave without running destructors, as below: the sensor
+        sys.stderr.flush()               # manager owns render threads
+        os._exit(0 if sim.result["ok"] else 1)
     else:
         viewer = Viewer(sim, args)
         code = 1

@@ -116,8 +116,97 @@ def test_footprint_and_distance():
     print("footprint test and polygon distance: ok")
 
 
+def test_sensor_geometry():
+    """Pixel rays, the planar scan made from classified 3D points, and the stripe detector."""
+    w, h, hfov = 96, 54, math.radians(120.0)
+    rays = ps.pinhole_rays(w, h, hfov)
+    assert np.allclose(np.linalg.norm(rays, axis=-1), 1.0, atol=1e-6)
+    assert rays[0, 0, 1] > 0 and rays[0, 0, 2] < 0, "the buffer starts at the bottom-left pixel"
+    edge = math.atan2(rays[h // 2, 0, 1], rays[h // 2, 0, 0])
+    assert abs(edge - 0.5 * hfov) < math.radians(0.7), "the first column looks half the field of view to the left"
+
+    # a wall 5 m ahead, ground in front of it, and a kerb (flat top, 0.6 m deep) off to the left
+    a = np.radians(np.arange(-40.0, 40.0, 0.25))
+    wall = np.stack([np.full_like(a, 5.0), 5.0 * np.tan(a) * 0.2, np.zeros_like(a)], axis=1)
+    wall = np.concatenate([wall + (0.0, 0.0, z) for z in (0.3, 0.6, 0.9)])
+    gx, gy = np.meshgrid(np.arange(0.5, 9.0, 0.05), np.arange(-4.0, 4.0, 0.05))
+    ground = np.stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)], axis=1)
+    kx, ky = np.meshgrid(np.arange(1.0, 4.0, 0.05), np.arange(3.0, 3.6, 0.05))
+    kerb = np.stack([kx.ravel(), ky.ravel(), np.full(kx.size, 0.15)], axis=1)
+    P = np.concatenate([wall, ground, kerb])[None]
+    obstacle, on_ground = P[..., 2] > 0.1, np.abs(P[..., 2]) < 0.05
+    ang, r_hit, r_free, r_stop, before = ps.planar_scan(P, (0.0, 0.0), obstacle, on_ground, ~on_ground, 240,
+                                                        math.radians(60.0), 0.0, 12.0)
+    assert np.all(before <= np.where(np.isfinite(r_stop), r_stop, np.inf) + 1e-9)
+    ahead = np.abs(ang) < math.radians(8.0)
+    assert np.allclose(r_hit[ahead], 5.0 / np.cos(ang[ahead]) * 1.0, atol=0.12), r_hit[ahead]
+    assert np.all(r_free[ahead] < r_hit[ahead]) and np.all(r_free[ahead] > r_hit[ahead] - 0.4)
+    side = (ang > math.radians(50.0)) & (ang < math.radians(58.0))
+    # the kerb is hit at its near edge (y = 3.0), not somewhere on its 0.6 m deep top
+    assert np.allclose(r_hit[side] * np.sin(ang[side]), 3.0, atol=0.08), r_hit[side] * np.sin(ang[side])
+
+    # two collinear stripes with a gap, one stripe across them, and speckle
+    rng = np.random.default_rng(3)
+    def stripe(p, q, n):
+        t = rng.random((n, 1))
+        d = np.array(q) - np.array(p)
+        nrm = np.array([-d[1], d[0]]) / np.hypot(*d)
+        return np.array(p) + t * d + rng.uniform(-0.06, 0.06, (n, 1)) * nrm
+    pts = np.concatenate([stripe((2.0, 1.0), (2.0, 4.0), 900), stripe((2.0, 5.5), (2.0, 8.0), 800),
+                          stripe((4.0, 2.0), (7.0, 2.5), 900), rng.uniform(0.0, 9.0, (60, 2))])
+    segs = ps.paint_segments(pts, np.zeros(2))
+    found = sorted((round(min(s[1], s[3]), 1), round(max(s[1], s[3]), 1)) for s in segs if abs(s[0] - 2.0) < 0.05
+                   and abs(s[2] - 2.0) < 0.05)
+    assert found == [(1.0, 4.0), (5.5, 8.0)], found
+    assert any(abs(math.hypot(s[2] - s[0], s[3] - s[1]) - math.hypot(3.0, 0.5)) < 0.15 for s in segs)
+    assert len(segs) == 3, "speckle must not become a line: %d segments" % len(segs)
+    print("pixel rays, planar scan and stripe detector: ok")
+
+
+def test_mapping():
+    """Line tracks that remember where paint was seen, and the tentative layer of the grid."""
+    trk = ps.LineTrack((0.0, 0.0, 0.0, 2.0, 8.0), 0.0, keep=True)       # the mouth of a line, seen from far
+    for _ in range(12):
+        trk.add((0.0, 0.0, 0.0, 2.0, 8.0))
+    for _ in range(200):                                                # then only its far end, from close
+        trk.add((0.0, 3.0, 0.0, 5.5, 2.0))
+    lo = min(e[1] for e in trk.ends())
+    assert lo < 0.15, "the track forgot the stretch it saw from far away (starts at %.2f)" % lo
+    plain = ps.LineTrack((0.0, 0.0, 0.0, 2.0, 8.0), 0.0)
+    for _ in range(12):
+        plain.add((0.0, 0.0, 0.0, 2.0, 8.0))
+    for _ in range(200):
+        plain.add((0.0, 3.0, 0.0, 5.5, 2.0))
+    assert min(e[1] for e in plain.ends()) > 2.5                        # (what happens without the memory)
+
+    old = (ps.EGO.rear, ps.EGO.front, ps.EGO.half_width, ps.EGO.length)
+    ps.EGO.rear, ps.EGO.front, ps.EGO.half_width, ps.EGO.length = 1.0, 3.8, 0.9, 4.8
+    try:
+        g = ps.GridMap((0.0, -5.0, 20.0, 5.0))
+        ang = np.radians(np.arange(-30.0, 30.0, 0.5))
+        none = np.full(len(ang), np.nan)
+        for _ in range(4):      # sure of the first 6 m, ground seen up to 11 m
+            g.update((0.0, 0.0), ang, none, np.full(len(ang), 6.0), np.full(len(ang), 11.0))
+        cell = lambda x, y: (int((y - g.y0) / g.RES), int((x - g.x0) / g.RES))
+        b = g.blocked()
+        assert not b[cell(4.0, 0.0)] and not b[cell(9.0, 0.0)], "seen ground must be drivable"
+        assert b[cell(10.8, 0.0)], "the last 0.4 m of far ground are kept as a margin"
+        assert b[cell(14.0, 0.0)] and b[cell(4.0, 4.0)], "what was never seen is not drivable"
+        assert g.free[cell(9.0, 0.0)] == 0, "far ground is no evidence that a cell is empty"
+        stop = np.where(np.abs(ang) < 0.05, 5.5, np.nan)            # a closer look finds something at x = 9
+        g.update((3.5, 0.0), ang, none, np.full(len(ang), 5.0), None, stop)
+        assert g.blocked()[cell(9.0, 0.0)], "something seen there overrules the far ground"
+        g.mark_free((15.0, 3.0, 0.0))
+        assert not g.blocked()[cell(16.0, 3.0)], "the ground under the car is free"
+    finally:
+        ps.EGO.rear, ps.EGO.front, ps.EGO.half_width, ps.EGO.length = old
+    print("line memory and tentative map layer: ok")
+
+
 if __name__ == "__main__":
     test_reeds_shepp()
     test_mpc_solver()
     test_footprint_and_distance()
+    test_sensor_geometry()
+    test_mapping()
     print("all checks passed")
