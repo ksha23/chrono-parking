@@ -26,7 +26,7 @@ Two sets of scenarios were run:
 The seed also picks the sky for the sensors: seed 1 a clear sky with the sun at 41 degrees, seed 2
 a low sun, seed 3 an overcast sky. So a third of the camera runs are under each.
 
-The sensor rig is verified on fewer scenarios than the stand-in because a run takes 3 to 4
+The sensor rig is verified on fewer scenarios than the stand-in because a run takes two to four
 minutes instead of 10 seconds. Parking forward on request, the left side of the lane, the second
 tire model and hand-placed targets were not run with the rig.
 
@@ -34,165 +34,200 @@ tire model and hand-placed targets were not run with the rig.
 
 | Perception | Stalls | Parked | Lateral | Heading | Clearance | Gear changes | Runs that replanned |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| camera | perpendicular | 14 of 14 | at most 5.5 cm | at most 1.16 deg | at least 0.41 m | 1 to 7 | 3 |
-| camera | angled | 14 of 14 | at most 2.1 cm | at most 1.09 deg | at least 0.50 m | 1 to 2 | 1 |
-| camera | parallel | 14 of 14 | at most 7.9 cm | at most 2.48 deg | at least 0.21 m | 1 to 4 | 4 |
-| camera + lidar | perpendicular | 6 of 6 | at most 1.6 cm | at most 0.12 deg | at least 0.41 m | 1 to 3 | 0 |
-| camera + lidar | angled | 6 of 6 | at most 1.3 cm | at most 0.74 deg | at least 0.57 m | 1 to 1 | 0 |
-| camera + lidar | parallel | 6 of 6 | at most 5.6 cm | at most 0.72 deg | at least 0.21 m | 1 to 4 | 0 |
-| stand-in (`sim`) | perpendicular | 26 of 26 | at most 2.1 cm | at most 0.59 deg | at least 0.31 m | 1 to 4 | 0 |
-| stand-in (`sim`) | angled | 24 of 24 | at most 3.1 cm | at most 1.46 deg | at least 0.33 m | 0 to 2 | 1 |
-| stand-in (`sim`) | parallel | 24 of 24 | at most 2.5 cm | at most 0.23 deg | at least 0.23 m | 1 to 4 | 0 |
+| camera | perpendicular | 14 of 14 | at most 0.9 cm | at most 0.17 deg | at least 0.37 m | 1 to 5 | 2 |
+| camera | angled | 14 of 14 | at most 1.3 cm | at most 1.20 deg | at least 0.56 m | 1 to 2 | 0 |
+| camera | parallel | 14 of 14 | at most 6.0 cm | at most 0.97 deg | at least 0.17 m | 1 to 3 | 0 |
+| camera + lidar | perpendicular | 6 of 6 | at most 0.8 cm | at most 0.10 deg | at least 0.45 m | 1 to 3 | 0 |
+| camera + lidar | angled | 6 of 6 | at most 1.1 cm | at most 0.61 deg | at least 0.47 m | 0 to 2 | 0 |
+| camera + lidar | parallel | 6 of 6 | at most 6.7 cm | at most 0.59 deg | at least 0.23 m | 2 to 2 | 0 |
+| stand-in (`sim`) | perpendicular | 26 of 26 | at most 2.7 cm | at most 0.43 deg | at least 0.31 m | 1 to 4 | 0 |
+| stand-in (`sim`) | angled | 24 of 24 | at most 1.3 cm | at most 1.50 deg | at least 0.33 m | 0 to 2 | 2 |
+| stand-in (`sim`) | parallel | 24 of 24 | at most 2.8 cm | at most 0.47 deg | at least 0.11 m | 1 to 4 | 0 |
 
 WHERE: camera 0 local 42 north, camera + lidar 0 local 18 north
 By sky, camera: clear 15 of 15, low 15 of 15, overcast 12 of 12.
 By sky, camera + lidar: clear 9 of 9, low 9 of 9.
 
-**How these numbers came about.** The 60 runs with the rig were run three times, and the table
-above is the third.
+**How these numbers came about.** The 60 runs with the rig have been run four times, and the
+table above is the fourth.
 
 | Batch | Parked | What did not park, and what was changed after it |
 | --- | --- | --- |
 | first | 58 of 60 | Two parallel stalls with a car on one side were never recognised. A tick line was seen in two pieces under a shadow, and a tick half hidden by the parked car was just under the length a tick had to have. After it: pieces of one line are joined, and a tick may be 1.2 m with a rig |
 | second | 59 of 60 | In the empty perpendicular lot under the overcast sky the car parked 40 cm too deep, 9 cm from the kerb. The first piece of one line of the stall is worn away, and the stall was taken to start where that line does. After it: a stall starts on a line along the lane |
 | third | 60 of 60 | |
+| seeds 4 to 6, never run before | 43 of 45 | The car drove past two free perpendicular stalls. The map was right in both. A line counted after 5 sightings and a stall after 8, numbers from when a camera fed the map ten times per second, and the stereo network ran 2.5 times per second. After it: nothing counts sightings or frames any more. The maps add up the time each answer stands for, and the networks run 5 times per second ([sensors.md](sensors.md#how-often-the-networks-run)). The check of that on recorded drives turned up one more rule, which was changed too: in a 60 degree lot a half-seen line could be matched to the wrong end of its neighbour |
+| fourth: the table above | 60 of 60 | |
+| seeds 4 to 6 again | 44 of 45 | see below |
 
-All three failures were rules of the stall inference meeting the worn paint and the shadows of
-the new scene. In none of them was the map wrong. The rules are described in
-[sensors.md](sensors.md#a-line-in-pieces-is-one-line).
+The first three changes were rules of the stall inference meeting the worn paint and the shadows
+of the new scene. The fourth was a wrong unit: frames where time was meant.
 
-**That makes the 60 a set the rules were fixed on, not a test of them.** For a test, 45 runs with
-seeds that had never been run (4, 5 and 6: other cars, other positions, other worn paint, each of
-the three skies) were made once, with the code of the third batch:
+**That makes seeds 1 to 6 runs the method was fixed on, not a test of it.** Seeds 4 to 6 with the
+final code:
 
 | Perception | Stalls | Parked | Lateral | Heading | Clearance | Gear changes | Runs that replanned |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| camera | perpendicular | 10 of 12 | at most 1.0 cm | at most 0.23 deg | at least 0.29 m | 1 to 2 | 2 |
-| camera | angled | 12 of 12 | at most 1.8 cm | at most 1.44 deg | at least 0.48 m | 1 to 2 | 0 |
-| camera | parallel | 12 of 12 | at most 3.0 cm | at most 0.50 deg | at least 0.17 m | 1 to 2 | 3 |
-| camera + lidar | perpendicular | 3 of 3 | at most 1.1 cm | at most 0.25 deg | at least 0.47 m | 1 to 1 | 0 |
-| camera + lidar | angled | 3 of 3 | at most 2.0 cm | at most 1.44 deg | at least 0.61 m | 1 to 2 | 0 |
-| camera + lidar | parallel | 3 of 3 | at most 2.9 cm | at most 0.35 deg | at least 0.12 m | 2 to 2 | 0 |
+| camera | perpendicular | 11 of 12 | at most 1.0 cm | at most 0.25 deg | at least 0.41 m | 1 to 4 | 0 |
+| camera | angled | 12 of 12 | at most 1.2 cm | at most 1.12 deg | at least 0.54 m | 1 to 2 | 0 |
+| camera | parallel | 12 of 12 | at most 2.4 cm | at most 0.83 deg | at least 0.20 m | 1 to 4 | 2 |
+| camera + lidar | perpendicular | 3 of 3 | at most 1.5 cm | at most 0.23 deg | at least 0.47 m | 1 to 3 | 0 |
+| camera + lidar | angled | 3 of 3 | at most 0.6 cm | at most 0.21 deg | at least 0.66 m | 0 to 2 | 0 |
+| camera + lidar | parallel | 3 of 3 | at most 1.8 cm | at most 0.48 deg | at least 0.19 m | 2 to 2 | 1 |
 
-By sky, camera: clear 12 of 12, low 11 of 12, overcast 11 of 12.
+By sky, camera: clear 12 of 12, low 12 of 12, overcast 11 of 12.
 By sky, camera + lidar: clear 3 of 3, low 3 of 3, overcast 3 of 3.
 
-That is 43 of 45. Both misses are perpendicular stalls that the car drove past without choosing
-them. Nothing was hit, and the map was right in both.
+One run of the 45 did not park (perpendicular, a car on the left, seed 6, low sun). The car
+stopped in the middle of its manoeuvre, found no way on and gave up, 1.1 m from anything. It is
+the only failure so far in which the map was wrong:
 
-- *Low sun, car on the right, seed 5.* The stall was found and classed as free 9 s before the end
-  of the lane. Its near line had been sighted 7 times, and a stall is only chosen once both of
-  its lines have 8 sightings.
-- *Overcast, cars on both sides, seed 6.* The near line of the stall was sighted 4 times, and a
-  line counts from 5.
+- The car had paused for 1.5 s between going forward and reversing, with a parked bus 3 m ahead.
+- Along the edge of the car's own bonnet in the image, the stereo network put a few dozen pixels
+  somewhere between the bonnet, 1 m away, and the bus. Those points lie in the air 20 to 30 cm
+  off the car's own wing.
+- While the car drives, such points fall into a different map cell in every frame and never
+  count. While it stood, they fell into the same cell four times, and the cell became an
+  obstacle that the car could not move away from with the margin the planner keeps.
 
-Both come from one thing. The two thresholds were set when a camera fed the map ten times per
-second. The stereo network runs 2.5 times per second, so a short stub of a line between two cars
-is seen a quarter as often while it is in view, and the thresholds were not scaled with that.
-They were left as they are here, so that this number stands as measured.
+It was left as it is. A fix was tried: leaving out a band of pixels around the car's own body in
+each image. That run then parks, and of the 60 runs none had to stop and plan again. But the band
+also hides the nearest strip of road from the pair, and a nose-in run into an angled stall, which
+had parked before, then ended 69 cm too deep. So the band is not in this version. A run is
+repeatable, so this one can be made again exactly:
+`--sensors camera --type perpendicular --cars left --seed 6`.
+
+For a test, 45 runs with seeds that had never been run (7, 8 and 9: other cars, other positions,
+other worn paint, each of the three skies) were made once, with the final code:
+
+| Perception | Stalls | Parked | Lateral | Heading | Clearance | Gear changes | Runs that replanned |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| camera | perpendicular | 12 of 12 | at most 1.2 cm | at most 0.16 deg | at least 0.47 m | 1 to 8 | 3 |
+| camera | angled | 12 of 12 | at most 0.9 cm | at most 1.03 deg | at least 0.54 m | 1 to 2 | 0 |
+| camera | parallel | 12 of 12 | at most 5.7 cm | at most 0.43 deg | at least 0.25 m | 1 to 4 | 3 |
+| camera + lidar | perpendicular | 3 of 3 | at most 1.2 cm | at most 0.25 deg | at least 0.49 m | 1 to 2 | 0 |
+| camera + lidar | angled | 3 of 3 | at most 1.5 cm | at most 0.94 deg | at least 0.61 m | 0 to 2 | 0 |
+| camera + lidar | parallel | 3 of 3 | at most 4.4 cm | at most 0.68 deg | at least 0.15 m | 2 to 2 | 0 |
+
+By sky, camera: clear 12 of 12, low 12 of 12, overcast 12 of 12.
+By sky, camera + lidar: clear 3 of 3, low 3 of 3, overcast 3 of 3.
+
+That is 45 of 45.
+
+Six of the 36 camera runs stopped once to plan again. One of them, a perpendicular stall
+between two cars, then needed eight gear changes and 64 s. The smallest clearance was 0.15 m, in a
+parallel stall with the lidar that was planned with a margin of 0.20 m.
 
 Other comments:
 
+- **Twice as often is better.** The third batch had the networks at 2.5 answers per second, the
+  fourth has them at 5. On the same 60 scenarios, 2 runs had to stop and plan again instead of 8,
+  the worst run took 5 gear changes instead of 7, and the largest heading error went from 2.5 to
+  1.2 degrees.
 - **The sky makes no difference.** Hard shadows over the stall lines, a low sun and an overcast
   sky give the same result. The line detector compares paint with the road right beside it, which
   does not care how much light there is.
-- **Parallel stalls are the least exact**, as with every perception source: up to 8 cm off
-  centre and 1.8 degrees off the kerb line, 2.5 degrees at double noise. The car is aligned with a
-  kerb that only the stereo pair sees, from 5 to 8 m, and with two tick lines.
+- **Parallel stalls are the least exact**, as with every perception source: up to 7 cm off
+  centre and 1 degree off the kerb line. The car is aligned with a kerb that only the stereo pair
+  sees, from 5 to 8 m, and with two tick lines.
 - **Gear changes.** Backing into a perpendicular stall between two cars mostly takes three gear
-  changes with the rig, and up to seven. When the plan is made, the stall has been seen only as a
+  changes with the rig, and up to eight. When the plan is made, the stall has been seen only as a
   wedge, and the margins are wider than with the stand-in.
-- **Where the networks run.** The first batch had them on the Mac, the third on the RTX 5070 Ti.
-  One run was made both ways with the same code and gave the same result line. The two batches
-  differ in the rules as well, so they do not isolate this: of the 58 rows that parked in both,
-  17 have the same result line, and 4 differ by a gear change or by more than 3 cm.
+- **A run can be repeated.** The same scenario gives the same messages at the same times and the
+  same result line. That took one setting: the stereo network on a CUDA GPU does not give the
+  same disparity twice unless cuDNN is told to ([sensors.md](sensors.md#what-it-needs)).
 
 The sensor runs used Chrono main with the Metal RT backend and the bindings patch, IGEV++ with its
 Middlebury weights and Depth Anything V2 Small. The simulation and the cameras ran on an Apple
 M4 Pro, four runs at a time, and the networks on an RTX 5070 Ti in another machine
-([sensors.md](sensors.md#what-it-needs)). The stand-in batch ran on the PyChrono 10 conda package
-and reproduces the previous batch run for run.
+([sensors.md](sensors.md#what-it-needs)), both networks five times per second. A run with the
+rig can be repeated: the same scenario gives the same result line to the last digit. The
+stand-in batch ran on the PyChrono 10 conda package. It parks the same 74 as the earlier
+versions, with the same averages. The single runs moved a little when the map went from counting
+scans to adding up time: an obstacle now has to be seen for 0.5 s, which is five scans of the
+stand-in, where it used to be two. The smallest clearance of the set is now 0.11 m, in a parallel
+stall between two cars that was planned with a margin of 0.12 m. It used to be 0.23 m.
 
 <details>
 <summary>Cameras: every row</summary>
 
-42 of 42 parked. Longest run 66 s of simulated time, 8 runs replanned or corrected (8 times in all), peak memory of the simulation 4.3 GB.
+42 of 42 parked. Longest run 53 s of simulated time, 2 runs replanned or corrected (2 times in all), peak memory of the simulation 4.3 GB.
 
 | Stalls | Cars | Variant | Runs parked | Lateral [cm] | Heading [deg] | Depth [cm] | Clearance [m] | Gear changes | Replans | Time [s] |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| perpendicular | both | default | 3 of 3 | 0.3 | 0.06 | 6.7 | 0.46 | 3 to 7 | 1 | 49 |
-| perpendicular | left | default | 3 of 3 | 1.4 | 0.39 | 1.9 | 0.47 | 1 | 0 | 29 |
-| perpendicular | none | default | 3 of 3 | 5.5 | 1.16 | 8.1 | 0.41 | 1 to 3 | 1 | 32 |
-| perpendicular | right | default | 3 of 3 | 0.4 | 0.06 | 6.0 | 0.47 | 2 | 0 | 40 |
-| perpendicular | both | noise 2 | 2 of 2 | 0.3 | 0.04 | 5.9 | 0.53 | 3 to 5 | 1 | 46 |
-| angled | both | default | 3 of 3 | 1.4 | 0.89 | 3.9 | 0.60 | 1 | 0 | 29 |
-| angled | left | default | 3 of 3 | 2.1 | 0.99 | 1.1 | 0.50 | 1 to 2 | 0 | 27 |
-| angled | none | default | 3 of 3 | 1.2 | 1.09 | 2.9 | 0.65 | 1 | 0 | 23 |
-| angled | right | default | 3 of 3 | 1.9 | 1.09 | 6.0 | 0.56 | 1 | 0 | 33 |
-| angled | both | noise 2 | 2 of 2 | 1.5 | 0.81 | 4.3 | 0.60 | 1 to 2 | 1 | 32 |
-| parallel | both | default | 3 of 3 | 5.3 | 1.83 | 2.5 | 0.21 | 2 | 0 | 41 |
-| parallel | left | default | 3 of 3 | 6.2 | 0.32 | 2.7 | 0.28 | 1 to 2 | 1 | 36 |
-| parallel | none | default | 3 of 3 | 6.7 | 0.23 | 1.8 | 0.31 | 1 to 2 | 2 | 37 |
-| parallel | right | default | 3 of 3 | 5.1 | 0.52 | 1.5 | 0.23 | 2 | 1 | 49 |
-| parallel | both | noise 2 | 2 of 2 | 7.9 | 2.48 | 4.0 | 0.22 | 2 to 4 | 0 | 43 |
+| perpendicular | both | default | 3 of 3 | 0.5 | 0.10 | 6.4 | 0.48 | 3 | 1 | 41 |
+| perpendicular | left | default | 3 of 3 | 0.9 | 0.17 | 2.3 | 0.41 | 1 to 3 | 0 | 34 |
+| perpendicular | none | default | 3 of 3 | 0.5 | 0.04 | 1.5 | 0.48 | 1 | 0 | 30 |
+| perpendicular | right | default | 3 of 3 | 0.4 | 0.07 | 5.6 | 0.48 | 1 to 5 | 0 | 41 |
+| perpendicular | both | noise 2 | 2 of 2 | 0.5 | 0.09 | 6.6 | 0.37 | 3 | 1 | 41 |
+| angled | both | default | 3 of 3 | 0.9 | 0.28 | 2.6 | 0.63 | 2 | 0 | 32 |
+| angled | left | default | 3 of 3 | 0.9 | 0.29 | 2.1 | 0.56 | 2 | 0 | 28 |
+| angled | none | default | 3 of 3 | 0.9 | 1.20 | 2.4 | 0.66 | 1 | 0 | 22 |
+| angled | right | default | 3 of 3 | 1.3 | 1.03 | 7.8 | 0.61 | 1 | 0 | 33 |
+| angled | both | noise 2 | 2 of 2 | 0.6 | 0.14 | 3.0 | 0.65 | 2 | 0 | 32 |
+| parallel | both | default | 3 of 3 | 5.3 | 0.46 | 1.7 | 0.19 | 2 to 3 | 0 | 42 |
+| parallel | left | default | 3 of 3 | 3.3 | 0.05 | 2.5 | 0.28 | 1 to 2 | 0 | 36 |
+| parallel | none | default | 3 of 3 | 3.2 | 0.04 | 3.1 | 0.27 | 1 to 2 | 0 | 36 |
+| parallel | right | default | 3 of 3 | 4.4 | 0.73 | 3.0 | 0.24 | 2 to 3 | 0 | 51 |
+| parallel | both | noise 2 | 2 of 2 | 6.0 | 0.97 | 1.0 | 0.17 | 2 | 0 | 40 |
 
 </details>
 
 <details>
 <summary>Cameras + lidar: every row</summary>
 
-18 of 18 parked. Longest run 46 s of simulated time, 0 runs replanned or corrected (0 times in all), peak memory of the simulation 5.0 GB.
+18 of 18 parked. Longest run 41 s of simulated time, 0 runs replanned or corrected (0 times in all), peak memory of the simulation 5.0 GB.
 
 | Stalls | Cars | Variant | Runs parked | Lateral [cm] | Heading [deg] | Depth [cm] | Clearance [m] | Gear changes | Replans | Time [s] |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| perpendicular | both | default | 2 of 2 | 0.5 | 0.01 | 6.3 | 0.53 | 3 | 0 | 39 |
-| perpendicular | none | default | 2 of 2 | 1.6 | 0.12 | 8.3 | 0.41 | 1 | 0 | 29 |
-| perpendicular | random | default | 2 of 2 | 0.2 | 0.10 | 6.0 | 0.48 | 3 | 0 | 39 |
-| angled | both | default | 2 of 2 | 1.3 | 0.74 | 2.6 | 0.57 | 1 | 0 | 29 |
-| angled | none | default | 2 of 2 | 1.0 | 0.54 | 1.4 | 0.66 | 1 | 0 | 23 |
-| angled | random | default | 2 of 2 | 0.5 | 0.53 | 1.6 | 0.66 | 1 | 0 | 28 |
-| parallel | both | default | 2 of 2 | 5.6 | 0.72 | 2.6 | 0.24 | 2 to 4 | 0 | 42 |
-| parallel | none | default | 2 of 2 | 1.9 | 0.24 | 2.0 | 0.22 | 1 to 2 | 0 | 37 |
-| parallel | random | default | 2 of 2 | 5.3 | 0.24 | 1.7 | 0.21 | 2 to 4 | 0 | 43 |
+| perpendicular | both | default | 2 of 2 | 0.8 | 0.09 | 5.8 | 0.45 | 1 to 3 | 0 | 37 |
+| perpendicular | none | default | 2 of 2 | 0.5 | 0.01 | 1.5 | 0.48 | 1 | 0 | 30 |
+| perpendicular | random | default | 2 of 2 | 0.4 | 0.10 | 2.9 | 0.46 | 1 to 3 | 0 | 34 |
+| angled | both | default | 2 of 2 | 1.1 | 0.13 | 0.5 | 0.47 | 2 | 0 | 32 |
+| angled | none | default | 2 of 2 | 0.4 | 0.28 | 2.0 | 0.65 | 0 to 1 | 0 | 21 |
+| angled | random | default | 2 of 2 | 0.6 | 0.61 | 5.6 | 0.62 | 0 to 2 | 0 | 24 |
+| parallel | both | default | 2 of 2 | 5.0 | 0.59 | 1.6 | 0.24 | 2 | 0 | 40 |
+| parallel | none | default | 2 of 2 | 4.6 | 0.48 | 2.9 | 0.29 | 2 | 0 | 36 |
+| parallel | random | default | 2 of 2 | 6.7 | 0.24 | 1.1 | 0.23 | 2 | 0 | 39 |
 
 </details>
 
 <details>
 <summary>Stand-in: every row</summary>
 
-74 of 74 parked. Longest run 51 s of simulated time, 1 runs replanned or corrected (1 times in all), peak memory of the simulation 0.3 GB.
+74 of 74 parked. Longest run 50 s of simulated time, 2 runs replanned or corrected (2 times in all), peak memory of the simulation 0.2 GB.
 
 | Stalls | Cars | Variant | Runs parked | Lateral [cm] | Heading [deg] | Depth [cm] | Clearance [m] | Gear changes | Replans | Time [s] |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| perpendicular | both | default | 4 of 4 | 1.7 | 0.59 | 3.7 | 0.45 | 1 to 3 | 0 | 36 |
-| perpendicular | left | default | 4 of 4 | 1.5 | 0.25 | 3.7 | 0.44 | 1 | 0 | 29 |
-| perpendicular | none | default | 4 of 4 | 1.2 | 0.18 | 6.4 | 0.43 | 1 | 0 | 30 |
-| perpendicular | random | default | 4 of 4 | 1.8 | 0.42 | 1.3 | 0.48 | 1 | 0 | 31 |
-| perpendicular | right | default | 4 of 4 | 2.1 | 0.43 | 1.4 | 0.47 | 1 | 0 | 37 |
-| perpendicular | both | noise 2 | 1 of 1 | 0.4 | 0.50 | 3.5 | 0.45 | 1 | 0 | 33 |
-| perpendicular | both | park forward | 1 of 1 | 0.1 | 0.49 | 0.7 | 0.31 | 4 | 0 | 47 |
-| perpendicular | both | side left | 1 of 1 | 1.6 | 0.20 | 0.8 | 0.46 | 1 | 0 | 37 |
-| perpendicular | random | target 17.6,-6.3,90 | 1 of 1 | 0.7 | 0.15 | 1.4 | 0.48 | 1 | 0 | 37 |
+| perpendicular | both | default | 4 of 4 | 1.8 | 0.37 | 3.5 | 0.42 | 1 to 2 | 0 | 35 |
+| perpendicular | left | default | 4 of 4 | 1.4 | 0.28 | 3.7 | 0.44 | 1 | 0 | 29 |
+| perpendicular | none | default | 4 of 4 | 1.2 | 0.17 | 3.3 | 0.46 | 1 | 0 | 30 |
+| perpendicular | random | default | 4 of 4 | 2.2 | 0.40 | 3.6 | 0.45 | 1 | 0 | 31 |
+| perpendicular | right | default | 4 of 4 | 2.7 | 0.43 | 2.2 | 0.47 | 1 | 0 | 37 |
+| perpendicular | both | noise 2 | 1 of 1 | 1.5 | 0.14 | 10.5 | 0.60 | 1 | 0 | 33 |
+| perpendicular | both | park forward | 1 of 1 | 0.4 | 0.22 | 0.9 | 0.31 | 4 | 0 | 47 |
+| perpendicular | both | side left | 1 of 1 | 1.2 | 0.22 | 0.9 | 0.42 | 1 | 0 | 36 |
+| perpendicular | random | target 17.6,-6.3,90 | 1 of 1 | 0.7 | 0.16 | 3.9 | 0.45 | 1 | 0 | 37 |
 | perpendicular | none | target 6.0,0.5,25, no-snap | 1 of 1 | 0.3 | 0.00 | 0.5 | n/a | 1 | 0 | 25 |
-| perpendicular | both | tire pac02 | 1 of 1 | 0.3 | 0.03 | 1.1 | 0.47 | 3 | 0 | 41 |
-| angled | both | default | 4 of 4 | 1.0 | 1.46 | 0.6 | 0.57 | 1 to 2 | 1 | 32 |
-| angled | left | default | 4 of 4 | 0.3 | 1.29 | 1.4 | 0.47 | 1 to 2 | 0 | 27 |
-| angled | none | default | 4 of 4 | 1.2 | 0.58 | 4.3 | 0.65 | 0 to 1 | 0 | 19 |
-| angled | random | default | 4 of 4 | 0.2 | 1.20 | 3.8 | 0.55 | 0 to 2 | 0 | 27 |
-| angled | right | default | 4 of 4 | 0.5 | 0.92 | 3.7 | 0.57 | 1 | 0 | 34 |
-| angled | both | angle 45 | 1 of 1 | 0.7 | 0.12 | 0.9 | 0.71 | 1 | 0 | 28 |
-| angled | both | noise 2 | 1 of 1 | 3.1 | 0.61 | 9.2 | 0.60 | 1 | 0 | 29 |
-| angled | both | side left | 1 of 1 | 0.4 | 0.17 | 3.5 | 0.33 | 1 | 0 | 28 |
-| angled | both | tire pac02 | 1 of 1 | 0.8 | 1.26 | 1.2 | 0.62 | 1 | 0 | 28 |
-| parallel | both | default | 4 of 4 | 2.4 | 0.21 | 0.9 | 0.27 | 2 | 0 | 43 |
-| parallel | left | default | 4 of 4 | 2.5 | 0.16 | 3.9 | 0.26 | 1 to 2 | 0 | 35 |
-| parallel | none | default | 4 of 4 | 2.5 | 0.04 | 0.5 | 0.27 | 2 | 0 | 35 |
-| parallel | random | default | 4 of 4 | 2.4 | 0.19 | 1.2 | 0.27 | 2 | 0 | 41 |
-| parallel | right | default | 4 of 4 | 2.4 | 0.02 | 0.6 | 0.27 | 2 | 0 | 48 |
-| parallel | both | noise 2 | 1 of 1 | 2.4 | 0.19 | 4.2 | 0.24 | 2 | 0 | 42 |
-| parallel | both | side left | 1 of 1 | 2.2 | 0.23 | 0.0 | 0.31 | 2 | 0 | 43 |
-| parallel | both | target 18.0,-3.0,0 | 1 of 1 | 2.4 | 0.01 | 1.4 | 0.23 | 2 | 0 | 40 |
-| parallel | both | tire pac02 | 1 of 1 | 2.3 | 0.22 | 4.3 | 0.32 | 4 | 0 | 51 |
+| perpendicular | both | tire pac02 | 1 of 1 | 0.3 | 0.16 | 3.0 | 0.45 | 3 | 0 | 42 |
+| angled | both | default | 4 of 4 | 1.0 | 1.50 | 1.0 | 0.57 | 1 to 2 | 1 | 32 |
+| angled | left | default | 4 of 4 | 1.0 | 1.31 | 2.8 | 0.47 | 1 to 2 | 0 | 27 |
+| angled | none | default | 4 of 4 | 1.1 | 0.63 | 4.0 | 0.65 | 0 to 1 | 0 | 19 |
+| angled | random | default | 4 of 4 | 0.3 | 1.21 | 4.2 | 0.56 | 0 to 2 | 0 | 27 |
+| angled | right | default | 4 of 4 | 1.0 | 0.81 | 3.6 | 0.57 | 1 | 0 | 34 |
+| angled | both | angle 45 | 1 of 1 | 0.5 | 0.12 | 1.6 | 0.70 | 1 | 0 | 28 |
+| angled | both | noise 2 | 1 of 1 | 1.3 | 0.02 | 2.3 | 0.62 | 2 | 1 | 36 |
+| angled | both | side left | 1 of 1 | 0.1 | 0.01 | 0.7 | 0.33 | 1 | 0 | 28 |
+| angled | both | tire pac02 | 1 of 1 | 0.7 | 1.25 | 6.1 | 0.62 | 1 | 0 | 28 |
+| parallel | both | default | 4 of 4 | 2.4 | 0.26 | 1.0 | 0.11 | 2 | 0 | 43 |
+| parallel | left | default | 4 of 4 | 2.5 | 0.24 | 2.0 | 0.26 | 1 to 2 | 0 | 35 |
+| parallel | none | default | 4 of 4 | 2.5 | 0.04 | 0.7 | 0.27 | 2 | 0 | 36 |
+| parallel | random | default | 4 of 4 | 2.3 | 0.23 | 1.2 | 0.16 | 2 | 0 | 40 |
+| parallel | right | default | 4 of 4 | 2.5 | 0.04 | 0.8 | 0.27 | 2 | 0 | 49 |
+| parallel | both | noise 2 | 1 of 1 | 2.8 | 0.47 | 1.3 | 0.25 | 4 | 0 | 50 |
+| parallel | both | side left | 1 of 1 | 2.3 | 0.10 | 0.2 | 0.27 | 2 | 0 | 43 |
+| parallel | both | target 18.0,-3.0,0 | 1 of 1 | 2.4 | 0.03 | 1.7 | 0.22 | 2 | 0 | 40 |
+| parallel | both | tire pac02 | 1 of 1 | 2.4 | 0.04 | 4.1 | 0.23 | 2 | 0 | 45 |
 
 </details>
 

@@ -61,6 +61,7 @@ python parking_sim.py --headless --seed 7 --noise 2     # no window, prints a re
 | --- | --- | --- |
 | `--sensors` | `camera`, `camera+lidar`, `sim` | what the car perceives with. Default: `camera` if the PyChrono has the sensors and the depth networks are set up, else `sim` |
 | `--stereo` | `igev`, `rt` | stereo network: IGEV++, or its real-time version, three times faster |
+| `--stereo-hz`, `--mono-hz` | per second, default 5 | how often the stereo network and the monocular network run, up to the 10 frames per second of the cameras. The maps add up time, not frames, so nothing is tuned to a rate: see [docs/sensors.md](docs/sensors.md#how-often-the-networks-run) |
 | `--sky` | `clear`, `low`, `overcast` | light for the sensors: sun at 41 degrees, sun at 32 degrees, or a grey sky. Default: by the seed |
 | `--depth-host` | ssh host | run the depth networks on another machine, see [docs/sensors.md](docs/sensors.md#what-it-needs) |
 | `--type` | `perpendicular`, `angled`, `parallel` | kind of stalls |
@@ -124,21 +125,24 @@ identified online while it drives.
 A run counts as parked when the car ends inside the lines of a free stall without having touched
 anything. All offsets are measured against the ground-truth stall.
 
-| Perception | Parked, runs the rules were fixed on | Parked, unseen seeds | Lateral offset | Heading error | Smallest clearance |
-| --- | --- | --- | --- | --- | --- |
-| cameras: stereo pair, rear, bumper | 42 of 42 | 34 of 36 | at most 7.9 cm | at most 2.48 deg | 0.17 m |
-| cameras + forward lidar | 18 of 18 | 9 of 9 | at most 5.6 cm | at most 1.44 deg | 0.12 m |
-| stand-in, no sensors | 74 of 74 | | at most 3.1 cm | at most 1.46 deg | 0.23 m |
+| Perception | Parked, seeds 1 to 3 | Seeds 4 to 6 | Unseen seeds 7 to 9 | Lateral offset | Heading error | Smallest clearance |
+| --- | --- | --- | --- | --- | --- | --- |
+| cameras: stereo pair, rear, bumper | 42 of 42 | 35 of 36 | 36 of 36 | at most 6.0 cm | at most 1.20 deg | 0.17 m |
+| cameras + forward lidar | 18 of 18 | 9 of 9 | 9 of 9 | at most 6.7 cm | at most 0.94 deg | 0.15 m |
+| stand-in, no sensors | 74 of 74 | | | at most 2.8 cm | at most 1.50 deg | 0.11 m |
 
 
 The rig was run on perpendicular, angled and parallel stalls with cars on both sides, one side
-or none, under a clear sky, a low sun and an overcast sky, and at double sensor noise. It took
-three batches to get there: the first parked 58 of 60 and the second 59, and each miss was a rule
-of the stall inference meeting worn paint or a shadow, which was then changed. So those 60 are
-the runs the rules were fixed on. On 45 runs with seeds that had never been run, made once afterwards, it parked 43: in the other two the car drove past a free stall whose line stubs it had sighted too few times. The stand-in was run on the 74 scenarios of
-the earlier versions. A run with the rig takes 3 to 4 minutes, most of it in the stereo network,
-which is why it has fewer runs. [docs/results.md](docs/results.md) has every row and the limits,
-and [docs/sensors.md](docs/sensors.md#how-good-it-is) measures the perception itself: range,
+or none, under a clear sky, a low sun and an overcast sky, and at double sensor noise. Seeds 1 to
+6 are runs the method was fixed on: each batch that missed a run led to a change, the last of
+them from counting camera frames to adding up time, so that nothing is tuned to how often the
+networks run. Seeds 7 to 9 had never been run and were made once with the final code. The one
+run that did not park stopped in mid-manoeuvre with no way on, 1.1 m from anything: the stereo
+network had put the edge of the car's own bonnet into the map as an obstacle while the car stood
+still. The stand-in was run on the 74 scenarios of the earlier versions. A run with the rig takes
+two to four minutes, most of it in the stereo network, which is why it has fewer runs, and it
+can be repeated exactly. [docs/results.md](docs/results.md) has every row and the limits, and
+[docs/sensors.md](docs/sensors.md#how-good-it-is) measures the perception itself: range,
 obstacles and lines against the geometry of the scenario.
 
 ## Layout
@@ -163,5 +167,6 @@ tests/test_core.py              checks of the planner curves, the MPC solver, th
 docs/                           design documents and figures
 docs/make_figures.py            regenerates the figures of the pipeline from real runs
 docs/make_sensor_figures.py     regenerates the sensor figures from real runs and measures the perception
+docs/rate_check.py              replays recorded drives at several network rates: the choice of stall must not depend on the rate
 docs/pychrono-rt-sensors.patch  Python bindings for Chrono's ray-traced sensors with Metal RT and Vulkan RT
 ```
