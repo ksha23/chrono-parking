@@ -97,6 +97,11 @@ def find_slots(tracks, trail, grid, stubs=False):
     tick = 1.2 if stubs else 1.5
     n = len(tracks)
     trail = np.asarray(trail)
+    # the direction across the lane, from the way the car has come: stalls open onto the lane
+    lane = None
+    if len(trail) >= 2 and np.hypot(*(trail[-1] - trail[0])) > 2.0:
+        along = (trail[-1] - trail[0]) / np.hypot(*(trail[-1] - trail[0]))
+        lane = np.array([-along[1], along[0]])
     for i in range(n):
         for j in range(i + 1, n):
             a, b = tracks[i], tracks[j]
@@ -158,6 +163,17 @@ def find_slots(tracks, trail, grid, stubs=False):
                 u_in, in_a, in_b, bk_a, bk_b = -d, -sa[1], -sb[1], -sa[0], -sb[0]
             nu = np.array([-u_in[1], u_in[0]])
             la, lb = a.c @ nu, b.c @ nu
+            if stubs and lane is not None and abs(u_in @ lane) > 0.3:
+                # The two lines of a stall start on one line along the lane. If one was seen to
+                # start up to 0.75 m further in than the other, its first piece is worn off or was
+                # lost in a shadow, and the stall starts where the other one does. (This goes by
+                # where the paint was seen, not by the extent assumed above for a partly seen line.)
+                oa, ob = (min(q @ u_in for q in t.ends()) for t in (a, b))
+                late = ((u_in * oa + nu * la) - (u_in * ob + nu * lb)) @ lane / (u_in @ lane)
+                if 0.1 < late < 0.75:
+                    in_a = oa - late
+                elif -0.75 < late < -0.1:
+                    in_b = ob + late
             s0, s1 = max(in_a, in_b), min(bk_a, bk_b)
             if partial and not parallel and s1 < s0 + EGO.length + 0.7:
                 # the far end of the lines is out of sight: take the stall to be deep enough for the car
