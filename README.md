@@ -124,23 +124,22 @@ identified online while it drives.
 A run counts as parked when the car ends inside the lines of a free stall without having touched
 anything. All offsets are measured against the ground-truth stall.
 
-| Perception | Parked | Lateral offset | Heading error | Smallest clearance |
-| --- | --- | --- | --- | --- |
-| cameras: stereo pair, rear, bumper | 40 of 42 | at most 8.0 cm | at most 2.44 deg | 0.18 m |
-| cameras + forward lidar | 18 of 18 | at most 5.9 cm | at most 0.81 deg | 0.21 m |
-| stand-in, no sensors | 74 of 74 | at most 3.1 cm | at most 1.46 deg | 0.23 m |
+| Perception | Parked, runs the rules were fixed on | Parked, unseen seeds | Lateral offset | Heading error | Smallest clearance |
+| --- | --- | --- | --- | --- | --- |
+| cameras: stereo pair, rear, bumper | 42 of 42 | 34 of 36 | at most 7.9 cm | at most 2.48 deg | 0.17 m |
+| cameras + forward lidar | 18 of 18 | 9 of 9 | at most 5.6 cm | at most 1.44 deg | 0.12 m |
+| stand-in, no sensors | 74 of 74 | | at most 3.1 cm | at most 1.46 deg | 0.23 m |
 
 
 The rig was run on perpendicular, angled and parallel stalls with cars on both sides, one side
-or none, under a clear sky, a low sun and an overcast sky, and at double sensor noise. The two
-runs that did not park are parallel stalls with a car on one side, where the stall was never
-recognised: a tick line seen in two pieces, and one half hidden by the parked car. Both are
-fixed in the commit after this batch and park with it. The stand-in was run on the 74 scenarios
-of the earlier versions. A run with the rig takes 3 to 4 minutes, most of it in the stereo
-network, which is why it has fewer runs.
-[docs/results.md](docs/results.md) has every row and the limits, and
-[docs/sensors.md](docs/sensors.md#how-good-it-is) measures the perception itself: range, obstacles
-and lines against the geometry of the scenario.
+or none, under a clear sky, a low sun and an overcast sky, and at double sensor noise. It took
+three batches to get there: the first parked 58 of 60 and the second 59, and each miss was a rule
+of the stall inference meeting worn paint or a shadow, which was then changed. So those 60 are
+the runs the rules were fixed on. On 45 runs with seeds that had never been run, made once afterwards, it parked 43: in the other two the car drove past a free stall whose line stubs it had sighted too few times. The stand-in was run on the 74 scenarios of
+the earlier versions. A run with the rig takes 3 to 4 minutes, most of it in the stereo network,
+which is why it has fewer runs. [docs/results.md](docs/results.md) has every row and the limits,
+and [docs/sensors.md](docs/sensors.md#how-good-it-is) measures the perception itself: range,
+obstacles and lines against the geometry of the scenario.
 
 ## Layout
 
