@@ -153,8 +153,14 @@ clean:
   band-limited noise generated once into a 1024 x 1024 image that repeats every 6 m. Its
   reflectance is 0.16 on average. Kerbs are concrete and the ground beside the lot is grass, both
   textured the same way.
-- **Paint.** Every line is laid down in half-metre pieces. Each piece is worn to a reflectance
-  between 0.5 and 0.8 and is up to 10 percent narrower than new, and 4 percent of them are gone.
+- **Paint.** No line is as it was painted (`parking/paint.py`). Every line is laid down in
+  half-metre pieces, and each piece carries an image of worn paint: patches flaked off with the
+  road showing through, ragged edges, a duller white than new. Two lines in three are worn like
+  that (reflectance 0.42 to 0.65, an eighth of the paint gone, one piece in twenty missing). One
+  in four is faded (0.32 to 0.48, a fifth gone) and one in twelve is nearly gone (0.22 to 0.32
+  against 0.16 for the road, half of it gone, one piece in five missing). A line also wanders by
+  up to a centimetre and is laid 80 to 100 percent wide. `--wear 0` gives the clean bars of flat
+  grey that the measurements on this page and in results.md were made with.
 - **Light.** A directional sun and a much weaker ambient term, so parked cars cast hard shadows
   across the stall lines. The sky is one of the HDR images that ship with Chrono, and the sun
   stands where that image has it. `--sky` picks one of three, and without it the seed does:

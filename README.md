@@ -66,7 +66,7 @@ python parking_sim.py --headless --seed 7 --noise 2     # no window, prints a re
 | `--sky` | `clear`, `low`, `overcast` | light for the sensors: sun at 41 degrees, sun at 32 degrees, or a grey sky. Default: by the seed |
 | `--pose-noise` | scale, default 0 | how well the car knows its own pose. At 1 its position is off by a slowly wandering 10 cm and its heading by 0.3 degrees, like a satellite receiver with an inertial unit, and its pitch and roll by 0.15 degrees. `--pose odometry` gives dead reckoning instead, which drifts. 0 = it knows the truth |
 | `--bumps` | cm, default 0 | how uneven the road is: up to this much up and down, in waves 6 to 25 m long. Try 1.5 |
-| `--wear` | scale, default 0 | worn paint: at 1, one line in four is faded and one in twelve is barely lighter than the road |
+| `--wear` | scale, default 1 | worn paint: every line is patchy with ragged edges, one in four is faded and one in twelve is barely lighter than the road. 0 = clean bars, as the results below were measured with |
 | `--depth-host` | ssh host | run the depth networks on another machine, see [docs/sensors.md](docs/sensors.md#what-it-needs) |
 | `--type` | `perpendicular`, `angled`, `parallel` | kind of stalls |
 | `--cars` | `both`, `left`, `right`, `none`, `random` | parked cars next to the free stall, seen from the lane looking into it |
@@ -127,7 +127,9 @@ identified online while it drives.
 ## Results
 
 A run counts as parked when the car ends inside the lines of a free stall without having touched
-anything. All offsets are measured against the ground-truth stall.
+anything. All offsets are measured against the ground-truth stall. The numbers below were measured
+with clean paint (`--wear 0`). The lines are worn by default now, and the set has not been run
+again with that yet.
 
 | Perception | Parked, seeds 1 to 3 | Seeds 4 to 6 | Unseen seeds 7 to 9 | Lateral offset | Heading error | Smallest clearance |
 | --- | --- | --- | --- | --- | --- | --- |

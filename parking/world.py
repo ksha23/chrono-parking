@@ -11,6 +11,7 @@ import numpy as np
 from .chrono_env import chrono, sens, veh
 from .config import STEP
 from .ground import Ground
+from .paint import lay, paint_textures
 from .scenario import parked_model
 from .vehicle import EGO
 
@@ -111,6 +112,7 @@ class World:
     def __init__(self, scn, visual=True, tire="tmeasy", wear=1.0, bumps=0.0):
         self.scn, self.wear = scn, wear
         self.ground = Ground(scn.bounds, bumps, getattr(scn, "seed", 0))
+        self.materials = {}
         x, y, th = scn.start
         sedan = veh.Sedan()
         sedan.SetContactMethod(chrono.ChContactMethod_SMC)
@@ -207,12 +209,19 @@ class World:
         shape = chrono.ChVisualShapeBox(lx, ly, lz)
         if surface is None:
             shape.SetColor(chrono.ChColor(*rgb))
-        else:
+        elif surface in self.surfaces:       # one of the ground images, repeated over the box
             mat = chrono.ChVisualMaterial()
             mat.SetKdTexture(self.surfaces[surface])
             mat.SetTextureScale(max(lx / (0.5 * SURFACE_TILE), 0.2), max(ly / (0.5 * SURFACE_TILE), 0.2))
             mat.SetRoughness(0.9)
             shape.AddMaterial(mat)
+        else:                                # an image file that covers the box once (one material per image)
+            if surface not in self.materials:
+                mat = chrono.ChVisualMaterial()
+                mat.SetKdTexture(surface)
+                mat.SetRoughness(0.9)
+                self.materials[surface] = mat
+            shape.AddMaterial(self.materials[surface])
         body.AddVisualShape(shape, chrono.ChFramed(chrono.ChVector3d(*pos), chrono.QuatFromAngleZ(yaw)))
 
     def _decor(self, visual):
@@ -220,32 +229,30 @@ class World:
             return
         body = chrono.ChBody()
         body.SetFixed(True)
-        # Paint is laid down in half-metre pieces: each is worn to a different grey and a little
-        # narrower than new, and a few are gone. Some lines are worn more than the rest, as where
-        # cars have driven over them for years: one line in four is faded to between 55 and 85
-        # percent of its brightness and has lost one piece in ten, and one in twelve is down to
-        # between 40 and 55 percent, barely lighter than the road, with one piece in five gone.
-        rng = np.random.default_rng(1000 + getattr(self.scn, "seed", 0))
-        old = np.random.default_rng(2000 + getattr(self.scn, "seed", 0))       # (its own stream: wear 0 is the paint as it was)
         dip = self.ground.amp
-        for x1, y1, x2, y2, color in self.scn.lines:
-            length, yaw = math.hypot(x2 - x1, y2 - y1), math.atan2(y2 - y1, x2 - x1)
-            n = max(1, int(round(length / 0.5)))
-            kind, fade, lost = old.random(), old.random(), old.random(n)
-            fade, lose = ((0.40 + 0.15 * fade, 0.20) if kind < 1.0 / 12.0 else
-                          (0.55 + 0.30 * fade, 0.10) if kind < 1.0 / 3.0 else (1.0, 0.0))
-            fade, lose = 1.0 - self.wear * (1.0 - fade), self.wear * lose
-            for k in range(n):
-                v, wide, gone = rng.uniform(0.50, 0.80), 0.12 * rng.uniform(0.9, 1.0), rng.random() < 0.04
-                v *= fade
-                if gone or lost[k] < lose:
-                    continue
-                f = (k + 0.5) / n
-                px, py = x1 + f * (x2 - x1), y1 + f * (y2 - y1)
-                # (on an uneven road a piece lies on the surface under its middle, a little proud of it)
-                pz = 0.003 if dip == 0.0 else self.ground.height(px, py) + 0.005
-                self._box(body, length / n + 0.004, wide, 0.004, (px, py, pz), yaw,
-                          (v, v, v) if color == "white" else (v, 0.80 * v, 0.10 * v))
+        if self.wear > 0.0:
+            # worn paint: patchy, ragged at the edges, some lines faded or nearly gone (paint.py)
+            images = paint_textures(write_png)
+            for px, py, yaw, length, wide, colour, state, level, variant in lay(self.scn.lines, self.wear, getattr(self.scn, "seed", 0)):
+                self._box(body, length, wide, 0.004, (px, py, self.ground.height(px, py) + (0.005 if dip else 0.003)), yaw,
+                          (1.0, 1.0, 1.0), images[(colour, state, level, variant)])
+        else:
+            # paint as it was before it could wear: half-metre pieces, each one flat grey and a
+            # little narrower than new, a few gone
+            rng = np.random.default_rng(1000 + getattr(self.scn, "seed", 0))
+            for x1, y1, x2, y2, color in self.scn.lines:
+                length, yaw = math.hypot(x2 - x1, y2 - y1), math.atan2(y2 - y1, x2 - x1)
+                n = max(1, int(round(length / 0.5)))
+                for k in range(n):
+                    v, wide, gone = rng.uniform(0.50, 0.80), 0.12 * rng.uniform(0.9, 1.0), rng.random() < 0.04
+                    if gone:
+                        continue
+                    f = (k + 0.5) / n
+                    px, py = x1 + f * (x2 - x1), y1 + f * (y2 - y1)
+                    # (on an uneven road a piece lies on the surface under its middle, a little proud of it)
+                    pz = 0.003 if dip == 0.0 else self.ground.height(px, py) + 0.005
+                    self._box(body, length / n + 0.004, wide, 0.004, (px, py, pz), yaw,
+                              (v, v, v) if color == "white" else (v, 0.80 * v, 0.10 * v))
         # (kerbs and the ground beside the lot keep their tops and reach down below the lowest road)
         for cx, cy, lx, ly in self.scn.curbs:
             self._box(body, lx, ly, 0.15 + dip, (cx, cy, 0.075 - 0.5 * dip), 0.0, (0.66, 0.66, 0.64), "concrete")

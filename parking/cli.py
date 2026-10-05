@@ -71,11 +71,12 @@ def parse_args(argv=None):
     ap.add_argument("--igev", default=None, metavar="DIR",
                     help="checkout of the IGEV++ repository with its weights (default: third_party/IGEV-plusplus)")
     ap.add_argument("--noise", type=float, default=1.0, help="perception noise scale (0 = perfect)")
-    # The next four make the world less kind. They are off by default until the whole set of
-    # scenarios has been run with them: the results in the docs were measured without.
-    ap.add_argument("--wear", type=float, default=0.0,
-                    help="how worn the paint is: at 1, one line in four is faded and one in twelve is barely "
-                         "lighter than the road. 0 (default) = every line as good as the next")
+    ap.add_argument("--wear", type=float, default=1.0,
+                    help="how worn the paint is. At 1 (default) every line is patchy and ragged, one in four is "
+                         "faded and one in twelve is barely lighter than the road. Between 0 and 1 fewer are "
+                         "faded. 0 = clean bars of flat grey, as the results in the docs were measured with")
+    # The next three make the world less kind as well. They are off by default until the whole
+    # set of scenarios has been run with them.
     ap.add_argument("--bumps", type=float, default=0.0, metavar="CM",
                     help="how uneven the road is: it rises and falls by up to this much, in waves 6 to 25 m long "
                          "(try 1.5). 0 (default) = a perfect plane")

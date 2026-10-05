@@ -20,6 +20,7 @@ from parking.geometry import footprint_hits, poly_distance, rect_poly, wrap
 from parking.ground import Ground
 from parking.localization import Localization
 from parking.mapping import GridMap, LineMap, LineTrack
+from parking.paint import STATES, lay, paint_textures
 from parking.perception import _rot_y, paint_segments, pinhole_rays, planar_scan
 from parking.reeds_shepp import rs_length_table, rs_paths, rs_sample
 from parking.sensors import SensorRig
@@ -461,6 +462,23 @@ def test_own_pose():
     print("the car's own pose and the uneven road: ok")
 
 
+def test_worn_paint():
+    """No line is perfect: the pieces of a line, and the images of worn paint."""
+    from parking.world import write_png
+    lines = [(float(k), 0.0, float(k), 5.5, "white") for k in range(600)]
+    pieces = lay(lines, 1.0, 3)
+    state = np.array([q[6] for q in pieces])
+    share = [(state == k).mean() for k in range(len(STATES))]
+    assert 0.5 < share[0] < 0.7 and 0.2 < share[1] < 0.35 and 0.07 < share[2] < 0.2, share       # (one piece in seven is a state worse than its line)
+    assert 0.85 * 600 * 11 < len(pieces) < 0.96 * 600 * 11, "some pieces are gone, most are there"
+    off = np.array([q[0] - round(q[0]) for q in pieces])
+    assert 0.002 < np.abs(off).max() <= 0.0101 and all(0.09 < q[4] < 0.125 for q in pieces)       # wanders, never wider than new
+    assert max(q[6] for q in lay(lines, 0.0, 3)) <= 1, "with no extra wear no line is nearly gone"
+    files = paint_textures(write_png)
+    assert len(files) == 2 * len(STATES) * 3 * 3 and all(os.path.getsize(f) > 300 for f in files.values())
+    print("worn paint: ok")
+
+
 def test_surfaces():
     """The road surface images exist, are PNG files and have the reflectance of asphalt."""
     files = surface_textures()
@@ -490,5 +508,6 @@ if __name__ == "__main__":
     test_lines_in_pieces()
     test_half_seen_stall()
     test_own_pose()
+    test_worn_paint()
     test_surfaces()
     print("all checks passed")
