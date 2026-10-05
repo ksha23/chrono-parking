@@ -664,7 +664,7 @@ made of that data shows up in three more places:
   - *Its speed.* From a wheel encoder on the rear axle: a count every 2.2 cm, the speed from
     the time between counts.
   - *The lane.* It assumes it starts on a lane and aligned with it, with stalls on either side.
-    It searches straight ahead for 40 m and stops if something is in the way.
+    It searches straight ahead for 70 m and stops if something is in the way.
   - *The lot.* It maps a fixed area around where it started, not the extent of the scenario.
   - *The road and the paint.* The road rises and falls by 1.5 cm (`parking/ground.py`) and no
     line is as it was painted (`parking/paint.py`).

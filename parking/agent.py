@@ -49,8 +49,8 @@ def start_depth_worker(args):
 
 class ParkingSim:
     MAX_REPLANS = 6
-    SEARCH_REACH = 40.0      # how far along the lane the car looks for a stall [m]
-    MAP = (20.0, 45.0, 15.0)     # the map covers this much behind, ahead and to each side of where the car starts [m]
+    SEARCH_REACH = 70.0      # how far along the lane the car looks for a stall [m]
+    MAP = (20.0, 80.0, 15.0)     # the map covers this much behind, ahead and to each side of where the car starts [m]
     MAX_CORRECTIONS = 2
 
     def __init__(self, args):
