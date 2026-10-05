@@ -47,6 +47,12 @@ def parse_args(argv=None):
     ap.add_argument("--stereo", choices=("igev", "rt"), default="igev",
                     help="stereo network: IGEV++ or its real-time version, which is three times faster and "
                          "a little less accurate")
+    ap.add_argument("--stereo-hz", type=float, default=5.0,
+                    help="how often the stereo network runs, up to the 10 frames per second of the cameras. "
+                         "The default is what IGEV++ reaches in real time on a desktop GPU. The method does not "
+                         "count frames, so nothing has to be retuned for another rate")
+    ap.add_argument("--mono-hz", type=float, default=5.0,
+                    help="how often the monocular network runs on the single cameras")
     ap.add_argument("--sky", choices=("auto",) + tuple(SKIES), default="auto",
                     help="light for the sensors: a clear sky with the sun at 41 degrees, a low sun at 32 degrees, "
                          "or an overcast sky. auto picks by the seed")

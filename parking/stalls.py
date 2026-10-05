@@ -21,7 +21,7 @@ class Slot:
         self.corners = corners      # entrance A, entrance B, back B, back A
         self.status = Slot.UNKNOWN
         self.neighbors = [False, False]
-        self.hits = 0               # detections behind the weaker of the two lines
+        self.watched = 0.0          # for how long the less watched of its two lines has been watched [s]
         self.region = None          # (mask, slices) of the grid cells between the two lines
 
     def goal(self, nose_in, travel_dir):
@@ -45,7 +45,7 @@ class JoinedLine:
         w = np.array([t.length for t in parts])
         across = float(sum(wi * (t.c @ n) for wi, t in zip(w, parts)) / w.sum())
         s = np.array([q @ d for t in parts for q in t.ends()])
-        self.d, self.hits, self.length = d, sum(t.hits for t in parts), float(s.max() - s.min())
+        self.d, self.watched, self.length = d, max(t.watched for t in parts), float(s.max() - s.min())
         self.c = 0.5 * (s.max() + s.min()) * d + across * n
         self._ends = (s.min() * d + across * n, s.max() * d + across * n)
 
@@ -128,12 +128,22 @@ def find_slots(tracks, trail, grid, stubs=False):
                 # matching end of the longer one (further off the more the stalls are angled)
                 lng, sht = (sa, sb) if a.length > b.length else (sb, sa)
                 reach = 1.2 * abs(sep) + 0.5
-                if lng[0] - reach < sht[0] < lng[0] + 1.5:
-                    sht = np.array([sht[0], sht[0] + lng[1] - lng[0]])      # as deep as the longer one
-                elif lng[1] - 1.5 < sht[1] < lng[1] + reach:
-                    sht = np.array([sht[1] - lng[1] + lng[0], sht[1]])
-                else:
+                end = None
+                if lane is not None and abs(d @ lane) > 0.3:
+                    # The ends of the two lines lie on a line along the lane, at the mouth and at
+                    # the back. That says how far apart they are lengthwise, whatever the angle
+                    # of the stalls: 1.56 m at 60 degrees, where a fixed window just misses it.
+                    side = sep if a.length > b.length else -sep           # from the longer line to the shorter
+                    shift = -side * (nv @ lane) / (d @ lane)
+                    end = 0 if abs(sht[0] - lng[0] - shift) < 0.75 else 1 if abs(sht[1] - lng[1] - shift) < 0.75 else None
+                if end is None:
+                    end = 0 if lng[0] - reach < sht[0] < lng[0] + 1.5 else 1 if lng[1] - 1.5 < sht[1] < lng[1] + reach else None
+                if end is None:
                     continue
+                if end == 0:
+                    sht = np.array([sht[0], sht[0] + lng[1] - lng[0]])      # as deep as the longer one
+                else:
+                    sht = np.array([sht[1] - lng[1] + lng[0], sht[1]])
                 sa, sb = (lng, sht) if a.length > b.length else (sht, lng)
                 parallel = False
             elif 2.2 <= abs(sep) <= 3.5 and whole:
@@ -190,7 +200,7 @@ def find_slots(tracks, trail, grid, stubs=False):
                 skew = abs(in_a - in_b) / max(abs(la - lb), 1e-6)
                 slot = Slot("perpendicular" if skew < 0.2 else "angled",
                             u_in * s_c + nu * 0.5 * (la + lb), u_in, nu, abs(sep), s1 - s0, corners)
-            slot.hits = min(a.hits, b.hits)
+            slot.watched = min(a.watched, b.watched)
             _classify(slot, grid, s0, s1, min(la, lb), max(la, lb), deep=stubs and not parallel)
             if parallel:
                 _align_with_kerb(slot, grid, s1, min(la, lb), max(la, lb))
@@ -245,9 +255,7 @@ def _classify(slot, grid, s0, s1, l0, l1, deep=False):
     S = X * u[0] + Y * u[1]
     Lc = X * nu[0] + Y * nu[1]
     occ = grid.occupied()[sl]
-    # (ground seen from too far to rule out a kerb also counts here: a parked car stands tall
-    # enough to be recognised at that range, and it is a parked car this test is about)
-    free = ((grid.free[sl] >= 2) | ((grid.far[sl] >= 3) & (grid.stop[sl] == 0))) & ~occ
+    free = grid.clear()[sl]
     lat = 0.35 if slot.kind != "parallel" else 0.6
     back = 0.45
     inside = (S > s0 + 0.1) & (S < s1 - back) & (Lc > l0 + lat) & (Lc < l1 - lat)

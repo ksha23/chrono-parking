@@ -105,7 +105,7 @@ def run(kind, cars, seed=1):
             rec["plan"] = dict(pose=sim.pose, occ=occ, occupied=sim.grid.occupied().copy(), free=sim.grid.free.copy(),
                                segs=[(s.x.copy(), s.y.copy(), s.th.copy(), s.dir) for s in sim.path], goal=sim.goal,
                                explored=sim.plan_info["explored"].copy(), stats=dict(sim.plan_info),
-                               tracks=[(t.ends(), t.hits) for t in sim.lines.tracks],
+                               tracks=[(t.ends(), t.watched) for t in sim.lines.tracks],
                                slots=[(s.corners.copy(), s.status, s.center.copy(), s.u_in.copy(), s is sim.target) for s in sim.slots])
         # an MPC solve in the middle of a curvature change makes the most instructive example
         if rec["mpc"] is None and sim.state == "DRIVE" and len(trk.k_ref) and np.ptp(trk.k_ref) > 0.1 and abs(sim.speed) > 0.5:
@@ -150,7 +150,7 @@ def fig_perception(rec):
         ax.set_xlim(fr["pose"][0] - 13, fr["pose"][0] + 17)
         ax.set_ylim(-10.5, 10.5)
     ax = axes[0]
-    for x1, y1, x2, y2, r in fr["dets"]:
+    for x1, y1, x2, y2, r, _ in fr["dets"]:
         ax.plot([x1, x2], [y1, y2], color=C["det"], lw=2.0, zorder=4)
     ax.add_patch(plt.Circle((fr["pose"][0] + EGO.center * math.cos(fr["pose"][2]), fr["pose"][1]), Perception.LINE_RANGE,
                             fc="none", ec=C["grey"], ls=":", lw=0.8))
@@ -171,13 +171,13 @@ def fig_mapping(rec):
     ax = axes[0]
     img = np.zeros(pl["occ"].shape + (3,))
     img[:] = (1.0, 1.0, 1.0)
-    img[pl["free"] < 1] = (0.80, 0.82, 0.85)
+    img[pl["free"] <= 0.0] = (0.80, 0.82, 0.85)          # never seen free
     img[pl["occupied"]] = (0.85, 0.25, 0.17)
     ax.imshow(img, origin="lower", extent=extent(g), interpolation="nearest")
     for x1, y1, x2, y2, _ in sim.scn.lines:
         ax.plot([x1, x2], [y1, y2], color="#b9bdc4", lw=0.8)
     for (a, b), hits in pl["tracks"]:
-        ax.plot([a[0], b[0]], [a[1], b[1]], color=C["track"] if hits >= LineMap.MIN_HITS else "#9fd8e6", lw=2.2 if hits >= 5 else 1.0)
+        ax.plot([a[0], b[0]], [a[1], b[1]], color=C["track"] if hits >= LineMap.MIN_WATCH else "#9fd8e6", lw=2.2 if hits >= LineMap.MIN_WATCH else 1.0)
     outline(ax, ego_poly(pl["pose"]), color=C["car"], lw=1.5)
     ax.set_title("map when the car stops to plan: seen free (white), never seen (grey), obstacle cells (red), line tracks (cyan)")
     ax = axes[1]

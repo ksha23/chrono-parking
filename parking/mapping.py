@@ -4,24 +4,32 @@ import math
 
 import numpy as np
 
+from .config import FRAME_MAX, PERCEPTION_DT
 from .vehicle import EGO
 
 
 class GridMap:
+    """What the sensors have seen of the ground, in cells. Each cell holds for how long it has been
+    seen as an obstacle and for how long as free ground, in seconds: a frame adds the time it
+    stands for (the time since the frame before it from the same sensor), not a count of one. What
+    the map believes therefore does not depend on how often a sensor delivers."""
     RES = 0.1
     RANGE = 20.0           # longest ray any sensor contributes
+    SURE = 0.5             # an obstacle, or free ground, is believed once seen for this long [s]
+    SURE_FAR = 1.0         # ground too far away to tell it from a kerb, once seen for this long [s]
+    EPS = 1e-3             # (sums of frame times are compared with this much slack)
 
     def __init__(self, bounds):
         self.x0, self.y0 = bounds[0], bounds[1]
         self.nx = int(math.ceil((bounds[2] - bounds[0]) / self.RES))
         self.ny = int(math.ceil((bounds[3] - bounds[1]) / self.RES))
-        self.hits = np.zeros((self.ny, self.nx), dtype=np.uint16)
-        self.free = np.zeros((self.ny, self.nx), dtype=np.uint16)
+        self.hits = np.zeros((self.ny, self.nx), dtype=np.float32)
+        self.free = np.zeros((self.ny, self.nx), dtype=np.float32)
         # A camera sees ground further than it can tell ground from a kerb. That far ground is kept
         # apart: it lets the planner use the road ahead, but it is no evidence against an obstacle,
         # and a closer look that finds something there (stop) overrules it.
-        self.far = np.zeros((self.ny, self.nx), dtype=np.uint16)
-        self.stop = np.zeros((self.ny, self.nx), dtype=np.uint16)
+        self.far = np.zeros((self.ny, self.nx), dtype=np.float32)
+        self.stop = np.zeros((self.ny, self.nx), dtype=np.float32)
         self._t = np.arange(0.1, self.RANGE, 0.2)
 
     def cells(self, x, y):
@@ -30,11 +38,13 @@ class GridMap:
         ok = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
         return ix, iy, ok
 
-    def update(self, origin, ang, r_hit, r_free, r_far=None, r_stop=None):
+    def update(self, origin, ang, r_hit, r_free, r_far=None, r_stop=None, dt=PERCEPTION_DT):
         """One planar scan: an obstacle at range r_hit along each bearing (NaN: none), and free
         space along the bearing up to r_free. Optionally, ground that looks free but is too far
         to be sure, from r_free to r_far, and the range r_stop at which something that is not
-        ground was seen. A scan counts once per cell, however many of its rays cross the cell."""
+        ground was seen. dt is the time the scan stands for. A scan counts once per cell, however
+        many of its rays cross the cell."""
+        dt = min(dt, FRAME_MAX)
         def mark(counter, m, r=None):
             if r is None:           # all cells along the rays selected by m
                 x = (origin[0] + self._t[None, :] * np.cos(ang)[:, None])[m]
@@ -44,7 +54,7 @@ class GridMap:
             ix, iy, ok = self.cells(x, y)
             once = np.zeros_like(self.free, dtype=bool)
             once[iy[ok], ix[ok]] = True
-            counter += once
+            counter[once] += dt
 
         mark(self.hits, np.isfinite(r_hit), r_hit)
         mark(self.free, self._t[None, :] < r_free[:, None])
@@ -53,7 +63,7 @@ class GridMap:
         if r_stop is not None:
             mark(self.stop, np.isfinite(r_stop), r_stop)
 
-    def mark_free(self, pose):
+    def mark_free(self, pose, dt=PERCEPTION_DT):
         """The ground the car stands on is free, whether a sensor looks at it or not."""
         x, y, th = pose
         win = self.window(x - EGO.length, y - EGO.length, x + EGO.length, y + EGO.length)
@@ -62,20 +72,33 @@ class GridMap:
         X, Y, sl = win
         c, s = math.cos(th), math.sin(th)
         lon, lat = (X - x) * c + (Y - y) * s, -(X - x) * s + (Y - y) * c
-        self.free[sl] += (lon > -EGO.rear) & (lon < EGO.front) & (np.abs(lat) < EGO.half_width)
+        self.free[sl] += dt * ((lon > -EGO.rear) & (lon < EGO.front) & (np.abs(lat) < EGO.half_width))
 
     def occupied(self):
         # a real surface stops the rays; a cell they mostly pass through only caught range noise
-        return (self.hits >= 2) & (self.hits > 0.3 * self.free)
+        return (self.hits >= self.SURE - self.EPS) & (self.hits > 0.3 * self.free)
+
+    def seen_free(self):
+        """Cells that have been seen as free ground at all."""
+        return self.free > 0.0
+
+    def clear(self):
+        """Cells seen as free ground for long enough to say that nothing stands there. Ground seen
+        from too far to rule out a kerb counts as well: what this is asked about is a parked car,
+        and that stands tall enough to be recognised at that range."""
+        return ((self.free >= self.SURE - self.EPS) | self.far_ground()) & ~self.occupied()
+
+    def far_ground(self):
+        return (self.far >= self.SURE_FAR - self.EPS) & (self.stop == 0.0)
 
     def blocked(self):
         """Planning map: cells with an obstacle in them, or that were never seen to be free
         (the far side of a parked car is unknown, not empty)."""
-        known = self.grow(self.free >= 1, 2)       # 2 cells, to close the gaps between rays
+        known = self.grow(self.seen_free(), 2)     # 2 cells, to close the gaps between rays
         if self.far.any():
             # Far ground is located to a few tens of centimetres at best: use it only 0.4 m in
             # from where it ends, so that a plan keeps that distance from what is still unknown.
-            maybe = self.grow((self.far >= 3) & (self.stop == 0), 2) & (self.stop == 0)
+            maybe = self.grow(self.far_ground(), 2) & (self.stop == 0.0)
             known |= ~self.grow(~(known | maybe), 6)
         return self.occupied() | ~known
 
@@ -115,16 +138,22 @@ class LineTrack:
     saw from further away, must not fade."""
     MAX_DETS = 160
     BIN = 0.1
+    GAP = 0.5        # a line that was out of sight for longer than this is given this much time on return [s]
+    SHOWN = 60.0     # a stretch of the line is remembered once its detections add up to this [weight x s]
 
     def __init__(self, det, t, keep=False):
         self.dets = [det]
         self.born = t
+        # For how long the line has been watched: the time between its sightings, summed. Whether
+        # a line is believed depends on this and not on the number of sightings, so it does not
+        # matter how often the perception runs or how many cameras see the line at once.
+        self.t_seen, self.watched = t, 0.0
         self.c = np.zeros(2)
         self.d = np.array([1.0, 0.0])
         self.lo = self.hi = 0.0
         self.keep = keep
         self.anchor = 0.5 * (np.array(det[0:2]) + np.array(det[2:4]))
-        self.seen = {}               # bin along the line (from the anchor) -> accumulated weight
+        self.seen = {}               # bin along the line (from the anchor) -> accumulated weight x time
         self.fit((det,))
 
     @property
@@ -138,16 +167,18 @@ class LineTrack:
     def ends(self):
         return self.c + self.lo * self.d, self.c + self.hi * self.d
 
-    def add(self, det):
+    def add(self, det, t):
+        self.watched += min(max(t - self.t_seen, 0.0), self.GAP)
+        self.t_seen = t
         self.dets.append(det)
         if len(self.dets) > self.MAX_DETS:           # forget the least informative detection
             self.dets.pop(int(np.argmax([d[4] for d in self.dets])))
         self.fit((det,))
 
     def cover(self, det, d):
-        """Record the stretch of the line that a detection shows."""
+        """Record the stretch of the line that a detection shows, for the time its frame stands for."""
         a, b = sorted(((np.array(det[0:2]) - self.anchor) @ d, (np.array(det[2:4]) - self.anchor) @ d))
-        w = 1.0 / (0.05 + 0.02 * det[4]) ** 2
+        w = min(det[5], FRAME_MAX) / (0.05 + 0.02 * det[4]) ** 2
         for k in range(int(math.floor(a / self.BIN)), int(math.floor(b / self.BIN)) + 1):
             self.seen[k] = self.seen.get(k, 0.0) + w
 
@@ -155,7 +186,7 @@ class LineTrack:
         """Weighted total least squares line + extent from the coverage of the detections.
         fresh: the detections that are new since the last fit."""
         D = np.asarray(self.dets)
-        w = 1.0 / (0.05 + 0.02 * D[:, 4]) ** 2
+        w = np.minimum(D[:, 5], FRAME_MAX) / (0.05 + 0.02 * D[:, 4]) ** 2
         P = np.concatenate([D[:, 0:2], D[:, 2:4]])
         W = np.concatenate([w, w])
         c = (P * W[:, None]).sum(0) / W.sum()
@@ -190,7 +221,7 @@ class LineTrack:
                 self.cover(det, d)
             ks = np.array(sorted(self.seen))
             ws = np.array([self.seen[k] for k in ks])
-            ks = ks[ws >= min(0.25 * ws.max(), 150.0)]
+            ks = ks[ws >= min(0.25 * ws.max(), self.SHOWN)]
             off = (self.anchor - c) @ d
             k_lo, k_hi = off + ks[0] * self.BIN, off + (ks[-1] + 1) * self.BIN
             # the remembered stretch is known to the size of a bin: where the current detections
@@ -201,18 +232,18 @@ class LineTrack:
 
 
 class LineMap:
-    MIN_HITS = 5
+    MIN_WATCH = 0.35          # a line counts once it has been watched for this long [s]
 
     def __init__(self, keep=False):
         self.tracks = []
         self.keep = keep             # see LineTrack
 
     def confirmed(self):
-        return [t for t in self.tracks if t.hits >= self.MIN_HITS and t.length > 1.2]
+        return [t for t in self.tracks if t.watched >= self.MIN_WATCH and t.length > 1.2]
 
     def markers(self):
         """Confirmed lines plus the short stubs that are all a camera sees of a line between two cars."""
-        return [t for t in self.tracks if t.hits >= self.MIN_HITS and t.length > 0.35]
+        return [t for t in self.tracks if t.watched >= self.MIN_WATCH and t.length > 0.35]
 
     def update(self, dets, t):
         for det in dets:
@@ -238,8 +269,8 @@ class LineMap:
             if best is None:
                 self.tracks.append(LineTrack(det, t, self.keep))
             else:
-                best.add(det)
-        self.tracks = [k for k in self.tracks if k.hits >= 3 or t - k.born < 2.5]
+                best.add(det, t)
+        self.tracks = [k for k in self.tracks if k.watched >= 0.15 or t - k.born < 2.5]
         self._merge()
 
     def _merge(self):
@@ -256,6 +287,7 @@ class LineMap:
                     if max(a.lo - s2, s1 - a.hi) < 0.4:
                         a.dets += b.dets
                         a.born = min(a.born, b.born)
+                        a.watched, a.t_seen = max(a.watched, b.watched), max(a.t_seen, b.t_seen)
                         for k, w in b.seen.items():          # what b remembers, in a's bins
                             ka = int(math.floor(((b.anchor + (k + 0.5) * b.BIN * b.d - a.anchor) @ a.d) / a.BIN))
                             a.seen[ka] = a.seen.get(ka, 0.0) + w

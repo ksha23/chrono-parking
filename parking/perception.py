@@ -5,6 +5,7 @@ import math
 
 import numpy as np
 
+from .config import PERCEPTION_DT
 from .vehicle import EGO
 
 
@@ -30,7 +31,8 @@ class Perception:
             self.line_pts.append(np.linspace((x1, y1), (x2, y2), n))
 
     def sense(self, pose):
-        """Returns (scans, line detections) for the car at this rear-axle pose."""
+        """Returns (scans, line detections) for the car at this rear-axle pose. A scan starts and
+        a detection ends with the time it stands for: the time since the frame before it."""
         rng, k = self.rng, self.noise
         ox = pose[0] + EGO.center * math.cos(pose[2])
         oy = pose[1] + EGO.center * math.sin(pose[2])
@@ -77,17 +79,17 @@ class Perception:
                     seg.append(pts[i] + nv * (bias + rng.normal(0.0, (0.03 + 0.012 * r) * k))
                                + u * rng.normal(0.0, (0.08 + 0.03 * r) * k))
                 dets.append((seg[0][0], seg[0][1], seg[1][0], seg[1][1],
-                             0.5 * (dist[i0] + dist[i1])))
+                             0.5 * (dist[i0] + dist[i1]), PERCEPTION_DT))
         for _ in range(rng.poisson(0.25 * k)):                     # clutter
             r, b = rng.uniform(2.0, self.LINE_RANGE), rng.uniform(0.0, 2.0 * math.pi)
             a, half = rng.uniform(0.0, math.pi), 0.5 * rng.uniform(0.8, 2.5)
             cx, cy = ox + r * math.cos(b), oy + r * math.sin(b)
             dets.append((cx - half * math.cos(a), cy - half * math.sin(a),
-                         cx + half * math.cos(a), cy + half * math.sin(a), r))
+                         cx + half * math.cos(a), cy + half * math.sin(a), r, PERCEPTION_DT))
         # a dropped ray (NaN) says nothing; a ray that hit nothing (inf) is free over the whole range
         r_hit = np.where(np.isfinite(r_meas), r_meas, np.nan)
         r_free = np.where(np.isnan(r_meas), 0.0, np.minimum(r_meas, self.SCAN_RANGE) - 0.1)
-        return [((ox, oy), ang, r_hit, r_free)], dets
+        return [(PERCEPTION_DT, (ox, oy), ang, r_hit, r_free)], dets
 
 
 # =============================================================================

@@ -17,13 +17,14 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 from parking.control import LateralMPC
 from parking.draw import RAMP, resample
 from parking.geometry import footprint_hits, poly_distance, rect_poly, wrap
-from parking.mapping import GridMap, LineTrack
+from parking.mapping import GridMap, LineMap, LineTrack
 from parking.perception import _rot_y, paint_segments, pinhole_rays, planar_scan
 from parking.reeds_shepp import rs_length_table, rs_paths, rs_sample
 from parking.sensors import SensorRig
 from parking.vehicle import EGO
 from parking.world import surface_textures
-from parking.stalls import JoinedLine, join_collinear
+from parking.stalls import JoinedLine, find_slots, join_collinear
+from parking.stereo_worker import pack, unpack
 
 
 def test_reeds_shepp():
@@ -172,18 +173,19 @@ def test_sensor_geometry():
 
 def test_mapping():
     """Line tracks that remember where paint was seen, and the tentative layer of the grid."""
-    trk = LineTrack((0.0, 0.0, 0.0, 2.0, 8.0), 0.0, keep=True)       # the mouth of a line, seen from far
+    far, near = (0.0, 0.0, 0.0, 2.0, 8.0, 0.4), (0.0, 3.0, 0.0, 5.5, 2.0, 0.4)      # (x, y, x, y, range, frame time)
+    trk = LineTrack(far, 0.0, keep=True)                              # the mouth of a line, seen from far
     for _ in range(12):
-        trk.add((0.0, 0.0, 0.0, 2.0, 8.0))
+        trk.add(far, 0.0)
     for _ in range(200):                                                # then only its far end, from close
-        trk.add((0.0, 3.0, 0.0, 5.5, 2.0))
+        trk.add(near, 0.0)
     lo = min(e[1] for e in trk.ends())
     assert lo < 0.15, "the track forgot the stretch it saw from far away (starts at %.2f)" % lo
-    plain = LineTrack((0.0, 0.0, 0.0, 2.0, 8.0), 0.0)
+    plain = LineTrack(far, 0.0)
     for _ in range(12):
-        plain.add((0.0, 0.0, 0.0, 2.0, 8.0))
+        plain.add(far, 0.0)
     for _ in range(200):
-        plain.add((0.0, 3.0, 0.0, 5.5, 2.0))
+        plain.add(near, 0.0)
     assert min(e[1] for e in plain.ends()) > 2.5                        # (what happens without the memory)
 
     old = (EGO.rear, EGO.front, EGO.half_width, EGO.length)
@@ -193,7 +195,7 @@ def test_mapping():
         ang = np.radians(np.arange(-30.0, 30.0, 0.5))
         none = np.full(len(ang), np.nan)
         for _ in range(4):      # sure of the first 6 m, ground seen up to 11 m
-            g.update((0.0, 0.0), ang, none, np.full(len(ang), 6.0), np.full(len(ang), 11.0))
+            g.update((0.0, 0.0), ang, none, np.full(len(ang), 6.0), np.full(len(ang), 11.0), dt=0.4)
         cell = lambda x, y: (int((y - g.y0) / g.RES), int((x - g.x0) / g.RES))
         b = g.blocked()
         assert not b[cell(4.0, 0.0)] and not b[cell(9.0, 0.0)], "seen ground must be drivable"
@@ -224,7 +226,17 @@ def test_pictures():
     assert np.all(np.diff(out[100, :, 0].astype(int)) >= 0) and out[100, 0, 0] <= 1 and out[100, -1, 0] >= 238
     assert np.array_equal(resample(ramp, 480, 270), ramp)
     assert RAMP.shape == (256, 3) and tuple(RAMP[0]) == (46, 58, 150) and tuple(RAMP[-1]) == (222, 44, 32)
-    print("picture resampling: ok")
+    # what travels to a depth worker on another machine arrives bit for bit
+    rng = np.random.default_rng(3)
+    img = rng.integers(0, 256, (60, 96, 3), dtype=np.uint8)
+    img[:30] = (np.linspace(60.0, 120.0, 96)[None, :, None] + rng.integers(-2, 3, (30, 96, 3))).astype(np.uint8)    # like a road
+    assert np.array_equal(unpack(pack(img[::-1]), img.shape, np.uint8), img[::-1])
+    depth = (rng.random((60, 96)) * 300.0).astype(np.float16)
+    depth[5, 7], depth[9, 0] = np.inf, 0.0
+    back = unpack(pack(depth), depth.shape, np.float16)
+    assert back.dtype == np.float16 and np.array_equal(back, depth)
+    assert len(pack(img[:30])) < 0.6 * img[:30].nbytes
+    print("picture resampling and packing: ok")
 
 
 def _rig():
@@ -301,10 +313,55 @@ def test_paint_in_light_and_shade():
     print("paint in sun and shade, shadow edges, light spots: ok")
 
 
+def test_evidence_in_seconds():
+    """A line is believed after the same time, however often the perception runs."""
+    when = {}
+    for hz in (2.5, 5.0, 10.0, 30.0):
+        det = (0.0, 0.0, 0.0, 2.0, 5.0, 1.0 / hz)
+        lines, n = LineMap(), 0
+        while not lines.markers():
+            lines.update([det], n / hz)
+            n += 1
+        when[hz] = (n - 1) / hz
+    assert all(0.35 <= t <= 0.41 for t in when.values()), when        # 0.4 s at every rate that divides it
+    lines = LineMap()                                    # three cameras seeing it at one instant are one sighting
+    for _ in range(3):
+        lines.update([det, det, det], 0.0)
+    assert lines.tracks[0].watched == 0.0 and not lines.markers()
+    lines.update([det], 5.0)                             # out of sight for a while: the gap counts for half a second
+    assert lines.tracks[0].watched == LineTrack.GAP
+
+    # the grid: 1.2 s of looking at a wall 6 m ahead, with ground that is sure up to 4 m and
+    # probable up to the wall, gives the same map at every rate
+    ang = np.radians(np.arange(-20.0, 20.0, 0.5))
+    wall, sure = np.full(len(ang), 6.0), np.full(len(ang), 4.0)
+    maps, shown = {}, {}
+    for hz in (2.5, 5.0, 10.0, 30.0):
+        g = GridMap((0.0, -5.0, 12.0, 5.0))
+        trk = LineTrack((0.0, 0.0, 0.0, 2.0, 8.0, 1.0 / hz), 0.0, keep=True)
+        for n in range(int(round(1.2 * hz))):
+            g.update((0.0, 0.0), ang, wall, sure, wall - 0.3, dt=1.0 / hz)
+            if n:
+                trk.add((0.0, 0.0, 0.0, 2.0, 8.0, 1.0 / hz), n / hz)
+        maps[hz] = (g.occupied(), g.clear(), g.blocked())
+        shown[hz] = trk.seen[5]
+        assert g.occupied().any() and g.clear().any() and g.far_ground().any()
+    for hz in (5.0, 10.0, 30.0):
+        assert all(np.array_equal(a, b) for a, b in zip(maps[hz], maps[2.5])), "the map depends on the rate (%g Hz)" % hz
+        assert abs(shown[hz] - shown[2.5]) < 1e-6 * shown[2.5], "the memory of a line depends on the rate"
+    # one frame is never enough, however long it is said to stand for, and neither is 0.3 s of frames
+    for dt, n in ((5.0, 1), (0.1, 3), (1.0 / 30.0, 9)):
+        g = GridMap((0.0, -5.0, 12.0, 5.0))
+        for _ in range(n):
+            g.update((0.0, 0.0), ang, wall, sure, wall - 0.3, dt=dt)
+        assert not g.occupied().any() and not g.clear().any() and g.seen_free().any(), (dt, n)
+    print("evidence in seconds, not in frames: ok")
+
+
 def test_lines_in_pieces():
     """Collinear pieces of a line are joined over a gap, and nothing else is."""
-    def piece(x, y0, y1, hits=6):
-        t = types.SimpleNamespace(c=np.array([x, 0.5 * (y0 + y1)]), d=np.array([0.0, 1.0]), length=abs(y1 - y0), hits=hits)
+    def piece(x, y0, y1, watched=0.6):
+        t = types.SimpleNamespace(c=np.array([x, 0.5 * (y0 + y1)]), d=np.array([0.0, 1.0]), length=abs(y1 - y0), watched=watched)
         t.ends = lambda: (np.array([x, y0]), np.array([x, y1]))
         return t
 
@@ -313,9 +370,35 @@ def test_lines_in_pieces():
     out = join_collinear(tick + other)                                 # across the lane and 40 cm to the side: not joined
     assert len(out) == 4
     joined = [t for t in out if isinstance(t, JoinedLine)]
-    assert len(joined) == 1 and abs(joined[0].length - 2.46) < 0.01 and joined[0].hits == 12
+    assert len(joined) == 1 and abs(joined[0].length - 2.46) < 0.01 and joined[0].watched == 0.6
     assert abs(joined[0].c[0] - 7.207) < 0.005 and abs(joined[0].c[1] + 3.0) < 0.01
     print("lines seen in pieces: ok")
+
+
+def test_half_seen_stall():
+    """A stall of which one line is seen whole and the other only in part, in a 60 degree lot: the
+    ends of the lines lie on a line along the lane, 1.56 m apart lengthwise."""
+    u = np.array([0.5, -math.sqrt(0.75)])                 # into the stalls, from a lane along +x
+
+    def line(x, far):                                     # from the lane edge at y = -2.8 to 'far' along it
+        t = types.SimpleNamespace(c=np.array([x, -2.8]) + 0.5 * far * u, d=u, length=far, watched=2.0)
+        t.ends = lambda: (np.array([x, -2.8]), np.array([x, -2.8]) + far * u)
+        return t
+
+    old = (EGO.rear, EGO.front, EGO.half_width, EGO.length)
+    EGO.rear, EGO.front, EGO.half_width, EGO.length = 1.0, 3.8, 0.9, 4.8
+    try:
+        trail = [np.array([-8.0, 0.0]), np.array([-4.8, 0.0])]
+        grid = GridMap((-10.0, -12.0, 12.0, 4.0))
+        for whole, part in ((0.0, 3.12), (3.12, 0.0)):   # the half-seen line on either side of the whole one
+            slots = find_slots([line(whole, 6.0), line(part, 3.4)], trail, grid, True)
+            assert len(slots) == 1 and slots[0].kind == "angled", [s.kind for s in slots]
+            mouth = slots[0].corners[:2]
+            assert np.abs(mouth[:, 1] + 2.8).max() < 0.05, "the stall must start at the lane edge: %s" % mouth.round(2)
+            assert abs(sorted(mouth[:, 0])[0]) < 0.05 and abs(sorted(mouth[:, 0])[1] - 3.12) < 0.05
+    finally:
+        EGO.rear, EGO.front, EGO.half_width, EGO.length = old
+    print("a half-seen stall in an angled lot: ok")
 
 
 def test_surfaces():
@@ -343,6 +426,8 @@ if __name__ == "__main__":
     test_pictures()
     test_depth_from_images()
     test_paint_in_light_and_shade()
+    test_evidence_in_seconds()
     test_lines_in_pieces()
+    test_half_seen_stall()
     test_surfaces()
     print("all checks passed")

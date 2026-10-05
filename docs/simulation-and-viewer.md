@@ -159,7 +159,8 @@ show the whole world, including what the car cannot see. What the car knows is d
 | chase view | behind and above the car, heading low-pass filtered |
 
 **What the sensors deliver**, in the middle and on the right. The images are what Chrono::Sensor
-renders for each camera, with that camera's noise and exposure, renewed ten times per second.
+renders for each camera, with that camera's noise and exposure, renewed whenever a network takes
+a frame: five times per second by default, see [sensors.md](sensors.md#how-often-the-networks-run).
 
 | Picture | Content |
 | --- | --- |
@@ -270,8 +271,9 @@ shaped the implementation:
 With `--sensors sim` the window keeps real time at 30 frames per second on the machine this was
 developed on. The simulation itself needs about a seventh of real time.
 
-With a sensor rig the window runs at about a fifth of real time. Rendering four cameras and
-running the depth networks takes most of it, see [sensors.md](sensors.md#what-it-needs).
+With a sensor rig the window runs at about a sixth of real time on the Mac alone, and at a
+quarter with the depth networks on another machine. The networks take most of it, see
+[sensors.md](sensors.md#what-it-needs).
 
 ## Placing the target by hand
 
@@ -315,8 +317,8 @@ macOS only. Input is ignored unless the window is in front.
 ## Running without a window
 
 `--headless` skips the viewer and runs as fast as it can: about four times real time with
-`--sensors sim`, about real time with a sensor rig, where rendering and processing the sensor
-data is most of the work. It prints a log and one result line:
+`--sensors sim`, and at a sixth to a third of real time with a sensor rig, where the depth
+networks are most of the work. It prints a log and one result line:
 
 ```
 [result] ok=True  time=32.220  plan_time=0.188  gear_changes=1  replans=0  corrections=0

@@ -38,7 +38,7 @@ flowchart TB
     end
     subgraph Agent["Parking agent"]
         SENSE["SensorRig.sense or Perception.sense<br/>line segments + planar scans"]
-        GRID["GridMap<br/>hits / pass-throughs per cell"]
+        GRID["GridMap<br/>seconds seen as obstacle / as free, per cell"]
         LINES["LineMap<br/>one LineTrack per painted line"]
         SLOTS["find_slots<br/>stalls from line pairs"]
         DEC["decide<br/>pick a settled free stall"]
@@ -148,19 +148,19 @@ agent, and `cli.py` starts one or both.
 
 | Module | Lines | Main names |
 | --- | --- | --- |
-| `cli.py` | 133 | `parse_args`, `main` |
-| `agent.py` | 632 | `ParkingSim` (state machine, decision, planning requests, refinement, monitor) |
+| `cli.py` | 144 | `parse_args`, `main` |
+| `agent.py` | 643 | `ParkingSim` (state machine, decision, planning requests, refinement, monitor) |
 | `chrono_env.py` | 53 | the PyChrono imports, and the rerun in a Python that has PyChrono |
-| `config.py` | 14 | `STEP`, `CONTROL_DT`, `PERCEPTION_DT`, speeds and acceleration limits |
+| `config.py` | 15 | `STEP`, `CONTROL_DT`, `PERCEPTION_DT`, speeds and acceleration limits |
 | `vehicle.py` | 51 | `Ego`, `EGO` (geometry, mass and limits read from the Chrono model) |
 | `geometry.py` | 66 | `rect_poly`, `ego_poly`, `poly_distance`, `footprint_hits` |
 | `scenario.py` | 216 | `Scenario`, `make_lot`, `make_street`, `parked_model` |
 | `world.py` | 277 | `World` (the model, the scene, the physical actuation in `step`), `surface_textures`, `light_scene` |
-| `perception.py` | 231 | `Perception` (stand-in), `planar_scan`, `paint_segments`, the ray helpers |
-| `sensors.py` | 502 | `SensorRig`, `DepthWorker`, `sensor_mounts` |
-| `stereo_worker.py` | 217 | the process that runs IGEV++ and Depth Anything V2 |
-| `mapping.py` | 266 | `GridMap`, `LineTrack`, `LineMap` |
-| `stalls.py` | 213 | `Slot`, `find_slots`, `_classify`, `_align_with_kerb` |
+| `perception.py` | 233 | `Perception` (stand-in), `planar_scan`, `paint_segments`, the ray helpers |
+| `sensors.py` | 526 | `SensorRig`, `DepthWorker`, `sensor_mounts` |
+| `stereo_worker.py` | 251 | the process that runs IGEV++ and Depth Anything V2 |
+| `mapping.py` | 298 | `GridMap`, `LineTrack`, `LineMap` |
+| `stalls.py` | 290 | `Slot`, `find_slots`, `_classify`, `_align_with_kerb` |
 | `reeds_shepp.py` | 179 | `_rs_words`, `rs_paths`, `rs_length_table`, `rs_sample` |
 | `planner.py` | 446 | `CSpace`, `holonomic_distance`, `Planner` (`search`, `shoot`, `_rs_shot`, `_arc_shot`), `Segment`, `split_segments` |
 | `control.py` | 262 | `LateralMPC`, `SteeringGain`, `MpcTracker` |

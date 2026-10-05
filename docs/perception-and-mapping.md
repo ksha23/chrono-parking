@@ -63,22 +63,28 @@ lengthwise, so a single detection is not good enough to park by. The map has to 
 
 ## Occupancy grid
 
-`GridMap` covers the scenario with 10 cm cells and keeps two counters per cell.
+`GridMap` covers the scenario with 10 cm cells and keeps two numbers per cell. Both are times in
+seconds, not counts of scans.
 
-- `hits`: in how many scans a range return ended in the cell.
-- `free`: in how many scans a ray passed through the cell. Rays are sampled every 20 cm up to
+- `hits`: for how long a range return ended in the cell.
+- `free`: for how long a ray passed through the cell. Rays are sampled every 20 cm up to
   the range the scan reports as free.
 
-A scan counts once per cell, however many of its rays touch the cell. The cells under the car's
+A scan adds the time it stands for, which is the time since the scan before it from the same
+sensor: 0.1 s for a sensor that delivers ten times per second, 0.4 s for one that delivers every
+0.4 s. What the map believes then depends on how long something was in view, not on how many
+scans that was, so nothing has to be retuned when a sensor runs faster or slower. A scan never
+stands for more than 0.4 s, so one scan alone is not enough to believe anything. A scan counts
+once per cell, however many of its rays touch the cell. The cells under the car's
 own outline are counted as free on every tick: the ground the car stands on is free, whether a
-sensor looks at it or not. With a sensor rig there are two more counters, for ground that a
+sensor looks at it or not. With a sensor rig there are two more layers, for ground that a
 camera sees from too far away to be sure of it (see
 [sensors.md](sensors.md#far-ground-in-the-grid)).
 
 Two derived maps are used.
 
 ```math
-\text{occupied} = (\text{hits} \ge 2) \;\wedge\; (\text{hits} > 0.3 \cdot \text{free})
+\text{occupied} = (\text{hits} \ge 0.5\ \text{s}) \;\wedge\; (\text{hits} > 0.3 \cdot \text{free})
 ```
 
 The second condition matters. Range noise puts an occasional return into the free cell just in
@@ -87,7 +93,7 @@ that were made with a small margin. A real surface stops the rays, so its cells 
 few pass-throughs. A cell that rays mostly pass through only caught noise.
 
 ```math
-\text{blocked} = \text{occupied} \;\vee\; \neg\,\mathrm{dilate}_{2}(\text{free} \ge 1)
+\text{blocked} = \text{occupied} \;\vee\; \neg\,\mathrm{dilate}_{2}(\text{free} > 0)
 ```
 
 The planner uses `blocked`: a cell is drivable only if it was seen to be free. The dilation by two
@@ -131,9 +137,13 @@ quarter of the peak coverage. That estimate overshoots, because it follows the l
 and lengthwise noise is large. Each end is then replaced by the weighted median of the detection
 endpoints that lie within 0.6 m of it, which is unbiased for a line end that was actually seen.
 
-**Housekeeping.** A track is confirmed after 5 detections and 1.2 m of length. Tracks with fewer
-than 3 detections are dropped after 2.5 s, which removes clutter. Tracks that turn out to be the
-same line (nearly parallel, within 0.25 m, extents touching) are merged.
+**Housekeeping.** A track keeps the time it has been watched for: the time between its sightings,
+summed, where a gap of more than 0.5 s counts as 0.5 s. Several detections of the line at the same
+instant are one sighting. A track is confirmed once it has been watched for 0.35 s and is 1.2 m
+long. Tracks watched for less than 0.15 s are dropped after 2.5 s, which removes clutter. Tracks
+that turn out to be the same line (nearly parallel, within 0.25 m, extents touching) are merged.
+Like the grid, this is in seconds and not in detections, so it does not depend on how often the
+perception runs.
 
 With a sensor rig, a track of 0.35 m or more also counts, as a stub, and a track remembers the
 stretch along which paint was seen. Both are described in
@@ -211,7 +221,7 @@ parallel) so that a neighbour parked close to the line does not count:
 | Result | Condition |
 | --- | --- |
 | occupied | at least 4 occupied cells inside |
-| free | at most 1 occupied cell **and** enough of the stall seen free in two or more scans: 60 percent of it, or 80 percent of its first 2.5 m and 30 percent overall. With a sensor rig also: 55 percent of its first 2.5 m, 25 percent overall, and free ground seen 2 m into it |
+| free | at most 1 occupied cell **and** enough of the stall seen free for half a second or more: 60 percent of it, or 80 percent of its first 2.5 m and 30 percent overall. With a sensor rig also: 55 percent of its first 2.5 m, 25 percent overall, and free ground seen 2 m into it |
 | unknown | anything else |
 
 "Free" needs positive evidence. A stall the car has not looked into yet is unknown, not free. For
@@ -229,8 +239,9 @@ neighbour on each side.
 
 `ParkingSim._decide` runs every perception tick while the car is searching.
 
-1. Candidates are stalls that are free, whose weaker line has at least 8 detections, that have not
-   been rejected by the planner before, and that lie between 8 m behind and 10 m ahead of the car.
+1. Candidates are stalls that are free, whose two lines have both been watched for 0.65 s, that
+   have not been rejected by the planner before, and that lie between 8 m behind and 10 m ahead
+   of the car.
 2. The candidate with the lowest score leads:
 
    ```math

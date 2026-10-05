@@ -78,18 +78,29 @@ python parking_sim.py --depth-host HOST --depth-dir chrono-parking --depth-pytho
 
 starts `parking/stereo_worker.py` on `HOST` through ssh. That machine needs a copy of this
 repository at `--depth-dir` (relative to the home directory there) with `third_party/IGEV-plusplus`,
-and `--depth-python` names its Python with PyTorch. The images are sent as they are, and the
-answers come back as 16 bit floats. Measured with an RTX 5070 Ti reached at 20 MB/s:
+and `--depth-python` names its Python with PyTorch. The link is what takes the time then: a
+stereo request is 3.5 MB of images and its answer 1.2 MB. So images and answers travel packed
+(each value less the one to its left, then zlib), which loses nothing and brings a camera image
+to 0.6 of its size, and the answers are 16 bit floats. Measured with an RTX 5070 Ti reached
+through a link that carries 17 MB/s:
 
 | | On the M4 Pro | On the RTX 5070 Ti |
 | --- | --- | --- |
 | IGEV++, one pair | 0.9 s | 0.16 s |
 | Depth Anything V2, two images | 0.11 s | 0.03 s |
-| batch of runs, per minute | 0.37 with two at a time | 0.79 with four at a time |
+| one run, per simulated second | 5.7 s | 2.7 s |
+| batch of runs, four at a time | | 1.1 per minute |
 
-The first row of the result table (`--type perpendicular --cars both`) comes out the same to the
-last printed digit either way. The link matters: a stereo request is 3.5 MB, so over a 2 MB/s
-link the transfer alone takes longer than computing here.
+Over a 2 MB/s link the transfer alone takes longer than computing here.
+
+**A run can be repeated.** The simulation, the camera noise and the planner give the same
+numbers every time. The stereo network on a CUDA GPU does not, left to itself: cuDNN picks
+convolution routines whose answer differs from one call to the next. On the RTX 5070 Ti the
+disparity of one and the same pair came out more than 0.1 pixels different on 13 percent of the
+pixels nearer than 14 m, and more than 1 pixel different on 0.5 percent. The worker therefore
+asks cuDNN for its repeatable routines, which are no slower here. With that, three runs of one
+scenario gave the same messages at the same times and the same result line to the last digit.
+A run with the networks on another kind of device (the Mac's GPU) is a different run.
 
 **Memory and time.** Measured on an Apple M4 Pro with 48 GB:
 
@@ -97,15 +108,18 @@ link the transfer alone takes longer than computing here.
 | --- | --- |
 | simulation process | 4.1 GB with the four cameras, 4.8 GB with the lidar |
 | network process | 1.1 GB, and 3.4 GB on the GPU |
-| rendering four cameras at 960 x 600, 4 rays per pixel | 130 ms per perception tick |
-| IGEV++ on one pair | 0.9 s, run every fourth tick |
+| rendering four cameras at 960 x 600, 4 rays per pixel | 160 ms, five times per simulated second |
+| IGEV++ on one pair | 0.9 s, run every second tick |
 | RT-IGEV++ on one pair (`--stereo rt`) | 0.28 s |
-| Depth Anything V2 Small on two images | 0.11 s, run every fourth tick |
-| a run that simulates 40 s | 3 to 4 minutes |
+| Depth Anything V2 Small on two images | 0.11 s, run every second tick |
+| a run that simulates 40 s | 4 minutes, or 2 with the networks on the RTX 5070 Ti |
 
 The stand-in perception needs 0.2 GB and runs four times faster than real time. The sensor rig
-runs at about a fifth of real time: per simulated second, 2.6 s for the networks and 1.3 s for
-rendering the cameras.
+runs at about a sixth of real time on the Mac alone: 5.7 s per simulated second. The networks set
+that. Their ten requests take 5.7 s, and rendering (0.8 s) and everything else fit in beside
+them. With the networks on the other machine it is 2.7 s. NumPy is held to one BLAS thread (`parking/__init__.py`): left alone,
+its OpenBLAS keeps a thread per core spinning, and four runs side by side then each took seven
+times as long as one alone.
 
 ## The scene the cameras see
 
@@ -177,12 +191,16 @@ treats as a tinted pane: 80 percent of the light passes per layer of glass. The 
 is what the bumper camera is for: it sees the road from 0.7 m. The rear camera sees it from
 0.5 m. The lidar's lowest beam reaches the road 2.4 m ahead of the bumper.
 
-**Timing.** The cameras are rendered once per perception tick (10 Hz). Every frame carries the
+**Timing.** The cameras can deliver a frame per perception tick (10 Hz). Every frame carries the
 time it was rendered at, and the chassis frame of that instant is kept, with its roll and pitch.
-The networks do not run on every frame, and their answer is not there at once: a stereo result is
-used two ticks (0.2 s) after its images were taken, a monocular one after one tick, both with the
-pose the car had when the images were taken. The simulation waits for a result when it is due,
-so a run does not depend on how fast the machine is.
+The networks do not have to run on every frame: `--stereo-hz` and `--mono-hz` set how often each
+one does, 5 times per second by default. Rendering is most of the work of a run, so the cameras
+are only rendered on the ticks at which a network takes their frame (on every tick with a lidar,
+which is read ten times per second). An answer is not there at once either: a stereo
+result is used two ticks (0.2 s) after its images were taken, a monocular one after one tick,
+both with the pose the car had when the images were taken. The simulation waits for a result
+when it is due, so a run does not depend on how fast the machine is. What the rates change and
+what they do not is in [How often the networks run](#how-often-the-networks-run).
 
 ## From images to the map
 
@@ -353,6 +371,77 @@ Returns from below 0.30 m end the free part of a ray but are not placed as obsta
 are 0.8 degrees apart, so a kerb is hit somewhere on its top, not at its face. Range noise is
 2 cm and 1 percent of the returns are dropped, both times `--noise`.
 
+## How often the networks run
+
+The cameras deliver ten frames per second. How many of them the networks get through is a matter
+of computing power, not of the method, and it is set with `--stereo-hz` and `--mono-hz`. The
+default is 5 per second for both, which is what IGEV++ reaches in real time on a desktop GPU
+(0.16 s per pair on an RTX 5070 Ti). A faster matcher can be given every frame.
+
+So nothing in the processing counts frames. Wherever the maps have to decide whether they have
+seen enough, they add up time. An answer of a network stands for the time since the answer before
+it: 0.2 s at 5 per second, 0.1 s at 10. It never stands for more than 0.4 s, so one answer alone
+is never enough, however slow the network. The lidar and the stand-in perception go by the same
+rule, with 0.1 s per scan.
+
+| What | Believed once |
+| --- | --- |
+| an obstacle in a cell, or free ground | seen for 0.5 s |
+| ground too far away to tell from a kerb | seen for 1 s |
+| a painted line | watched for 0.35 s |
+| a stretch of a line, to be remembered | weight x time of 60: 1.4 s in view for a line 5 m away, 3.2 s at 9 m |
+| a stall, before the car commits to it | both lines watched for 0.65 s, and its estimate steady for 0.55 s |
+
+**The check.** `docs/rate_check.py` records one drive along the lane with both networks on every
+frame. Keeping every second or every fourth answer turns the recording into the same drive at 5
+and at 2.5 answers per second, in two and in four ways (which answer is kept first). The maps
+are rebuilt for each of them and the agent's own stall choice runs on them. The table gives the
+time at which the car commits to the free stall, in seconds, for 15 recorded drives. The right
+half is the same recordings with the rules of an earlier version, in which every answer counted
+as one whatever time it stood for.
+
+| Drive | 10 per second | 5 per second | 2.5 per second | counted: 10 | counted: 5 | counted: 2.5 |
+| --- | --- | --- | --- | --- | --- | --- |
+| angled, cars both, seed 2 | 12.8 | 12.8 to 12.9 | 12.9 to 13.2 | 11.6 | 12.2 to 12.3 | 13.3 to 13.6 |
+| angled, cars left, seed 4 | 8.1 | 8.1 to 8.3 | 8.2 to 8.8 | 7.0 | 8.3 to 8.4 | 8.4 to 8.7 |
+| angled, cars right, seed 6 | 17.2 | 17.2 to 17.3 | 17.3 to 17.6 | 16.2 | 16.5 to 16.6 | 17.6 to 21.0 |
+| parallel, cars both, seed 4 | 16.3 | 16.4 to 16.5 | 16.4 to 16.7 | 16.1 | 16.7 to 16.8 | 17.7 to 18.2 |
+| parallel, cars left, seed 2 | 9.9 | 10.3 to 10.4 | 10.3 to 11.0 | 10.3 | 11.1 to 11.4 | 12.1, never in 3 of 4 |
+| parallel, cars none, seed 5 | 9.6 | 9.7 to 9.8 | 9.7 to 10.3 | 9.4 | 9.7 to 10.3 | 10.6 to 12.1 |
+| parallel, cars right, seed 3 | 22.9 | 23.0 to 23.1 | 23.0 to 23.3 | 22.8 | 23.4 to 23.7 | 24.4 to 25.1 |
+| perpendicular, cars both, seed 1 | 11.9 | 11.9 to 12.0 | 11.9 to 12.2 | 10.9 | 11.3 to 11.4 | 11.9 to 12.9 |
+| perpendicular, cars both, seed 6 | 12.4 | 12.5 to 12.6 | never | 12.0 | 16.0 to 16.1 | never |
+| perpendicular, cars left, seed 2 | 7.3 | 7.2 to 7.3 | 7.5 to 7.8 | 7.4 | 7.2 to 7.5 | 8.2 to 9.2 |
+| perpendicular, cars none, seed 3 | 7.4 | 7.3 to 7.4 | 7.5 to 7.8 | 7.1 | 7.4 to 7.5 | 8.1 to 9.2 |
+| perpendicular, cars right, seed 5 | 15.4 | 15.4 to 15.5 | 15.5 to 15.8 | 14.4 | 14.8 to 14.9 | never |
+| angled, cars random, seed 3, with lidar | 10.1 | 10.2 to 10.5 | 10.1 to 10.7 | 9.9 | 10.8 to 12.5 | 11.8 to 12.4 |
+| parallel, cars random, seed 5, with lidar | 9.6 | 9.7 to 9.8 | 9.9 to 10.3 | 9.6 | 9.7 to 10.3 | 10.8 to 12.1 |
+| perpendicular, cars random, seed 1, with lidar | 8.9 | 8.9 | 8.8 to 9.3 | 8.4 | 8.8 to 8.9 | 9.8 to 12.6 |
+
+| | Time added up | Answers counted |
+| --- | --- | --- |
+| the free stall chosen at 10 per second | 15 of 15 | 15 of 15 |
+| at 5 per second | 30 of 30 | 30 of 30 |
+| at 2.5 per second | 56 of 60 | 49 of 60 |
+| from the earliest to the latest choice of a drive, on average | 0.53 s | 2.56 s |
+| the same, worst drive | 1.0 s | 4.9 s |
+| between 10 and 5 per second, on average | 0.11 s | 0.63 s |
+
+No replay chose anything but the free stall. The car searches at 2.2 m/s, so the 2.6 s that the
+choice used to move by are 5.6 m of road, and the 0.5 s that are left are 1.2 m.
+
+**What a slow network still costs.** At 2.5 answers per second the car commits 0.3 s later on
+average than at 10, and in one of the 15 drives it never does. That is sampling, not a rule
+tuned to a rate. The car moves 0.9 m between two answers. A cell at the inner end of the mouth of
+a stall between two cars is in view of the forward pair for about that stretch of road, and it
+takes two answers to believe anything. At 5 and at 10 per second the same cell is seen three and
+five times while it is in view. In that one drive at most 52 percent of the mouth of the stall came
+out as seen empty at 2.5 per second, 59 percent at 5 and 61 percent at 10, and 55 are asked for.
+
+Two things still go by a number of items and not by time. A line keeps its 160 best detections
+for the fit, which is a limit on memory and not a test of anything. The path monitor reacts when
+the path is blocked on two ticks in a row of the agent's own 10 Hz cycle, whatever the cameras do.
+
 ## How good it is
 
 The reference is the scenario itself, not anything rendered. The road is a plane, so the true
@@ -424,7 +513,7 @@ side:
 | --- | --- |
 | the longer line | at least 2.0 m |
 | the shorter one | at least 0.35 m, and 2.2 to 3.5 m to the side of the longer one |
-| where the shorter one is | one of its ends near the matching end of the longer one: up to 1.5 m inside it, or up to `1.2 w + 0.5` m outside it for angled stalls, with `w` the separation |
+| where the shorter one is | one of its ends matches the same end of the longer one. The ends of the lines of a row lie on a line along the lane, and the car's own track gives the lane, so the two ends have to be within 0.75 m of that. This holds for any stall angle: at 60 degrees the ends are 1.56 m apart lengthwise. Before the car has driven 2 m there is no track, and the test is: up to 1.5 m inside the longer line, or up to `1.2 w + 0.5` m outside it, with `w` the separation |
 | direction | from the longer line alone if the shorter is under 1.2 m |
 | depth | if the lines end sooner than a car length plus 0.7 m, that depth is assumed |
 
@@ -471,9 +560,10 @@ estimate then rests on those, and the plan follows it (see
 A `LineTrack` keeps its 160 best detections and derives its extent from what they cover. With a
 camera that drops the wrong ones: once the car is close, it sees only the far part of the lines,
 and the detections of the mouth, made from further away, are the first to be forgotten. With a
-rig, a track therefore keeps a record of where along the line paint was seen, in 10 cm bins with
-the summed weight of the detections. A stretch stays part of the line once that weight has
-passed a threshold.
+rig, a track therefore keeps a record of where along the line paint was seen, in 10 cm bins. Each
+detection adds its weight times the time its frame stands for, so the record does not depend on
+how often the networks run. A stretch stays part of the line once that sum has passed a
+threshold, which a line 5 m away reaches after 1.4 s in view.
 
 ### Free means a wedge of the mouth is empty
 
@@ -503,7 +593,7 @@ or by a single camera at all:
 | Layer | Written by | Counts as |
 | --- | --- | --- |
 | free | the stereo pair within 8.1 m, the lidar | seen free |
-| far | the stereo pair from 8.1 to 12 m, a single camera within 3 m | probably free: drivable for the planner once seen three times, with a larger margin |
+| far | the stereo pair from 8.1 to 12 m, a single camera within 3 m | probably free: drivable for the planner once seen for a second, with a larger margin |
 | stop | anything that is not ground | not free, whatever the far layer says |
 
 ### The monitor looks for margin, and the goal moves back
@@ -548,8 +638,18 @@ made of that data shows up in three more places:
   the ground would produce false ones.
 - **The networks were not trained for this.** They run with published weights. IGEV++ does well
   on the textured road and badly on a road of one flat colour, where it has nothing to match.
+- **Points in the air next to the car.** Along the edge of the car's own bonnet in the image, a
+  depth network puts pixels somewhere between the bonnet and whatever lies behind it, and they
+  come out as points 20 to 30 cm off the car's own wing. While the car drives they fall into a
+  different cell in every frame. While it stands they pile up in one, and in one of 150 runs that
+  cell became an obstacle the car could not get away from ([results.md](results.md#verification)).
+  Leaving out a band of pixels around the car's body in each image removes them, but as tried it
+  also hid the nearest strip of road and made a nose-in run park too deep, so it is not in.
 - **Stray obstacle cells with the lidar.** The map of the lidar run above has a handful of
   obstacle cells in the open lane, and one false line along the side of a parked car. Where the
   cells come from was not tracked down. They did not change a run.
+- **A slow network sees less of a stall.** The method does not count frames, but two answers are
+  the least it takes to believe anything, and at 2.5 answers per second some ground is in view
+  for less than that. See [How often the networks run](#how-often-the-networks-run).
 - **Static scene.** Nothing moves but the car.
 - **Other backends.** OptiX and Vulkan RT were not run with this scene.

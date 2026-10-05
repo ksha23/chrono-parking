@@ -5,6 +5,7 @@
 STEP = 2e-3                    # simulation step [s]
 CONTROL_DT = 0.02              # controller period [s]
 PERCEPTION_DT = 0.1            # perception / mapping period [s]
+FRAME_MAX = 0.4                # a sensor frame stands for the time since the one before it, at most this [s]
 
 V_SEARCH = 2.2                 # cruise speed while looking for a stall [m/s]
 V_FWD = 1.4                    # maneuver speed, forward [m/s]

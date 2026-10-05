@@ -301,9 +301,9 @@ def draw(path):
         x0, y0, res, nx, ny = d["grid"]
         T = lambda a: a.T if a.shape == (nx, ny) else a
         img = np.full((ny, nx, 3), 0.13)
-        img[T(d["far"] >= 3)] = (0.25, 0.3, 0.36)
-        img[T(d["free"] >= 1)] = (0.42, 0.45, 0.5)
-        img[T(d["obstacles"] >= 2)] = (0.95, 0.35, 0.25)
+        img[T(d["far"] >= 0.999)] = (0.25, 0.3, 0.36)         # (seconds seen: GridMap.SURE_FAR and GridMap.SURE)
+        img[T(d["free"] > 0.0)] = (0.42, 0.45, 0.5)
+        img[T(d["obstacles"] >= 0.499)] = (0.95, 0.35, 0.25)
         ax.imshow(img, origin="lower", extent=(x0, x0 + nx * res, y0, y0 + ny * res), interpolation="nearest")
         for poly in d["cars"]:
             ax.plot(*np.vstack([poly, poly[:1]]).T, color="0.75", lw=0.7)

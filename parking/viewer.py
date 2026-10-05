@@ -208,7 +208,7 @@ class Viewer(PicturesMixin, PanelMixin):
     def _rebuild_items(self):
         sim, C = self.sim, self.COLORS
         self.items = []
-        for x1, y1, x2, y2, _ in sim.dets:
+        for x1, y1, x2, y2, *_ in sim.dets:
             self._line([(x1, y1), (x2, y2)], C["det"], z=0.07, thick=1)
         for origin, head, half, reach in getattr(sim.sensor, "fans", ()):      # what each sensor looks at
             arc = [(origin[0] + reach * math.cos(head + a), origin[1] + reach * math.sin(head + a))

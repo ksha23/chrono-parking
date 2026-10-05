@@ -16,6 +16,7 @@ import numpy as np
 from .chrono_env import _conda_roots, chrono, sens
 from .config import PERCEPTION_DT
 from .perception import _rot_y, _rot_z, angular_rays, paint_segments, pinhole_rays, planar_scan
+from .stereo_worker import pack, unpack
 from .vehicle import EGO
 from .world import light_scene
 
@@ -23,8 +24,9 @@ from .world import light_scene
 class DepthWorker:
     """The process that runs the depth networks (stereo_worker.py). Requests are answered in the
     order they were made; a thread keeps reading the answers so that neither side waits on a
-    full pipe. The process may be on another machine: its pipes then run through ssh, and the
-    answers come back as 16 bit floats, which is half the data."""
+    full pipe. The process may be on another machine: its pipes then run through ssh. The link
+    is then what takes the time, so the answers come back as 16 bit floats, and images and
+    answers travel packed, without loss (see pack in stereo_worker.py)."""
 
     def __init__(self, command, remote=False):
         self.remote = remote
@@ -34,6 +36,7 @@ class DepthWorker:
             raise RuntimeError("the depth networks did not start. Try: %s --check" % " ".join(command))
         self.info = json.loads(line)
         self.info["where"] = command[-2] if remote else "this machine"
+        self.pack = remote and bool(self.info.get("pack"))      # (a worker from before packing does not say so)
         self.replies = queue.Queue()
         self.sent, self.seconds = 0, 0.0
         threading.Thread(target=self._read, daemon=True).start()
@@ -48,8 +51,11 @@ class DepthWorker:
                 head = json.loads(line)
                 size = head["h"] * head["w"]
                 kind = np.dtype(head.get("dtype", "float32"))
-                maps = [np.frombuffer(out.read(kind.itemsize * size), kind).reshape(head["h"], head["w"]).astype(np.float32)
-                        for _ in range(head["n"])]
+                if "sizes" in head:
+                    maps = [unpack(out.read(n), (head["h"], head["w"]), kind).astype(np.float32) for n in head["sizes"]]
+                else:
+                    maps = [np.frombuffer(out.read(kind.itemsize * size), kind).reshape(head["h"], head["w"]).astype(np.float32)
+                            for _ in range(head["n"])]
                 self.replies.put((head, maps))
         finally:
             self.replies.put((None, None))
@@ -60,9 +66,13 @@ class DepthWorker:
         self.sent += 1
         h, w = images[0].shape[:2]
         pipe = self.proc.stdin
-        pipe.write((json.dumps(dict(id=self.sent, op=op, h=h, w=w, n=len(images), half=self.remote)) + "\n").encode())
-        for img in images:
-            pipe.write(np.ascontiguousarray(img).tobytes())
+        head = dict(id=self.sent, op=op, h=h, w=w, n=len(images), half=self.remote)
+        data = [pack(img) if self.pack else np.ascontiguousarray(img).tobytes() for img in images]
+        if self.pack:
+            head["sizes"] = [len(b) for b in data]
+        pipe.write((json.dumps(head) + "\n").encode())
+        for b in data:
+            pipe.write(b)
         pipe.flush()
         return self.sent
 
@@ -151,8 +161,7 @@ class SensorRig:
     CAM_HFOV = 2.0 * math.atan(0.5 * CAM_W / CAM_F)          # 105 degrees for the rectified image
     BASELINE = 0.30                          # between the two cameras of the stereo pair [m]
     REAR_PITCH, BUMPER_PITCH = math.radians(25.0), math.radians(5.0)      # downwards
-    STEREO_EVERY, MONO_EVERY = 4, 4          # perception ticks from one run of a network to the next
-    STEREO_LAG, MONO_LAG = 2, 1              # ticks until a result is in
+    STEREO_LAG, MONO_LAG = 0.2, 0.1          # how long a network's answer takes to arrive [s]
     DISP_ERR = 0.25                          # disparity error that the processing assumes [pixels]
     MONO_ERR = (0.02, 0.07)                  # range error assumed for monocular depth: 2 cm + 7 %
     MONO_RANGE = 3.0                         # ground seen by a single camera counts as probably free up to here
@@ -168,8 +177,13 @@ class SensorRig:
     Z_GROUND, Z_OBSTACLE, Z_TOP = 0.05, 0.08, 2.3     # a kerb is 0.15 m high
     Z_LIDAR = 0.30             # lidar returns below this are not placed in the map as obstacles
 
-    def __init__(self, world, mode, noise, rng, depth, sky):
+    def __init__(self, world, mode, noise, rng, depth, sky, stereo_hz=5.0, mono_hz=5.0):
         self.mode, self.noise, self.rng, self.depth = mode, noise, rng, depth
+        # How often each network runs is a matter of how much computing there is, not of the
+        # method: the maps add up the time each answer stands for, not the number of answers.
+        # The cameras can deliver a frame per perception tick.
+        self.stereo_every = max(1, int(round(1.0 / (stereo_hz * PERCEPTION_DT))))
+        self.mono_every = max(1, int(round(1.0 / (mono_hz * PERCEPTION_DT))))
         self.name = "Chrono::Sensor " + mode.replace("+", " + ")
         self.body = world.car.GetChassisBody()
         self.system = world.system
@@ -264,8 +278,12 @@ class SensorRig:
         ref_p, ref_R = self.frames[t] = self._frame()
         while len(self.frames) > 12:
             self.frames.popitem(last=False)
-        self.manager.Update()
         self.tick += 1
+        # Rendering is most of the work of a run. The cameras are therefore only rendered on the
+        # ticks at which a network takes their frame. A lidar is read on every tick.
+        take_stereo, take_mono = self.tick % self.stereo_every == 0, self.tick % self.mono_every == 0
+        if take_stereo or take_mono or self.lidar is not None:
+            self.manager.Update()
         fresh = set()
         for cam in self.cameras:
             buf = cam["sensor"].GetMostRecentRGBA8Buffer()
@@ -282,15 +300,16 @@ class SensorRig:
         # here and its result is used a fixed number of ticks later, with the pose the car had
         # when the images were taken.
         monos = self.cameras[2:]
-        if self.tick % self.STEREO_EVERY == 0 and {"front", "right"} <= fresh and \
+        # (the quicker answer is asked for first: the answers come back in the order of the requests)
+        if take_mono and all(c["label"] in fresh for c in monos):
+            ident = self.depth.submit("mono", [c["image"][::-1] for c in monos])
+            self.pending.append((self.tick + int(round(self.MONO_LAG / PERCEPTION_DT)), ident, monos, monos[0]["stamp"],
+                                 [c["image"] for c in monos]))
+        if take_stereo and {"front", "right"} <= fresh and \
                 self.left["stamp"] == self.right["stamp"]:
             ident = self.depth.submit("stereo", [self.left["image"][::-1], self.right["image"][::-1]])
-            self.pending.append((self.tick + self.STEREO_LAG, ident, [self.left], self.left["stamp"],
+            self.pending.append((self.tick + int(round(self.STEREO_LAG / PERCEPTION_DT)), ident, [self.left], self.left["stamp"],
                                  [self.left["image"]]))
-        if self.tick % self.MONO_EVERY == self.MONO_EVERY // 2 and all(c["label"] in fresh for c in monos):
-            ident = self.depth.submit("mono", [c["image"][::-1] for c in monos])
-            self.pending.append((self.tick + self.MONO_LAG, ident, monos, monos[0]["stamp"],
-                                 [c["image"] for c in monos]))
         scans, dets, paint = [], [], []
         while self.pending and self.pending[0][0] <= self.tick:
             _, ident, cams, stamp, images = self.pending.pop(0)
@@ -302,17 +321,19 @@ class SensorRig:
                 if rng_img is None:
                     continue
                 scan, xy, segs = self._camera(cam, image, rng_img, *frame)
-                scans.append(scan)
-                dets += segs
+                # (each answer stands for the time since the one before it from the same network)
+                dt = (self.stereo_every if cam["role"] == "stereo" else self.mono_every) * PERCEPTION_DT
+                scans.append((dt,) + scan)
+                dets += [tuple(seg) + (dt,) for seg in segs]
                 paint.append(xy)
         if self.lidar is not None:
             buf = self.lidar["sensor"].GetMostRecentDIBuffer()
             stamp = round(buf.TimeStamp, 4) if buf.HasData() else -1.0
             if stamp != self.lidar["stamp"] and stamp in self.frames:
                 self.lidar["stamp"] = stamp
-                scans.append(self._scanner(self.lidar, buf.GetDIData()[..., 0], *self.frames[stamp], self.LIDAR_RANGE,
-                                           0.02, 0.01, int(round(math.degrees(self.LIDAR_HFOV) / 0.5)),
-                                           0.5 * self.LIDAR_HFOV, self.Z_LIDAR))
+                scans.append((PERCEPTION_DT,) + self._scanner(
+                    self.lidar, buf.GetDIData()[..., 0], *self.frames[stamp], self.LIDAR_RANGE, 0.02, 0.01,
+                    int(round(math.degrees(self.LIDAR_HFOV) / 0.5)), 0.5 * self.LIDAR_HFOV, self.Z_LIDAR))
         if paint:
             self.paint = np.concatenate(paint)
         return scans, dets

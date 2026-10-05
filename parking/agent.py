@@ -56,8 +56,8 @@ class ParkingSim:
         rng = np.random.default_rng(args.seed + 7919)
         rig = args.sensors != "sim"
         self.world = World(self.scn, visual=rig or not args.headless, tire=args.tire)   # sensors render the visual assets
-        self.sensor = SensorRig(self.world, args.sensors, args.noise, rng, start_depth_worker(args), args.sky) \
-            if rig else Perception(self.scn, args.noise, rng)
+        self.sensor = SensorRig(self.world, args.sensors, args.noise, rng, start_depth_worker(args), args.sky,
+                                args.stereo_hz, args.mono_hz) if rig else Perception(self.scn, args.noise, rng)
         self.grid = GridMap(self.scn.bounds)
         self.lines = LineMap(keep=rig)
         self.planner = Planner()
@@ -99,9 +99,10 @@ class ParkingSim:
         print("[parking] perception: %s" % self.sensor.name, flush=True)
         if rig:
             info = self.sensor.depth.info
-            print("[parking] depth from images: %s (%s) for the stereo pair, %s for the single cameras, on %s of %s; "
-                  "sky: %s" % (info["model"], info["weights"], info["mono"], info["device"], info["where"], args.sky),
-                  flush=True)
+            print("[parking] depth from images: %s (%s) for the stereo pair at %.3g Hz, %s for the single cameras at "
+                  "%.3g Hz, on %s of %s; sky: %s" % (
+                      info["model"], info["weights"], 1.0 / (self.sensor.stereo_every * PERCEPTION_DT), info["mono"],
+                      1.0 / (self.sensor.mono_every * PERCEPTION_DT), info["device"], info["where"], args.sky), flush=True)
 
     @property
     def time(self):
@@ -180,8 +181,8 @@ class ParkingSim:
     def _perceive(self):
         scans, dets = self.sensor.sense(self.pose)
         hits = [np.zeros((0, 2))]
-        for origin, ang, r_hit, r_free, *more in scans:
-            self.grid.update(origin, ang, r_hit, r_free, *more)
+        for dt, origin, ang, r_hit, r_free, *more in scans:
+            self.grid.update(origin, ang, r_hit, r_free, *more, dt=dt)
             ok = np.isfinite(r_hit)
             hits.append(np.stack([origin[0] + r_hit[ok] * np.cos(ang[ok]), origin[1] + r_hit[ok] * np.sin(ang[ok])], axis=1))
         self.grid.mark_free(self.pose)
@@ -226,7 +227,7 @@ class ParkingSim:
         ctr = np.array(self.pose[:2]) + EGO.center * fwd
         best = None
         for s in self.slots:
-            if s.status != Slot.FREE or s.hits < 8:
+            if s.status != Slot.FREE or s.watched < 0.65:        # (both lines watched for that long)
                 continue
             # a stall the planner turned down is left alone until the car has moved on a few metres
             # (its estimate may have been poor), and for good after three attempts
@@ -323,7 +324,7 @@ class ParkingSim:
             ref, near, seen = self.target.center, 7.0, self.target.status != Slot.UNKNOWN
         else:      # no stall recognised under the box (yet): go right up to it before planning
             ref, near, cells = np.array(self.manual[:2]), 1.5, self._box_cells()
-            seen = cells is None or (self.grid.free[cells[1]] >= 1)[cells[0]].mean() > 0.6 or \
+            seen = cells is None or self.grid.seen_free()[cells[1]][cells[0]].mean() > 0.6 or \
                 self.grid.occupied()[cells[1]][cells[0]].sum() >= 6
         ahead = (ref - np.array(self.pose[:2])) @ self.travel_dir
         if (ahead < near and seen) or ahead < -1.5:
@@ -366,7 +367,7 @@ class ParkingSim:
                 # A parallel stall lies open to the lane: what a camera has not seen of it is small.
                 # Only fill gaps, within 0.5 m of ground seen to be free. Its far side is the kerb,
                 # which a camera cannot tell from the road until it is close.
-                mask = mask & self.grid.grow(self.grid.free >= 1, 5)[sl]
+                mask = mask & self.grid.grow(self.grid.seen_free(), 5)[sl]
             occ[sl] &= ~mask | self.grid.occupied()[sl]
         self.state = "PLAN"
         self.say("planning ...")
