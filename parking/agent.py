@@ -49,6 +49,8 @@ def start_depth_worker(args):
 
 class ParkingSim:
     MAX_REPLANS = 6
+    SEARCH_REACH = 40.0      # how far along the lane the car looks for a stall [m]
+    MAP = (20.0, 45.0, 15.0)     # the map covers this much behind, ahead and to each side of where the car starts [m]
     MAX_CORRECTIONS = 2
 
     def __init__(self, args):
@@ -59,9 +61,9 @@ class ParkingSim:
         self.world = World(self.scn, visual=rig or not args.headless, tire=args.tire, wear=args.wear,
                            bumps=0.01 * args.bumps)        # (sensors render the visual assets)
         self.sensor = SensorRig(self.world, args.sensors, args.noise, rng, start_depth_worker(args), args.sky,
-                                args.stereo_hz, args.mono_hz, args.stereo_rows) if rig else \
+                                args.stereo_hz, args.mono_hz, args.stereo_rows, args.give) if rig else \
             Perception(self.scn, args.noise, rng)
-        self.grid = GridMap(self.scn.bounds)
+        self.grid = None             # (made once the car knows where it is: see below)
         self.lines = LineMap(keep=rig)
         self.planner = Planner()
         self.planner.table()          # tabulate the Reeds-Shepp heuristic up front (~1 s)
@@ -76,12 +78,12 @@ class ParkingSim:
         self.watch = []                # recent estimates of the leading candidate stall
         self.manual = None             # user-requested pose of the car's middle (x, y, heading)
         self.nose_in = False
-        self.trail = [np.array(self.scn.start[:2])]
+        self.trail = None
         self.dets, self.scan = [], np.zeros((0, 2))
         self.cmd = (0.0, 0.0, EGO.torque(A_BRAKE))     # steering angle, drive torque, brake torque
         self.steps = 0
         self.t_still = None
-        self.replans = self.corrections = self.blocked = 0
+        self.replans = self.corrections = self.blocked = self.lane_blocked = 0
         self.must_replan = False
         self.watch_margin = True       # whether the path monitor still asks for more margin on this plan
         self.plan_info = None          # statistics and search tree of the last plan
@@ -90,12 +92,25 @@ class ParkingSim:
         self.min_clearance = float("inf")
         self.gear_changes = 0
         self.result = None
-        # The car goes by where it thinks it is (pose), which is the truth unless --pose-noise is set.
-        # Where it really is (true_pose) is for the score, and for what localization.py owns up to.
+        # The car goes by where it thinks it is (pose). Where it really is (true_pose) is for the score.
         self.true_pose, self.speed = self.world.state()
-        self.odo = Localization(self.true_pose, np.random.default_rng(args.seed + 4441), args.pose, args.pose_noise)
+        self.odo = Localization(self.true_pose, np.random.default_rng(args.seed + 4441), args.pose,
+                                0.0 if "pose" in args.give else args.pose_noise, "speed" in args.give)
         self.pose = self.odo.pose
+        # What the car assumes about the place: it starts on a lane and aligned with it, and
+        # stalls may be on either side. It is not told where the lane ends or how big the lot
+        # is (unless --give lane, map): it looks for a stall straight ahead for SEARCH_REACH,
+        # and maps a fixed area around where it started.
+        self.origin = self.pose
         self.travel_dir = np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
+        self.trail = [np.array(self.pose[:2])]
+        if "map" in args.give:
+            self.grid = GridMap(self.scn.bounds)
+        else:
+            back, ahead, side = self.MAP
+            fwd, left = self.travel_dir, np.array([-self.travel_dir[1], self.travel_dir[0]])
+            box = np.array([np.array(self.pose[:2]) + a * fwd + b * left for a in (-back, ahead) for b in (-side, side)])
+            self.grid = GridMap((box[:, 0].min(), box[:, 1].min(), box[:, 0].max(), box[:, 1].max()))
         self.park_dir = self.travel_dir          # which way a parallel-parked car should face
         car = self.world.car
         print("[parking] vehicle: Chrono::Vehicle Sedan, full multibody model (%s front / %s rear suspension, "
@@ -143,16 +158,35 @@ class ParkingSim:
 
     def _locate(self):
         self.true_pose, v = self.world.state()
-        self.pose, self.speed = self.odo.update(self.true_pose, self.time), self.odo.speed(v)
+        self.pose, self.speed = self.odo.update(self.true_pose, self.time, self.world.wheel_travel()), self.odo.speed(v)
 
     def _follow(self, seg, presteer=True):
         self.tracker.start(seg, self.time, presteer)
 
     def _search_route(self):
+        """Straight on along the lane the car started on, from where it is now."""
         x, y, th = self.pose
-        y0, n = self.scn.start[1], max(2, int((self.scn.route_end - x) / 0.1))
-        xs = np.linspace(x, self.scn.route_end, n)
-        return Segment(np.stack([xs, np.full(n, y0), np.zeros(n)], axis=1), np.zeros(n), 1, V_SEARCH)
+        if "lane" in self.args.give:         # the scenario's own line and end
+            y0, n = self.scn.start[1], max(2, int((self.scn.route_end - x) / 0.1))
+            xs = np.linspace(x, self.scn.route_end, n)
+            return Segment(np.stack([xs, np.full(n, y0), np.zeros(n)], axis=1), np.zeros(n), 1, V_SEARCH)
+        o, fwd = np.array(self.origin[:2]), self.travel_dir
+        s0 = (np.array([x, y]) - o) @ fwd
+        s = np.linspace(s0, max(self.SEARCH_REACH, s0 + 0.2), max(2, int((self.SEARCH_REACH - s0) / 0.1)))
+        return Segment(np.stack([o[0] + s * fwd[0], o[1] + s * fwd[1], np.full(len(s), self.origin[2])], axis=1),
+                       np.zeros(len(s)), 1, V_SEARCH)
+
+    def _lane_blocked(self):
+        """Is something in the way within the next 6 m of the lane? (Nothing told the car that
+        the lane is clear.)"""
+        pts = self.grid.occupied_points()
+        if len(pts) == 0:
+            return False
+        x, y, th = self.pose
+        fwd = self.travel_dir
+        pts = pts[np.hypot(pts[:, 0] - x, pts[:, 1] - y) < 12.0]
+        poses = np.array([(x + d * fwd[0], y + d * fwd[1], th) for d in np.arange(1.0, 6.01, 0.5)])
+        return bool(len(pts)) and bool(footprint_hits(poses, pts, 0.10).any())
 
     def _control(self):
         t, v = self.time, self.speed
@@ -173,7 +207,8 @@ class ParkingSim:
                 if self.state == "SEARCH" and self.manual is not None:
                     self.state, self.t_still = "BRAKE", None
                 elif self.state == "SEARCH":
-                    self._finish(False, "reached the end of the route without finding a usable stall")
+                    self._finish(False, "reached the end of the route without finding a usable stall" if "lane" in self.args.give
+                                 else "found no usable stall in %.0f m of lane" % self.SEARCH_REACH)
                 else:
                     self._segment_done()
         elif self.state == "BRAKE":
@@ -223,6 +258,11 @@ class ParkingSim:
                 self._decide()
             else:
                 self._approach()
+            if self.state == "SEARCH" and "lane" not in self.args.give:
+                self.lane_blocked = self.lane_blocked + 1 if self._lane_blocked() else 0
+                if self.lane_blocked >= 2:
+                    self.tracker.stop()
+                    self._finish(False, "something is in the way on the lane, stopping")
         elif self.state == "BRAKE":
             if self.target is not None:
                 self._retarget()
@@ -293,9 +333,11 @@ class ParkingSim:
         self.rejected = []
         self._snap()
         x, y, th = self.pose
-        on_route = abs(y - self.scn.start[1]) < 0.6 and abs(wrap(th - self.scn.start[2])) < 0.2
+        o, fwd = np.array(self.origin[:2]), self.travel_dir
+        off = np.array([x, y]) - o
+        on_route = abs(off[0] * fwd[1] - off[1] * fwd[0]) < 0.6 and abs(wrap(th - self.origin[2])) < 0.2
         ahead = (np.array(box[:2]) - np.array([x, y])) @ self.travel_dir
-        if on_route and ahead > 12.0 and self.scn.route_end - x > 3.0:
+        if on_route and ahead > 12.0 and self.SEARCH_REACH - off @ fwd > 3.0:
             self.say("driving up to the requested spot")
             self.state = "SEARCH"
             self._follow(self._search_route(), presteer=abs(self.speed) < 0.1)

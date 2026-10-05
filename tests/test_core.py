@@ -286,6 +286,19 @@ def test_depth_from_images():
     part = rig._stereo_rows(disp[160:544])
     lo, hi = (rig.CAM_H - 544) // 2, (rig.CAM_H - 160) // 2                               # the same rows, from the bottom, at half size
     assert np.array_equal(part[lo + 1:hi - 1], whole[lo + 1:hi - 1]) and not part[:lo].any() and not part[hi:].any()
+    # the car's lean and height from the road in a depth image: a camera 1.3 m up, the car nose-down by 0.8 degrees
+    for pitch_deg, up in ((0.8, 1.30), (-0.5, 1.36), (0.0, 1.33)):
+        rig.own, rig.plane, rig.lean, rig.height = (-2.4, 2.4, 0.92), None, np.eye(3), None
+        cam = dict(pos=np.array([0.6, 0.15, 1.05]), R=np.eye(3))
+        _, zc, Rc = _ground_view(rig, up, math.radians(pitch_deg))
+        rng_c = np.where(zc < 60.0, zc / rig.rays[..., 0], 0.0).astype(np.float32)        # range along each ray
+        for _ in range(2):
+            rig._road_plane(cam, rng_c)
+        assert rig.height is not None, "no road found"
+        level = rig.lean @ cam["pos"]
+        got = math.degrees(math.asin(rig.lean[2, 0]))
+        assert abs(level[2] + rig.height - up) < 0.004, (level[2] + rig.height, up)       # the camera is where it is above the road
+        assert abs(abs(got) - abs(pitch_deg)) < 0.03 and abs(rig.lean[2, 1]) < 5e-4, (got, pitch_deg)
     step = (rig.CAM_F * rig.BASELINE / zf).astype(np.float32)
     step[:, 480:] += 6.0                                                                  # something nearer on one side
     r = rig._stereo_range(step)               # (rows 100 to 145 show the road from 5 m on, where 6 pixels is a jump)

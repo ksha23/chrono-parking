@@ -53,9 +53,9 @@ def record(out, sim_args):
     SensorRig._camera = camera_noted
     sense = sim.sensor.sense
 
-    def sense_kept(pose):
+    def sense_kept(pose, *rest):
         labels.clear()
-        scans, dets = sense(pose)
+        scans, dets = sense(pose, *rest)
         frames.append(dict(t=sim.time, pose=tuple(pose), scans=scans, dets=dets, cams=list(labels)))
         return scans, dets
 

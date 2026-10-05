@@ -64,8 +64,9 @@ python parking_sim.py --headless --seed 7 --noise 2     # no window, prints a re
 | `--stereo-rows` | `TOP,BOTTOM`, for example `160,544` | give the stereo network only these rows of the 600 of an image, counted from the top: above is sky, below is the car's own bonnet. Default: all rows |
 | `--stereo-hz`, `--mono-hz` | per second, default 5 | how often the stereo network and the monocular network run, up to the 10 frames per second of the cameras. The maps add up time, not frames, so nothing is tuned to a rate: see [docs/sensors.md](docs/sensors.md#how-often-the-networks-run) |
 | `--sky` | `clear`, `low`, `overcast` | light for the sensors: sun at 41 degrees, sun at 32 degrees, or a grey sky. Default: by the seed |
-| `--pose-noise` | scale, default 0 | how well the car knows its own pose. At 1 its position is off by a slowly wandering 10 cm and its heading by 0.3 degrees, like a satellite receiver with an inertial unit, and its pitch and roll by 0.15 degrees. `--pose odometry` gives dead reckoning instead, which drifts. 0 = it knows the truth |
-| `--bumps` | cm, default 0 | how uneven the road is: up to this much up and down, in waves 6 to 25 m long. Try 1.5 |
+| `--pose-noise` | scale, default 1 | how well the car knows where it is. At 1 its position is off by a slowly wandering 10 cm and its heading by 0.3 degrees, like a satellite receiver with an inertial unit. `--pose odometry` gives dead reckoning instead, which drifts |
+| `--bumps` | cm, default 1.5 | how uneven the road is: up to this much up and down, in waves 6 to 25 m long |
+| `--give` | any of `pose`, `attitude`, `speed`, `lane`, `map`, or `all` | tell the car things a real car would not know, to tell causes apart. Default: nothing. See [docs/sensors.md](docs/sensors.md#limits) |
 | `--wear` | scale, default 1 | worn paint: every line is patchy with ragged edges, one in four is faded and one in twelve is barely lighter than the road. 0 = clean bars, as the results below were measured with |
 | `--depth-host` | ssh host | run the depth networks on another machine, see [docs/sensors.md](docs/sensors.md#what-it-needs) |
 | `--type` | `perpendicular`, `angled`, `parallel` | kind of stalls |
@@ -127,9 +128,11 @@ identified online while it drives.
 ## Results
 
 A run counts as parked when the car ends inside the lines of a free stall without having touched
-anything. All offsets are measured against the ground-truth stall. The numbers below were measured
-with clean paint (`--wear 0`). The lines are worn by default now, and the set has not been run
-again with that yet.
+anything. All offsets are measured against the ground-truth stall. **The numbers below are from
+before the car stopped being told things a real car would not know**: its true pose, pitch, roll,
+height and speed, the lane and the extent of the lot, on a flat road with clean paint
+(`--give all --wear 0 --bumps 0`, and a 2 ms simulation step). None of that is the default any
+more. A run of the set as it is now is under way.
 
 | Perception | Parked, seeds 1 to 3 | Seeds 4 to 6 | Unseen seeds 7 to 9 | Lateral offset | Heading error | Smallest clearance |
 | --- | --- | --- | --- | --- | --- | --- |

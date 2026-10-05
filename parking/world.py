@@ -145,7 +145,7 @@ class World:
         sedan.SetChassisFixed(False)
         sedan.SetInitPosition(chrono.ChCoordsysd(chrono.ChVector3d(x, y, 0.25 + self.ground.height(x, y)), chrono.QuatFromAngleZ(th)))
         sedan.SetTireType(veh.TireModelType_PAC02 if tire == "pac02" else veh.TireModelType_TMEASY)
-        sedan.SetTireStepSize(1e-3)
+        sedan.SetTireStepSize(STEP)
         sedan.SetBrakeType(veh.BrakeType_SHAFTS)     # the simple brake cannot hold the car still
         sedan.Initialize()
         vt = chrono.VisualizationType_MESH if visual else chrono.VisualizationType_NONE
@@ -186,6 +186,15 @@ class World:
         self._decor(visual)
         self._parked_cars(visual)
         self._actuators()
+        # The radius the rear wheels roll on, by the usual rule: two parts the radius of the free
+        # tire and one part the height of the axle over the road when the car stands. That is
+        # geometry the car knows about itself. (It is 1 percent less than the free radius here.)
+        rear = self.car.GetDriveline().GetDrivenAxleIndexes()
+        self.rear = 1 if 0 in list(rear) else 0
+        stand = np.mean([self.car.GetSpindlePos(self.rear, s).z - self.ground.height(self.car.GetSpindlePos(self.rear, s).x,
+                                                                                  self.car.GetSpindlePos(self.rear, s).y)
+                         for s in (veh.LEFT, veh.RIGHT)])
+        self.roll_radius = (2.0 * EGO.wheel_radius + float(stand)) / 3.0
 
     # ---- actuators: the car is driven by physical commands, not by pedal positions -------------
 
@@ -322,6 +331,12 @@ class World:
                 else:
                     self._box(body, 2.0 * half, 2.0 * m["hw"], 1.3, (mid, 0.0, 0.5), 0.0, (0.5, 0.5, 0.55))
             self.system.Add(body)
+
+    def wheel_travel(self):
+        """How far the axle that is not driven has rolled since the start [m], forwards positive:
+        what a wheel encoder counts."""
+        turn = np.mean([self.car.GetSuspension(self.rear).GetAxle(s).GetPos() for s in (veh.LEFT, veh.RIGHT)])
+        return -float(turn) * self.roll_radius
 
     def state(self):
         """Rear-axle pose (x, y, heading) and signed forward speed."""

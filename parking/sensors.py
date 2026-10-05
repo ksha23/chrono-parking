@@ -177,8 +177,14 @@ class SensorRig:
     Z_GROUND, Z_OBSTACLE, Z_TOP = 0.05, 0.08, 2.3     # a kerb is 0.15 m high
     Z_LIDAR = 0.30             # lidar returns below this are not placed in the map as obstacles
 
-    def __init__(self, world, mode, noise, rng, depth, sky, stereo_hz=5.0, mono_hz=5.0, stereo_rows=None):
+    def __init__(self, world, mode, noise, rng, depth, sky, stereo_hz=5.0, mono_hz=5.0, stereo_rows=None, given=()):
         self.mode, self.noise, self.rng, self.depth = mode, noise, rng, depth
+        # How the car leans and how high it rides come from the road the stereo pair sees
+        # (_road_plane), unless it is told ('attitude' in given).
+        self.own_attitude = "attitude" not in given
+        self.lean, self.height = np.eye(3), None          # chassis frame to a frame level with the road, and its height above it
+        self.plane = None                                 # the road in the chassis frame: z = a x + b y + c
+        self.believed = collections.OrderedDict()         # where the car thought it was at the time of each render
         # The rows of the stereo images that go to the network, counted from the top. The top of
         # an image is sky and the bottom is the car's own bonnet, and the network spends as long
         # on those rows as on the road. (Even numbers: the range image is made of 2 x 2 blocks.)
@@ -287,6 +293,44 @@ class SensorRig:
                           p[2] - self.ground.height(p[0], p[1])]),
                 _rot_z(turn) @ R @ _rot_y(tilt[0]) @ roll)
 
+    def _own_frame(self, pose):
+        """The chassis frame from what the car itself knows: position and heading from its pose
+        estimate, lean and height from the road as the stereo pair last saw it."""
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        return (np.array([pose[0] + EGO.ref_to_rear * c, pose[1] + EGO.ref_to_rear * s, self.height or 0.0]),
+                _rot_z(pose[2]) @ self.lean)
+
+    def _road_plane(self, cam, depth):
+        """How the car leans and how high it rides, from the road in a depth image: a plane is
+        fitted to the points of the road 1 to 10 m ahead of the bumper, in the chassis frame.
+        Nothing else tells the car its pitch, its roll or its height: not under braking, when
+        the nose dips by a degree, and not on an uneven road, where the plane is that of the
+        road ahead. If too little road is in view, the last plane stays."""
+        P = cam["pos"].astype(np.float32) + depth[..., None] * (self.rays @ cam["R"].T.astype(np.float32))
+        x0, x1, hw = self.own
+        ok = (depth > 0.3) & (P[..., 0] > x1 + 1.0) & (P[..., 0] < x1 + 10.0) & (np.abs(P[..., 1]) < 5.0)
+        pts = P[ok]
+        if len(pts) < 2000:
+            return
+        pts = pts[::max(1, len(pts) // 8000)].astype(np.float64)
+        A = np.column_stack([pts[:, 0], pts[:, 1], np.ones(len(pts))])
+        if self.plane is None:
+            # the first time: the road is the lowest level surface in view
+            plane, gates = np.array([0.0, 0.0, np.quantile(pts[:, 2], 0.15)]), (0.15, 0.06, 0.03)
+        else:
+            plane, gates = self.plane, (0.08, 0.04, 0.025)
+        for gate in gates:
+            m = np.abs(pts[:, 2] - A @ plane) < gate
+            if m.sum() < 800 or np.ptp(pts[m, 0]) < 2.0:
+                return
+            plane = np.linalg.lstsq(A[m], pts[m, 2], rcond=None)[0]
+        a, b, c = plane
+        if abs(a) > 0.08 or abs(b) > 0.08:
+            return                             # no road lies at 5 degrees to the car
+        n = np.array([-a, -b, 1.0]) / math.sqrt(a * a + b * b + 1.0)       # the road's normal in the chassis frame
+        K = np.array([[0.0, 0.0, -n[0]], [0.0, 0.0, -n[1]], [n[0], n[1], 0.0]])       # (turns it onto the vertical)
+        self.plane, self.lean, self.height = plane, np.eye(3) + K + K @ K / (1.0 + n[2]), -c * n[2]
+
     def _develop(self, cam, rgba):
         """What a camera delivers for a rendered frame: its own exposure and the noise of its
         sensor, different in every camera and every frame."""
@@ -303,10 +347,16 @@ class SensorRig:
         the error of the pitch and roll it assumes (None: it knows all of that exactly). What the
         sensors show is put into the map with those, not with the truth."""
         t = round(self.system.GetChTime(), 4)
-        exact = tilt is None and self.ground.amp == 0.0
-        ref_p, ref_R = self.frames[t] = self._frame() if exact else self._believed_frame(pose, tilt or (0.0, 0.0))
+        if self.own_attitude:
+            self.believed[t] = pose
+            ref_p, ref_R = self.frames[t] = self._own_frame(pose)
+        else:
+            exact = tilt is None and self.ground.amp == 0.0
+            ref_p, ref_R = self.frames[t] = self._frame() if exact else self._believed_frame(pose, tilt or (0.0, 0.0))
         while len(self.frames) > 12:
             self.frames.popitem(last=False)
+        while len(self.believed) > 12:
+            self.believed.popitem(last=False)
         self.tick += 1
         # Rendering is most of the work of a run. The cameras are therefore only rendered on the
         # ticks at which a network takes their frame. A lidar is read on every tick.
@@ -346,8 +396,17 @@ class SensorRig:
             maps = self.depth.collect(ident)
             for cam, image, out in zip(cams, images, maps):
                 frame = self.frames[stamp]
-                rng_img = self._stereo_rows(out) if cam["role"] == "stereo" else \
-                    self._mono_range(cam, out[::-1], *frame)
+                if cam["role"] == "stereo":
+                    rng_img = self._stereo_rows(out)
+                    if self.own_attitude:      # this answer shows the road: take the car's lean and height from it
+                        self._road_plane(cam, rng_img)
+                        frame = self.frames[stamp] = self._own_frame(self.believed[stamp])
+                elif self.own_attitude and self.height is not None:
+                    frame = self._own_frame(self.believed[stamp])      # (as the pair last saw it)
+                if self.own_attitude and self.height is None:
+                    continue                   # nothing can be placed before the road has been seen once
+                if cam["role"] != "stereo":
+                    rng_img = self._mono_range(cam, out[::-1], *frame)
                 if rng_img is None:
                     continue
                 scan, xy, segs = self._camera(cam, image, rng_img, *frame)
@@ -359,7 +418,7 @@ class SensorRig:
         if self.lidar is not None:
             buf = self.lidar["sensor"].GetMostRecentDIBuffer()
             stamp = round(buf.TimeStamp, 4) if buf.HasData() else -1.0
-            if stamp != self.lidar["stamp"] and stamp in self.frames:
+            if stamp != self.lidar["stamp"] and stamp in self.frames and not (self.own_attitude and self.height is None):
                 self.lidar["stamp"] = stamp
                 scans.append((PERCEPTION_DT,) + self._scanner(
                     self.lidar, buf.GetDIData()[..., 0], *self.frames[stamp], self.LIDAR_RANGE, 0.02, 0.01,

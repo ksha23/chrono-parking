@@ -1,10 +1,9 @@
 """Where the car thinks it is.
 
 Everything the agent does goes by an estimate of its pose: where it puts what the sensors show, the
-plan, the steering. With --pose-noise 0, which is still the default, that estimate is the true
-pose. And with any setting the car is still told more than it could know: its true height above
-the road, and a pitch and roll that are the true ones with an error added (SensorRig._believed_frame),
-so the dive under braking is known for free. Its speed is the true one as well."""
+plan, the steering. The true pose is for the physics and the score, unless the car is told it
+(--give pose). How it leans and how high it rides it has to see for itself (SensorRig._road_plane),
+and its speed it counts off its wheels."""
 
 import math
 
@@ -30,13 +29,24 @@ class Localization:
     With either, the pitch and the roll are off by 0.15 degrees for the run (how well the cameras
     are levelled to the body) plus 0.1 degrees that wander with a time constant of a second.
 
-    All of these are multiplied by `scale`. At scale 0 the car knows its true pose."""
+    All of these are multiplied by `scale`. At scale 0 the car knows its true pose.
+
+    The speed comes from the wheels in either case: an encoder on the axle that is not driven,
+    which gives a count every 2.2 cm of travel (a 48-tooth ring read on both edges), with a
+    rolling radius known to 0.5 percent. The speed is one count over the time since the count
+    before, so it is fine at driving speed and coarse at a crawl, and when the car stops the
+    reading only falls as fast as the wait for the next count allows. With `true_speed` the car
+    is told its speed."""
 
     SOURCES = ("gps", "odometry")
+    COUNT = 2.0 * math.pi * 0.33 / 96.0          # travel per encoder count [m]
 
-    def __init__(self, pose, rng, source="gps", scale=1.0):
+    def __init__(self, pose, rng, source="gps", scale=1.0, true_speed=False):
         self.source, self.scale, self.rng = source, scale, rng
         self.true, self.t = tuple(pose), None
+        self.true_speed = true_speed
+        self.k_wheel = 1.0 + 0.005 * float(rng.normal())
+        self.rolled, self.counts, self.t_count, self.v_wheel = 0.0, 0, None, 0.0
         self.level = np.radians(0.15) * scale * rng.normal(size=2)          # pitch, roll: the constant part
         self.wander = np.zeros(2)
         if source == "gps":
@@ -54,10 +64,12 @@ class Localization:
     def _gps(self):
         return (self.true[0] + self.error[0], self.true[1] + self.error[1], wrap(self.true[2] + self.error[2]))
 
-    def update(self, true, t):
-        """The estimate after the car has moved to the pose `true` at time t."""
+    def update(self, true, t, rolled=None):
+        """The estimate after the car has moved to the pose `true` at time t. rolled: how far
+        its wheels have rolled since the start (if not given, the travel along the car is used)."""
         dt = 0.0 if self.t is None else t - self.t
         before, self.true, self.t = self.true, tuple(true), t
+        self._encoder(before, dt, rolled)
         if self.scale == 0.0:
             self.pose = self.true
             return self.pose
@@ -79,8 +91,37 @@ class Localization:
         self.pose = (x + ds * math.cos(th + 0.5 * dth), y + ds * math.sin(th + 0.5 * dth), wrap(th + dth))
         return self.pose
 
+    def _encoder(self, before, dt, rolled):
+        """Count what the wheels have rolled since the last call, and time the counts."""
+        if dt <= 0.0:
+            return
+        if rolled is None:
+            mid = before[2] + 0.5 * wrap(self.true[2] - before[2])
+            ds = ((self.true[0] - before[0]) * math.cos(mid) + (self.true[1] - before[1]) * math.sin(mid)) * self.k_wheel
+        else:
+            ds = rolled * self.k_wheel - self.rolled
+        if ds == 0.0:
+            ds = 1e-12
+        self.rolled += ds
+        counts = math.floor(self.rolled / self.COUNT)
+        if counts != self.counts:
+            # when the last of these counts came, within the step
+            edge = counts if ds > 0.0 else counts + 1
+            t_edge = self.t - dt * (self.rolled - edge * self.COUNT) / ds
+            if self.t_count is not None and t_edge > self.t_count:
+                self.v_wheel = (counts - self.counts) * self.COUNT / (t_edge - self.t_count)
+            self.counts, self.t_count = counts, t_edge
+        elif self.t_count is not None:
+            # no count: the car cannot be faster than one count in the time it has waited
+            most = self.COUNT / max(self.t - self.t_count, 1e-6)
+            if abs(self.v_wheel) > most:
+                self.v_wheel = math.copysign(most, self.v_wheel)
+            if most < 0.01:
+                self.v_wheel = 0.0
+
     def speed(self, v):
-        return v * self.k_dist if self.scale else v
+        """The speed the car measures, given the true one."""
+        return v if self.true_speed else self.v_wheel
 
     @property
     def tilt(self):

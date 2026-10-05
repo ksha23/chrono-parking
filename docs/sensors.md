@@ -652,29 +652,28 @@ made of that data shows up in three more places:
 
 ## Limits
 
-- **The car is told things a real car would not know.** An audit of the code against that
-  question found these, most important first:
-  - *Its pose.* By default every range and every line is placed with the true position,
-    heading, height, pitch and roll of the car at the instant of the image, which is the main
-    reason it ends up within a centimetre or two of the stall's middle. `--pose-noise 1` replaces
-    position and heading by an estimate that is off by a slowly wandering 10 cm and 0.3 degrees
-    (`parking/localization.py`). Even then the height is the true one, and pitch and roll are
-    the true ones plus 0.15 degrees and a wander of 0.1 degrees, so the dive under braking is
-    known for free.
-  - *The lane.* The car is given the line to search along, where it ends, and that it is clear:
-    nothing checks for obstacles while it searches.
-  - *Its speed*, exactly, which stopping within 1.5 cm of the end of a path relies on.
-  - *The extent of the map*, which ends on the kerbs of the scenario.
-  - *Perfect calibration and timing.* Only the right camera of the pair is misaligned, by
-    0.015 degrees. Image and pose have the same time stamp, and a network's answer takes a fixed
-    0.2 s.
-  - *The exposure*, set once from the known brightness of the road.
-  `--bumps 1.5` makes the road rise and fall by up to 1.5 cm in waves 6 to 25 m long, which the
-  car takes for the plane it stands on (`parking/ground.py`). Both switches are off by default
-  until the set of scenarios has been run with them. Three runs with both on and worn paint: a
-  perpendicular stall between two cars was parked 2 cm off centre, 13 cm deep and 0.6 degrees
-  off (0.5 cm, 6 cm and 0.1 degrees without), an angled one 7 cm off centre, and in a parallel
-  one the car drove past the free stall without recognising it.
+- **What the car is told, and what it is not.** An audit of the code found that the car was
+  given a good deal that a real car would not know. Most of that is gone:
+  - *Where it is.* It goes by a pose estimate (`parking/localization.py`): by default a
+    satellite receiver with an inertial unit, off by a slowly wandering 10 cm and 0.3 degrees.
+  - *How it leans and how high it rides.* From a plane fitted to the road the stereo pair sees
+    (`SensorRig._road_plane`), with nothing else. In one run the true pitch went from -1.2 to
+    +1.1 degrees under braking and acceleration, and the estimate was within 0.16 degrees of it
+    half the time and within 0.5 degrees nine times in ten. The height was within 1 cm half the
+    time.
+  - *Its speed.* From a wheel encoder on the rear axle: a count every 2.2 cm, the speed from
+    the time between counts.
+  - *The lane.* It assumes it starts on a lane and aligned with it, with stalls on either side.
+    It searches straight ahead for 40 m and stops if something is in the way.
+  - *The lot.* It maps a fixed area around where it started, not the extent of the scenario.
+  - *The road and the paint.* The road rises and falls by 1.5 cm (`parking/ground.py`) and no
+    line is as it was painted (`parking/paint.py`).
+  `--give pose,attitude,speed,lane,map` hands any of these back, to tell causes apart.
+  What it is still told: its cameras are mounted exactly as designed (only the right camera of
+  the pair is off, by 0.015 degrees), image and pose carry the same time stamp, a network's
+  answer always takes 0.2 s, the exposure is set once from the known brightness of the road,
+  and its own mass, geometry and brakes are exactly as modelled. The pose error is that of a
+  good receiver, and smooth.
 - **One exposure, no auto-exposure.** See above. A camera would adapt when it drives into shade.
 - **The rear camera does not see kerbs**, and places cars only within 1.9 m. Backing into a
   stall relies on what the stereo pair mapped while driving past.

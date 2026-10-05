@@ -148,20 +148,20 @@ agent, and `cli.py` starts one or both.
 
 | Module | Lines | Main names |
 | --- | --- | --- |
-| `cli.py` | 175 | `parse_args`, `main` |
-| `agent.py` | 660 | `ParkingSim` (state machine, decision, planning requests, refinement, monitor) |
+| `cli.py` | 186 | `parse_args`, `main` |
+| `agent.py` | 703 | `ParkingSim` (state machine, decision, planning requests, refinement, monitor) |
 | `chrono_env.py` | 87 | the PyChrono imports, and the rerun in a Python that has PyChrono |
-| `config.py` | 15 | `STEP`, `CONTROL_DT`, `PERCEPTION_DT`, speeds and acceleration limits |
+| `config.py` | 20 | `STEP`, `CONTROL_DT`, `PERCEPTION_DT`, speeds and acceleration limits |
 | `vehicle.py` | 51 | `Ego`, `EGO` (geometry, mass and limits read from the Chrono model) |
 | `geometry.py` | 66 | `rect_poly`, `ego_poly`, `poly_distance`, `footprint_hits` |
 | `scenario.py` | 216 | `Scenario`, `make_lot`, `make_street`, `parked_model` |
-| `world.py` | 305 | `World` (the model, the scene, the physical actuation in `step`), `surface_textures`, `light_scene` |
+| `world.py` | 347 | `World` (the model, the scene, the physical actuation in `step`), `surface_textures`, `light_scene` |
 | `perception.py` | 233 | `Perception` (stand-in), `planar_scan`, `paint_segments`, the ray helpers |
-| `sensors.py` | 565 | `SensorRig`, `DepthWorker`, `sensor_mounts` |
+| `sensors.py` | 624 | `SensorRig`, `DepthWorker`, `sensor_mounts` |
 | `stereo_worker.py` | 251 | the process that runs IGEV++ and Depth Anything V2 |
-| `localization.py` | 101 | `Localization`: the pose the car believes it has (satellite receiver with inertial unit, or dead reckoning) |
+| `localization.py` | 145 | `Localization`: the pose the car believes it has (satellite receiver with inertial unit, or dead reckoning) |
 | `paint.py` | 90 | `paint_textures`, `lay`: worn paint for the lines |
-| `ground.py` | 65 | `Ground`: the height of the road, flat or uneven |
+| `ground.py` | 83 | `Ground`: the height of the road, flat or uneven |
 | `mapping.py` | 298 | `GridMap`, `LineTrack`, `LineMap` |
 | `stalls.py` | 290 | `Slot`, `find_slots`, `_classify`, `_align_with_kerb` |
 | `reeds_shepp.py` | 179 | `_rs_words`, `rs_paths`, `rs_length_table`, `rs_sample` |

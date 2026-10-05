@@ -18,6 +18,9 @@ TOUR = [("perpendicular", "both"), ("perpendicular", "left"), ("perpendicular", 
         ("parallel", "none")]
 
 
+GIVEN = ("pose", "attitude", "speed", "lane", "map")
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description="Automated parking in Project Chrono: perpendicular, angled and parallel stalls.",
@@ -71,22 +74,26 @@ def parse_args(argv=None):
     ap.add_argument("--igev", default=None, metavar="DIR",
                     help="checkout of the IGEV++ repository with its weights (default: third_party/IGEV-plusplus)")
     ap.add_argument("--noise", type=float, default=1.0, help="perception noise scale (0 = perfect)")
+    ap.add_argument("--give", default="", metavar="LIST",
+                    help="what the car is told that a real car would not know, for telling causes apart: any of "
+                         + ", ".join(GIVEN) + ", separated by commas, or 'all'. Default: nothing. "
+                         "pose: its true position and heading. attitude: its true pitch, roll and height. "
+                         "speed: its true speed. lane: the line to search along and where it ends. "
+                         "map: the extent of the lot")
     ap.add_argument("--wear", type=float, default=1.0,
                     help="how worn the paint is. At 1 (default) every line is patchy and ragged, one in four is "
                          "faded and one in twelve is barely lighter than the road. Between 0 and 1 fewer are "
                          "faded. 0 = clean bars of flat grey, as the results in the docs were measured with")
-    # The next three make the world less kind as well. They are off by default until the whole
-    # set of scenarios has been run with them.
-    ap.add_argument("--bumps", type=float, default=0.0, metavar="CM",
-                    help="how uneven the road is: it rises and falls by up to this much, in waves 6 to 25 m long "
-                         "(try 1.5). 0 (default) = a perfect plane")
+    ap.add_argument("--bumps", type=float, default=1.5, metavar="CM",
+                    help="how uneven the road is: it rises and falls by up to this much, in waves 6 to 25 m long. "
+                         "0 = a perfect plane")
     ap.add_argument("--pose", choices=Localization.SOURCES, default="gps",
                     help="where the car gets its own pose from: a satellite receiver with an inertial unit, "
                          "whose error wanders slowly, or dead reckoning from wheel speed and yaw rate, "
                          "whose error grows as it drives")
-    ap.add_argument("--pose-noise", type=float, default=0.0,
-                    help="scale of the errors of that pose (at 1: 10 cm and 0.3 degrees with gps) and of the pitch "
-                         "and roll the car assumes (0.15 degrees). 0 (default) = it knows its true pose")
+    ap.add_argument("--pose-noise", type=float, default=1.0,
+                    help="scale of the errors of that pose: at 1, 10 cm and 0.3 degrees with gps. (--give pose "
+                         "takes them away altogether)")
     ap.add_argument("--seed", type=int, default=1, help="random seed (layout details and noise)")
     ap.add_argument("--tour", action="store_true", help="play through a set of scenarios one after another")
     ap.add_argument("--headless", action="store_true", help="no window, run as fast as possible")
@@ -107,6 +114,10 @@ def parse_args(argv=None):
     if args.target is not None and args.target != "drag":
         x, y, deg = (float(v) for v in args.target.split(","))
         args.target = (x, y, math.radians(deg))
+    given = set(GIVEN) if args.give.strip() == "all" else {g.strip() for g in args.give.split(",") if g.strip()}
+    if given - set(GIVEN):
+        ap.error("--give: unknown %s (it takes %s, or all)" % (", ".join(sorted(given - set(GIVEN))), ", ".join(GIVEN)))
+    args.give = given
     if args.stereo_rows is not None:
         try:
             top, bottom = (int(v) for v in args.stereo_rows.split(","))
