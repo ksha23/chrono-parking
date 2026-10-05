@@ -125,17 +125,18 @@ anything. All offsets are measured against the ground-truth stall.
 
 | Perception | Parked | Lateral offset | Heading error | Smallest clearance |
 | --- | --- | --- | --- | --- |
-| cameras: stereo pair, rear, bumper | 12 of 12 | at most 6.1 cm | at most 1.07 deg | 0.29 m |
-| cameras + forward lidar | 5 of 5 | at most 1.3 cm | at most 0.56 deg | 0.55 m |
+| cameras: stereo pair, rear, bumper | 40 of 42 | at most 8.0 cm | at most 2.44 deg | 0.18 m |
+| cameras + forward lidar | 18 of 18 | at most 5.9 cm | at most 0.81 deg | 0.21 m |
 | stand-in, no sensors | 74 of 74 | at most 3.1 cm | at most 1.46 deg | 0.23 m |
 
 
-**17 of the 60 sensor runs had finished when this was written.** The rest are running, and this page will be updated with them.
-
-The rig is being run on perpendicular, angled and parallel stalls with cars on both sides, one
-side or none, under a clear sky, a low sun and an overcast sky, and at double sensor noise. The
-stand-in was run on the 74 scenarios of the earlier versions. A run with the rig takes 3 to 4
-minutes, most of it in the stereo network, which is why it has fewer runs.
+The rig was run on perpendicular, angled and parallel stalls with cars on both sides, one side
+or none, under a clear sky, a low sun and an overcast sky, and at double sensor noise. The two
+runs that did not park are parallel stalls with a car on one side, where the stall was never
+recognised: a tick line seen in two pieces, and one half hidden by the parked car. Both are
+fixed in the commit after this batch and park with it. The stand-in was run on the 74 scenarios
+of the earlier versions. A run with the rig takes 3 to 4 minutes, most of it in the stereo
+network, which is why it has fewer runs.
 [docs/results.md](docs/results.md) has every row and the limits, and
 [docs/sensors.md](docs/sensors.md#how-good-it-is) measures the perception itself: range, obstacles
 and lines against the geometry of the scenario.
