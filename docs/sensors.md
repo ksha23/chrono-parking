@@ -42,6 +42,12 @@ cmake -S . -B build -DCH_ENABLE_MODULE_VEHICLE=ON -DCH_ENABLE_MODULE_IRRLICHT=ON
 cmake --build build
 ```
 
+`parking_sim.py` has to run with that PyChrono. Either start it with the build's Python and
+`PYTHONPATH=<build>/bin`, or tell it once where the build is: link the build's `bin` directory
+(the one that holds the `pychrono` package) as `third_party/pychrono`, or name it in
+`PARKING_PYCHRONO`. Any `python parking_sim.py` then starts again with that build and the Python
+it was made for, which is read from the build's `CMakeCache.txt`.
+
 Everything on this page was developed and tested with **Metal RT**. The scene uses features that
 the other backends may render differently (textures without mip-maps, glass as plain
 transparency, the exposure and vignette settings of the scene), so expect to retune the light on

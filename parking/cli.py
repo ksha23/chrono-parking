@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 from .agent import ParkingSim
-from .chrono_env import HAVE_SENSORS, sens
+from .chrono_env import HAVE_SENSORS, rerun_with_own_build, sens
 from .sensors import SensorRig, find_depth_python
 from .world import SKIES
 
@@ -93,9 +93,11 @@ def parse_args(argv=None):
     if args.sensors == "auto":
         args.sensors = "camera" if HAVE_SENSORS and (args.depth_host or find_depth_python(args.depth_python)) else "sim"
     elif args.sensors != "sim" and not HAVE_SENSORS:
+        rerun_with_own_build("this PyChrono has no cameras")
         ap.error("--sensors %s needs a PyChrono whose sensor module has cameras and lidar (a build "
                  "with a ray-tracing backend and Python bindings for it, see docs/sensors.md). This one has %s. "
-                 "Use --sensors sim to run without simulated sensors." %
+                 "If you have such a build, name its bin directory in PARKING_PYCHRONO or link it as "
+                 "third_party/pychrono. Use --sensors sim to run without simulated sensors." %
                  (args.sensors, "no sensor module" if sens is None else "only GPS and IMU sensors"))
     if args.layout == "sensors" and args.sensors == "sim":
         ap.error("--layout sensors shows the output of simulated sensors, and --sensors sim has none")
