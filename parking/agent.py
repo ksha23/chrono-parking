@@ -90,7 +90,8 @@ class ParkingSim:
         self.min_clearance = float("inf")
         self.gear_changes = 0
         self.result = None
-        # The car goes by where it thinks it is (pose). Where it really is (true_pose) is for the score.
+        # The car goes by where it thinks it is (pose), which is the truth unless --pose-noise is set.
+        # Where it really is (true_pose) is for the score, and for what localization.py owns up to.
         self.true_pose, self.speed = self.world.state()
         self.odo = Localization(self.true_pose, np.random.default_rng(args.seed + 4441), args.pose, args.pose_noise)
         self.pose = self.odo.pose

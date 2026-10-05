@@ -267,9 +267,10 @@ segments. Everything after `SensorRig.sense` is shared.
 
 The two images go to IGEV++ (Xu et al., 2024), a stereo network that builds cost volumes over
 several disparity ranges and refines the disparity iteratively. It runs with the weights its
-authors trained for the Middlebury benchmark on a mix of data sets, which did best on this scene
-among the published ones, and with 8 refinement iterations. Nothing was trained or tuned on this
-scene. From the disparity `d` of a pixel of the left image,
+authors trained for the Middlebury benchmark on a mix of data sets, and with 8 refinement
+iterations. No weights were trained on this scene, but that checkpoint was picked because it did
+best on it among the published ones, and the error model and the thresholds further down were
+set against it. From the disparity `d` of a pixel of the left image,
 
 ```math
 Z = \frac{f B}{d}, \qquad r = \frac{Z}{\hat{d}_x}, \qquad
@@ -651,19 +652,29 @@ made of that data shows up in three more places:
 
 ## Limits
 
-- **By default the pose is exact, the road is a plane and all paint is equally good.** Then
-  every range and every line is placed with the true pose, including the true pitch of the car
-  under braking, which is the main reason the car ends up within a centimetre or two of the
-  stall's middle. Three switches take that away: `--pose-noise 1` (the car goes by a pose that
-  is off by a slowly wandering 10 cm and 0.3 degrees, as from a satellite receiver with an
-  inertial unit, and by a pitch and roll that are off by 0.15 degrees: `parking/localization.py`),
-  `--bumps 1.5` (the road rises and falls by up to 1.5 cm in waves 6 to 25 m long, and the car
-  takes it for the plane it stands on: `parking/ground.py`) and `--wear 1` (some lines are
-  faded, a few to barely lighter than the road). They are off by default because the set of
-  scenarios has not been run with them. Three runs with all of them on: a perpendicular stall
-  between two cars was parked 2 cm off centre, 13 cm deep and 0.6 degrees off (0.5 cm, 6 cm and
-  0.1 degrees without), an angled one 7 cm off centre, and in a parallel one the car drove past
-  the free stall without recognising it.
+- **The car is told things a real car would not know.** An audit of the code against that
+  question found these, most important first:
+  - *Its pose.* By default every range and every line is placed with the true position,
+    heading, height, pitch and roll of the car at the instant of the image, which is the main
+    reason it ends up within a centimetre or two of the stall's middle. `--pose-noise 1` replaces
+    position and heading by an estimate that is off by a slowly wandering 10 cm and 0.3 degrees
+    (`parking/localization.py`). Even then the height is the true one, and pitch and roll are
+    the true ones plus 0.15 degrees and a wander of 0.1 degrees, so the dive under braking is
+    known for free.
+  - *The lane.* The car is given the line to search along, where it ends, and that it is clear:
+    nothing checks for obstacles while it searches.
+  - *Its speed*, exactly, which stopping within 1.5 cm of the end of a path relies on.
+  - *The extent of the map*, which ends on the kerbs of the scenario.
+  - *Perfect calibration and timing.* Only the right camera of the pair is misaligned, by
+    0.015 degrees. Image and pose have the same time stamp, and a network's answer takes a fixed
+    0.2 s.
+  - *The exposure*, set once from the known brightness of the road.
+  `--bumps 1.5` makes the road rise and fall by up to 1.5 cm in waves 6 to 25 m long, which the
+  car takes for the plane it stands on (`parking/ground.py`). Both switches are off by default
+  until the set of scenarios has been run with them. Three runs with both on and worn paint: a
+  perpendicular stall between two cars was parked 2 cm off centre, 13 cm deep and 0.6 degrees
+  off (0.5 cm, 6 cm and 0.1 degrees without), an angled one 7 cm off centre, and in a parallel
+  one the car drove past the free stall without recognising it.
 - **One exposure, no auto-exposure.** See above. A camera would adapt when it drives into shade.
 - **The rear camera does not see kerbs**, and places cars only within 1.9 m. Backing into a
   stall relies on what the stereo pair mapped while driving past.

@@ -1,7 +1,10 @@
 """Where the car thinks it is.
 
 Everything the agent does goes by an estimate of its pose: where it puts what the sensors show, the
-plan, the steering. The true pose is used for nothing but the physics and the score."""
+plan, the steering. With --pose-noise 0, which is still the default, that estimate is the true
+pose. And with any setting the car is still told more than it could know: its true height above
+the road, and a pitch and roll that are the true ones with an error added (SensorRig._believed_frame),
+so the dive under braking is known for free. Its speed is the true one as well."""
 
 import math
 
