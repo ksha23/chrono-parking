@@ -360,6 +360,11 @@ aligned with its two short tick lines. When the rear camera sees the kerb during
 
 ## In the viewer
 
+With a sensor rig the window shows what the sensors deliver next to the scene: the colour image
+and the depth image of each camera, and every measured range as a point seen from above, with the
+lidar's range image underneath. [simulation-and-viewer.md](simulation-and-viewer.md#the-window)
+describes each picture. What is made of that data shows up in three more places:
+
 - The top view outlines what each sensor is looking at.
 - Line stubs are drawn in a darker colour than confirmed lines.
 - The panel shows, for each camera, the picture of what its pixels are read as: ground,

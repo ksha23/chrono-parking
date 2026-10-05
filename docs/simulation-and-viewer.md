@@ -146,14 +146,57 @@ lidar saw of a car counted as touching it.
 
 ![The window](img/window.png)
 
-One Irrlicht window, drawn by the script itself in several viewports per frame.
+*`python parking_sim.py --sensors camera+lidar`, reversing into the stall.*
+
+One Irrlicht window, drawn by the script itself. With a sensor rig it has three parts.
+
+**Two views of the scene** on the left. They are rendered by the viewer, not by a sensor, and they
+show the whole world, including what the car cannot see. What the car knows is drawn on top.
 
 | View | Camera |
 | --- | --- |
 | top view | straight down, north up. Follows the car, or shows the whole lot in drag mode |
-| chase camera | behind and above the car, heading low-pass filtered |
-| front or rear camera | at bumper height, switches with the gear, with the plan drawn in like a parking camera |
-| stall camera | beyond the back of the chosen stall, looking at the car coming in. A side view until a stall is chosen |
+| chase view | behind and above the car, heading low-pass filtered |
+
+**What the sensors deliver**, in the middle and on the right. This is the data from Chrono::Sensor
+that the perception works from, renewed whenever the sensors deliver, ten times per second.
+
+| Picture | Content |
+| --- | --- |
+| front camera: colour | the 960 x 540 colour image of the front stereo camera |
+| front camera: depth | its 480 x 270 depth image. The value of a pixel is the range along its ray. Red is near, blue is 15 m, dark means nothing within the 30 m that the depth image covers |
+| rear camera: colour, depth | the same for the rear stereo camera |
+| range data from above | every range measured in this tick as a point, seen from above. The car is in the middle and forward is up. The colour is the height of the point above the ground, blue at ground level and red at 1.6 m |
+
+The range picture holds the points of all range sensors of the rig:
+
+- **Stereo depth**: every second pixel of both depth images, as small dots. With cameras alone
+  these are the only points, and the two dark sectors to the left and right of the car are what
+  no camera looks at.
+- **Lidar** (`camera+lidar`): the returns of its 16 beams as larger dots, with the stereo points
+  dimmed. Underneath is the lidar's range image: one row per beam with the highest on top, and
+  the columns going round the car with forward in the middle and the rear at both ends. Red is
+  near, blue is 20 m, dark is no return.
+- **Radar** (`camera+radar`): the returns of both radars as white dots.
+
+The rings are 5 m apart. The thin lines are the edges of each camera's and each radar's field of
+view. The car's own body shows up too: the cameras see the bonnet and the boot, which is the
+cluster of points inside the car's outline.
+
+The colour images are the buffers of Chrono::Sensor as they come. The depth images and the points
+have the range error of [sensors.md](sensors.md#stereo-depth-error) added, because that is the
+data the perception gets.
+
+**The internals panel** on the far right, see below.
+
+`--layout quad` or `--layout wide` gives four views of the scene instead, and no sensor pictures.
+That is also what the window shows with `--sensors sim`, where there is no sensor to show.
+
+| View | Camera |
+| --- | --- |
+| top view, chase view | as above |
+| front or rear view | at bumper height, switches with the gear, with the plan drawn in like a parking camera. A camera of the viewer, not one of the car's sensors |
+| stall view | beyond the back of the chosen stall, looking at the car coming in. A side view until a stall is chosen |
 
 The bottom left corner shows the three commands being sent to the car: steering angle in degrees,
 drive torque and brake torque in N m.
@@ -207,14 +250,32 @@ shaped the implementation:
   right-handed convention. Cameras created directly in Irrlicht render mirrored.
 - **Text.** The bindings give no usable font object, so the HUD has its own 5 by 7 pixel font drawn
   with filled rectangles.
+- **Pictures.** The bindings can draw a texture (`draw2DImage`) but cannot make one from pixels.
+  The call for that, `IVideoDriver::addTexture(name, image)`, takes an Irrlicht string, and the
+  bindings have no conversion for it. So the script fills an `IImage` through the pointer its
+  `lock()` returns, and calls `CNullDriver::addTexture` through `ctypes`, by its C++ symbol and
+  with the string built by hand as a struct. A texture cannot be written to from Python either,
+  so every new picture replaces the old texture. That takes 0.5 ms.
+- **Picture size.** Irrlicht draws a scaled image by picking the nearest pixel, which breaks thin
+  lines into dashes. Every picture is therefore resampled with NumPy to exactly the size it is
+  drawn at: averaged down by a whole factor first, then interpolated.
 - **Panel.** Everything in the panel is filled rectangles too. The planning map is rendered into a
   small palette image with NumPy, and each row is run-length encoded into rectangles. Charts are
-  chains of small rectangles. The result is cached and rebuilt ten times per second.
+  chains of small rectangles. The rectangles and the text go into an image that is uploaded as one
+  texture ten times per second, which costs a quarter of drawing them every frame.
+- **Without textures.** The symbol exists in Irrlicht built with clang or gcc (macOS, Linux). Where
+  it is not found, the panel is drawn as rectangles every frame, and the window shows the four
+  views of the scene and says so on the console. This path is not tested on Windows.
 - **Shutdown.** Destroying the visual system from Python crashes, so the process leaves with
   `os._exit` once the window is closed.
 
-Real time is kept at 30 frames per second on the machine this was developed on. The simulation
-itself needs about a seventh of real time.
+With `--sensors sim` the window keeps real time at 30 frames per second on the machine this was
+developed on. The simulation itself needs about a seventh of real time.
+
+With a sensor rig the window runs at about 0.8 of real time and 23 frames per second. Measured
+with cameras and lidar, a tick of 100 ms simulated time takes 124 ms: 53 ms to render and process
+the sensors, 19 ms for the physics, the control and the mapping, and 52 ms for three frames of the
+window. Of those 52 ms, the sensor pictures take 16 ms and the panel 10 ms.
 
 ## Placing the target by hand
 
@@ -223,6 +284,8 @@ python parking_sim.py --target drag
 ```
 
 ![Drag mode](img/drag_mode.png)
+
+*With `--sensors sim`. With a sensor rig the top view sits next to the sensor pictures, as above.*
 
 The top view shows the whole lot. A car-sized box marks where the car should park.
 

@@ -203,10 +203,28 @@ def test_mapping():
     print("line memory and tentative map layer: ok")
 
 
+def test_pictures():
+    """The pictures of the viewer are made at the size they are drawn at."""
+    flat = np.full((540, 960, 3), (10, 120, 250), np.uint8)
+    out = ps.resample(flat, 400, 225)
+    assert out.shape == (225, 400, 3) and out.dtype == np.uint8 and np.all(out == (10, 120, 250))
+    board = np.zeros((540, 960, 3), np.uint8)              # one pixel on, one off: averages to grey
+    board[::2, ::2] = board[1::2, 1::2] = 255
+    out = ps.resample(board, 400, 225)
+    assert out.min() >= 126 and out.max() <= 128
+    ramp = np.repeat((np.arange(480) // 2).astype(np.uint8)[None, :, None], 3, axis=2).repeat(270, axis=0)
+    out = ps.resample(ramp, 400, 225)                      # a gradient stays one, end to end
+    assert np.all(np.diff(out[100, :, 0].astype(int)) >= 0) and out[100, 0, 0] <= 1 and out[100, -1, 0] >= 238
+    assert np.array_equal(ps.resample(ramp, 480, 270), ramp)
+    assert ps.RAMP.shape == (256, 3) and tuple(ps.RAMP[0]) == (46, 58, 150) and tuple(ps.RAMP[-1]) == (222, 44, 32)
+    print("picture resampling: ok")
+
+
 if __name__ == "__main__":
     test_reeds_shepp()
     test_mpc_solver()
     test_footprint_and_distance()
     test_sensor_geometry()
     test_mapping()
+    test_pictures()
     print("all checks passed")

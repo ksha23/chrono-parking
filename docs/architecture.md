@@ -69,7 +69,7 @@ ground truth is its own pose.
 | Physics | 2 ms | Chrono vehicle and terrain, tire sub-step 1 ms |
 | Control | 20 ms | error measurement, steering gain update, MPC solve, speed loop, torque commands |
 | Perception and mapping | 100 ms | sensor rendering and processing, grid and line map update, stall inference, decision, plan refinement, path monitor |
-| Rendering | about 33 ms | four camera views and the internals panel |
+| Rendering | about 33 ms | the views of the scene, the sensor pictures and the internals panel |
 | Planning | on demand | runs in a worker thread while simulated time is frozen |
 
 `ParkingSim.advance` steps the physics and calls `_perceive` and `_control` on their own

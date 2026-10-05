@@ -6,7 +6,7 @@
 # down a parking aisle, builds a map of the stall lines and obstacles from what
 # its sensors show, decides which stall to take, plans a forward/reverse
 # maneuver into it and tracks that plan with model predictive control. One
-# window shows four live views and a panel with the internals.
+# window shows the scene, what the sensors deliver and a panel with the internals.
 #
 #   perception : Chrono::Sensor stereo cameras looking forward and back (lines
 #                from the colour image, obstacles and free ground from depth),
@@ -33,6 +33,7 @@
 #   python parking_sim.py --sensors camera+lidar           cameras and a roof lidar
 #   python parking_sim.py --sensors camera+radar           cameras and side radars
 #   python parking_sim.py --sensors sim                    no sensors, detections from the scenario
+#   python parking_sim.py --layout quad                    four views of the scene, no sensor pictures
 #   python parking_sim.py --type angled --cars none        60 deg stalls, empty lot
 #   python parking_sim.py --type parallel --cars both      parallel park between two cars
 #   python parking_sim.py --type perpendicular --cars left --park forward
@@ -45,6 +46,7 @@
 
 import argparse
 import collections
+import ctypes
 import glob
 import heapq
 import math
@@ -680,6 +682,7 @@ class SensorRig:
 
     CAM_W, CAM_H, CAM_HFOV = 960, 540, math.radians(120.0)     # depth is rendered at half that size
     CAM_PITCH = math.radians(10.0)
+    CAM_FAR = 30.0             # the depth image ends here: it reads this where there is nothing nearer
     CAM_RANGE = 12.0           # obstacles and free ground are taken from the depth image up to here at most
     PAINT_RANGE = 11.0
     DEPTH_ERR = 0.003          # stereo depth error at 1 m [m]; it grows with the square of the range
@@ -723,7 +726,8 @@ class SensorRig:
             frame = chrono.ChFramed(chrono.ChVector3d(*pos), chrono.QuatFromAngleZ(yaw) * chrono.QuatFromAngleY(self.CAM_PITCH))
             colour = sens.ChCameraSensor(self.body, rate, frame, self.CAM_W, self.CAM_H, self.CAM_HFOV)
             colour.PushFilter(sens.ChFilterRGBA8Access())
-            depth = sens.ChDepthCamera(self.body, rate, frame, self.CAM_W // 2, self.CAM_H // 2, self.CAM_HFOV, 30.0)
+            depth = sens.ChDepthCamera(self.body, rate, frame, self.CAM_W // 2, self.CAM_H // 2, self.CAM_HFOV,
+                                       self.CAM_FAR)
             for s in (colour, depth):
                 self._add(s, label + " camera")
             self.cameras.append(dict(label=label, colour=colour, depth=depth, pos=pos, R=R, stamp=-1.0))
@@ -751,6 +755,7 @@ class SensorRig:
         self.frames = collections.OrderedDict()      # chassis frame at the time of each render
         self.paint = np.zeros((0, 2))                 # for the viewer: where paint was seen this tick
         self.fans = []                                # for the viewer: (origin, heading, half fov, range) per sensor
+        self.show = False                             # set by the viewer: keep what each sensor delivered
 
     def _add(self, sensor, name):
         sensor.SetName(name)
@@ -803,6 +808,11 @@ class SensorRig:
         self.paint = np.concatenate(paint) if paint else np.zeros((0, 2))
         return scans, dets
 
+    def _keep(self, dev, P, valid, ref_p, ref_R, **raw):
+        """For the viewer: the data of a sensor as it came in, and its points in the chassis frame."""
+        dev.update(raw)
+        dev["cloud"] = (P[valid] - ref_p.astype(np.float32)) @ ref_R.astype(np.float32)
+
     def _is_own(self, P, ref_p, ref_R, grow):
         loc = (P - ref_p.astype(np.float32)) @ ref_R.astype(np.float32)
         x0, x1, hw = self.own
@@ -814,6 +824,7 @@ class SensorRig:
         ray; the chassis frame is the one at the time the images were rendered."""
         k = self.noise
         p, R = ref_p + ref_R @ cam["pos"], (ref_R @ cam["R"]).astype(np.float32)
+        nothing = depth > 0.995 * self.CAM_FAR
         if k > 0.0:
             depth = depth * (1.0 + self.rng.normal(0.0, 0.004 * k)) + \
                 smooth_noise(self.rng, depth.shape) * (self.DEPTH_ERR * k) * depth * depth
@@ -830,6 +841,9 @@ class SensorRig:
         zs = sig * depth * depth * np.abs(dw[..., 2])     # height error that the depth error causes
         own = self._is_own(P, ref_p, ref_R, 0.15)
         seen = (depth > 0.3) & (depth < 28.0) & (z < self.Z_TOP) & ~own
+        if self.show:
+            self._keep(cam, P[::2, ::2], ((depth > 0.3) & ~nothing)[::2, ::2], ref_p, ref_R,
+                       rgb=np.array(rgb[..., :3]), range=np.where(nothing, 0.0, depth))
         ground = seen & (np.abs(z) < self.Z_GROUND + 1.25 * zs)
         obstacle = seen & (z > self.Z_OBSTACLE + 2.5 * zs)
         head = math.atan2(R[1, 0], R[0, 0])
@@ -902,6 +916,8 @@ class SensorRig:
         P = p.astype(np.float32) + r[..., None] * (dev["rays"] @ R.T)
         z = P[..., 2]
         seen = (r > 0.3) & (r < r_max) & (z < self.Z_TOP) & ~self._is_own(P, ref_p, ref_R, 0.15)
+        if self.show:
+            self._keep(dev, P, (r > 0.3) & (r < 1.4 * r_max), ref_p, ref_R, range=r)
         ground = seen & (np.abs(z) < self.Z_GROUND + 1.5 * sigma * max(k, 0.3))
         obstacle = seen & (z > max(z_min, self.Z_OBSTACLE + 2.5 * sigma * max(k, 0.3)))
         head = math.atan2(R[1, 0], R[0, 0])
@@ -3012,8 +3028,9 @@ class ParkingSim:
 
 
 # =============================================================================
-# Visualization: one Irrlicht window split into four live camera views, with
-# the perception, the stall map and the plan drawn into the scene
+# Visualization: one Irrlicht window with live views of the scene (the
+# perception, the stall map and the plan drawn into them), the images and range
+# data that the sensors deliver, and a panel with the internals
 # =============================================================================
 
 _GLYPHS = {
@@ -3046,6 +3063,49 @@ for _ch, _hx in _GLYPHS.items():
             else:
                 _col += 1
     _RUNS[_ch] = _runs
+# the same glyphs as bitmaps, 7 rows of 5 pixels and one of spacing
+_BITS = {_ch: np.array([[(int(_hx[2 * _r:2 * _r + 2], 16) >> (4 - _c)) & 1 if _c < 5 else 0 for _c in range(6)]
+                        for _r in range(7)], dtype=bool) for _ch, _hx in _GLYPHS.items()}
+_BLANK = np.zeros((7, 6), dtype=bool)
+
+
+def _ramp(anchors, n=256):
+    t = np.linspace(0.0, len(anchors) - 1.0, n)
+    a = np.array(anchors, dtype=float)
+    return np.stack([np.interp(t, np.arange(len(a)), a[:, k]) for k in range(3)], axis=1).astype(np.uint8)
+
+
+# colour scale of the sensor pictures: blue (far, low) through green and yellow to red (near, high)
+RAMP = _ramp([(46, 58, 150), (40, 130, 235), (30, 205, 200), (100, 235, 100), (230, 228, 50), (250, 140, 30),
+              (222, 44, 32)])
+
+
+def resample(img, w, h):
+    """An image (rows, columns, 3) as a picture of exactly w x h pixels: averaged down by a whole
+    factor first, then interpolated. Irrlicht draws a scaled image by picking the nearest pixel,
+    which breaks up thin lines, so every picture is made at the size it is drawn at."""
+    f = min(img.shape[0] // h, img.shape[1] // w)
+    if f > 1:
+        total = np.zeros((img.shape[0] // f, img.shape[1] // f, 3), np.uint16)
+        for i in range(f):
+            for j in range(f):
+                total += img[i:total.shape[0] * f:f, j:total.shape[1] * f:f]
+        img = total // (f * f)
+    H, W = img.shape[:2]
+    if (H, W) == (h, w):
+        return img.astype(np.uint8)
+    y = np.clip((np.arange(h) + 0.5) * H / h - 0.5, 0.0, H - 1.0)
+    x = np.clip((np.arange(w) + 0.5) * W / w - 0.5, 0.0, W - 1.0)
+    y0, x0 = np.minimum(y.astype(int), H - 2), np.minimum(x.astype(int), W - 2)
+    fy, fx = (y - y0).astype(np.float32)[:, None, None], (x - x0).astype(np.float32)[None, :, None]
+    rows = img[y0] * (1.0 - fy) + img[y0 + 1] * fy
+    return (rows[:, x0] * (1.0 - fx) + rows[:, x0 + 1] * fx + 0.5).astype(np.uint8)
+
+
+class _IrrString(ctypes.Structure):
+    """Memory layout of irr::core::string<char>, the type Irrlicht names a texture with."""
+    _fields_ = [("array", ctypes.c_char_p), ("allocated", ctypes.c_uint32), ("used", ctypes.c_uint32),
+                ("allocator", ctypes.c_void_p)]
 
 
 class MouseKeys:
@@ -3108,6 +3168,9 @@ class Viewer:
                   fan=(0.45, 0.6, 0.95), stub=(0.1, 0.55, 0.65))
     CAM_PALETTE = {0: (34, 38, 48), 1: (84, 88, 96), 2: (255, 120, 40), 3: (112, 44, 44), 4: (150, 120, 70),
                    5: (255, 240, 60)}
+    DEPTH_SCALE = 15.0         # range at the far end of the colour scale of the depth pictures [m]
+    HEIGHT_SCALE = 1.6         # height at the top of the colour scale of the range picture [m]
+    RANGE_SPAN = 13.0          # what the range picture shows to each side of the car [m]
 
     def __init__(self, sim, args):
         global irr
@@ -3142,14 +3205,47 @@ class Viewer:
 
         self.PW = 0 if args.no_panel else 380          # width of the internals panel
         W, H, top = self.W - self.PW, self.H, 30
-        if args.layout == "wide":      # big top view on the left, three views stacked on the right
+        self.pics, self.tex, self.pic_stamp, self.range_bg = [], {}, None, None
+        self.canvas = None             # (image, x, y of its corner) while drawing into a picture, not the window
+        self.panel_key, self.panel_wall = None, 0.0
+        self.add_texture = self._texture_call()
+        try:
+            if self.add_texture is not None:
+                self.drv.removeTexture(self._upload("probe", np.zeros((2, 2, 3), np.uint8)))
+        except Exception:
+            self.add_texture = None
+        if args.layout == "sensors" and self.add_texture is None:
+            print("[parking] Python cannot put pictures into the window with this Irrlicht library: the views "
+                  "show the scene, not the sensor images", flush=True)
+        if args.layout == "sensors" and self.add_texture is not None:
+            # The viewer's own top and chase views on the left. On the right what the sensors
+            # deliver: colour and depth image of each camera, and the measured ranges from above.
+            rig = sim.sensor
+            ch = (H - top) // 4
+            xl = W - ch * rig.CAM_W // rig.CAM_H
+            ym = top + int(0.52 * (H - top))
+            self.rects = [(0, top, xl, ym), (0, ym, xl // 2, H)]
+            sizes = {"colour": (rig.CAM_W, rig.CAM_H), "depth": (rig.CAM_W // 2, rig.CAM_H // 2)}
+            for i, (cam, kind) in enumerate((c, k) for c in rig.cameras for k in ("colour", "depth")):
+                self.pics.append(((cam["label"], kind), (xl, top + i * ch, W, top + (i + 1) * ch),
+                                  "%s CAMERA: %s" % (cam["label"], kind),
+                                  "CHRONO::SENSOR, %d X %d PIXELS" % sizes[kind]))
+            what = "STEREO DEPTH POINTS"
+            if rig.lidar is not None:
+                what = "LIDAR %d X %d (LARGE DOTS), STEREO DEPTH" % (rig.LIDAR_W, rig.LIDAR_H)
+            if rig.radars:
+                what = "%d RADARS %d X %d (WHITE), STEREO DEPTH" % (len(rig.radars), rig.RADAR_W, rig.RADAR_H)
+            self.pics.append((("range", ""), (xl // 2, ym, xl, H), "RANGE DATA FROM ABOVE", "CHRONO::SENSOR, " + what))
+            self.pic_rects = [(irr.recti(*r), irr.recti(0, 0, r[2] - r[0], r[3] - r[1])) for _, r, _, _ in self.pics]
+            rig.show = True
+        elif args.layout == "wide":    # big top view on the left, three views stacked on the right
             xs, hh = int(0.64 * W), (H - top) // 3
             self.rects = [(0, top, xs, H), (xs, top, W, top + hh), (xs, top + hh, W, top + 2 * hh),
                           (xs, top + 2 * hh, W, H)]
         else:
             xm, ym = W // 2, top + (H - top) // 2
             self.rects = [(0, top, xm, ym), (xm, top, W, ym), (0, ym, xm, H), (xm, ym, W, H)]
-        self.labels = ["TOP VIEW", "CHASE CAMERA", "FRONT CAMERA", "STALL CAMERA"]
+        self.labels = ["TOP VIEW", "CHASE VIEW", "FRONT VIEW", "STALL VIEW"]      # the viewer's own cameras
 
         x0, y0, x1, y1 = sim.scn.bounds
         r = self.rects[0]
@@ -3216,6 +3312,16 @@ class Viewer:
             self.items.append((self._vec(pts + n * 0.04 * (k - 0.5 * (thick - 1)), z), col))
 
     def _rect(self, color, x0, y0, x1, y1):
+        if self.canvas is not None:        # into a picture that is uploaded later, see _panel and _pictures
+            img, ox, oy = self.canvas
+            part = img[max(int(y0) - oy, 0):max(int(y1) - oy, 0), max(int(x0) - ox, 0):max(int(x1) - ox, 0)]
+            c = color.color                # alpha, red, green, blue in one number
+            rgb = ((c >> 16) & 255, (c >> 8) & 255, c & 255)
+            if c >> 24 == 255:
+                part[:] = rgb
+            else:
+                part[:] = (part.astype(np.uint16) * (255 - (c >> 24)) + np.array(rgb, np.uint16) * (c >> 24)) // 255
+            return
         key = (x0, y0, x1, y1)
         r = self.rect_cache.get(key)
         if r is None:
@@ -3225,6 +3331,15 @@ class Viewer:
         self.drv.draw2DRectangle(color, r)
 
     def _text(self, text, x, y, scale=2, rgb=(255, 255, 255), alpha=255):
+        if self.canvas is not None and text:           # into a picture: all glyphs at once
+            img, ox, oy = self.canvas
+            mask = np.hstack([_BITS.get(ch, _BLANK) for ch in text.upper()])
+            mask = mask.repeat(scale, axis=0).repeat(scale, axis=1)
+            x, y = int(x) - ox, int(y) - oy
+            if x >= 0 and y >= 0:
+                part = img[y:y + mask.shape[0], x:x + mask.shape[1]]
+                part[mask[:part.shape[0], :part.shape[1]]] = rgb
+            return
         col = irr.SColor(alpha, *rgb)
         for ch in text.upper():
             for row, c0, c1 in _RUNS.get(ch, ()):
@@ -3309,7 +3424,7 @@ class Viewer:
 
         cam = self.cams[2]
         reverse = sim.state == "DRIVE" and sim.tracker.seg is not None and sim.tracker.seg.dir < 0
-        self.labels[2] = "REAR CAMERA" if reverse else "FRONT CAMERA"
+        self.labels[2] = "REAR VIEW" if reverse else "FRONT VIEW"
         if reverse:
             ex, ey = x - (EGO.rear + 0.05) * c, y - (EGO.rear + 0.05) * s
             cam.setPosition(V(ex, ey, 1.0))
@@ -3326,11 +3441,11 @@ class Viewer:
             u = sim.target.u_in if sim.target is not None else -np.array([math.cos(sim.manual[2]), math.sin(sim.manual[2])])
             eye = goal + 9.0 * u + 3.5 * np.array([-u[1], u[0]])
             aim = goal - 2.0 * u
-            self.labels[3] = "STALL CAMERA"
+            self.labels[3] = "STALL VIEW"
             cam.setPosition(V(float(eye[0]), float(eye[1]), 5.5))
             cam.setTarget(V(float(aim[0]), float(aim[1]), 0.3))
         else:
-            self.labels[3] = "SIDE CAMERA"
+            self.labels[3] = "SIDE VIEW"
             cam.setPosition(V(cx - 4.0 * c - 11.0 * s, cy - 4.0 * s + 11.0 * c, 5.5))
             cam.setTarget(V(cx + 2.0 * c, cy + 2.0 * s, 0.4))
         cam.setFOV(0.85)
@@ -3426,14 +3541,190 @@ class Viewer:
             for vec, col in self.items + box_items + (self.scan_items if i == 0 else []):
                 irr.DrawPolyline(self.vis, vec, col, True)
         drv.setViewPort(irr.recti(0, 0, self.W, self.H))
+        self._pictures()
         self._hud()
         self.vis.EndScene()
+
+    # ---- what the sensors deliver ---------------------------------------------------
+
+    @staticmethod
+    def _texture_call():
+        """Irrlicht's function that makes a texture from an image, or None if it cannot be reached.
+        The Python bindings can draw a texture but cannot make one from pixels: the call for that,
+        IVideoDriver::addTexture(name, image), takes an Irrlicht string, which they do not convert.
+        So it is called through ctypes instead, by its C++ symbol (the same for clang and gcc)."""
+        if not all(hasattr(irr, n) for n in ("ECF_A8R8G8B8", "dimension2du", "recti")):
+            return None
+        symbol = "_ZN3irr5video11CNullDriver10addTextureERKNS_4core6stringIcNS2_12irrAllocatorIcEEEEPNS0_6IImageEPv"
+        libs = [None]                              # everything already in the process: enough on macOS
+        try:
+            with open("/proc/self/maps") as f:     # Linux: Irrlicht is loaded, but privately to PyChrono
+                libs += sorted({ln.split()[-1] for ln in f if "libIrrlicht" in ln})
+        except OSError:
+            pass
+        for lib in libs:
+            try:
+                call = ctypes.CDLL(lib)[symbol]
+            except Exception:
+                continue
+            call.restype = ctypes.c_void_p
+            call.argtypes = [ctypes.c_void_p] * 4
+            return call
+        return None
+
+    def _upload(self, name, rgb, old=None):
+        """A texture with the pixels of rgb (rows, columns, 3), replacing the texture 'old'."""
+        h, w = rgb.shape[:2]
+        bgra = np.empty((h, w, 4), np.uint8)
+        bgra[..., 0], bgra[..., 1], bgra[..., 2], bgra[..., 3] = rgb[..., 2], rgb[..., 1], rgb[..., 0], 255
+        img = self.drv.createImage(irr.ECF_A8R8G8B8, irr.dimension2du(w, h))
+        ctypes.memmove(int(img.lock()), bgra.ctypes.data, bgra.nbytes)
+        img.unlock()
+        if old is not None:
+            self.drv.removeTexture(old)
+        raw = name.encode()
+        text = _IrrString(raw, len(raw) + 1, len(raw) + 1, None)
+        addr = self.add_texture(int(self.drv.this), ctypes.addressof(text), int(img.this), None)
+        img.drop()
+        for i in range(self.drv.getTextureCount()):       # the same texture, as an object of the bindings
+            tex = self.drv.getTextureByIndex(i)
+            if int(tex) == addr:
+                return tex
+        raise RuntimeError("Irrlicht did not keep the texture")
+
+    def _pictures(self):
+        """Draw the camera images and the range data, renewed whenever the sensors have delivered."""
+        if not self.pics:
+            return
+        rig = self.sim.sensor
+        stamp = tuple(d["stamp"] for d in rig.cameras + rig.radars + ([rig.lidar] if rig.lidar is not None else []))
+        new, self.pic_stamp = stamp != self.pic_stamp, stamp
+        for (key, r, title, sub), (dst, src) in zip(self.pics, self.pic_rects):
+            if new:
+                img = self._picture(key, r[2] - r[0], r[3] - r[1])
+                if img is not None:
+                    self.canvas = (img, r[0], r[1])
+                    self._picture_labels(key, r, title, sub)
+                    self.canvas = None
+                    self.tex[key] = self._upload("sensor %s %s" % key, img, self.tex.get(key))
+            if key in self.tex:
+                self.drv.draw2DImage(self.tex[key], dst, src)
+            else:
+                self._rect(irr.SColor(255, 14, 15, 18), *r)
+
+    def _picture(self, key, w, h):
+        name, kind = key
+        if name == "range":
+            return self._range_picture(w, h)
+        cam = next(c for c in self.sim.sensor.cameras if c["label"] == name)
+        if "rgb" not in cam:
+            return None
+        if kind == "colour":
+            return resample(cam["rgb"][::-1], w, h)               # the buffers start at the bottom row
+        r = cam["range"][::-1]
+        img = RAMP[(255.0 * (1.0 - np.clip(r / self.DEPTH_SCALE, 0.0, 1.0))).astype(np.uint8)]
+        img[r < 0.05] = (24, 26, 31)                                # nothing within the range of the camera
+        return resample(img, w, h)
+
+    def _range_view(self, w, h):
+        """Geometry of the range picture: pixels per metre, the pixel of the middle of the car, its
+        x in the chassis frame, and the height of the part above the lidar's range image."""
+        rig = self.sim.sensor
+        hh = h - (3 * rig.LIDAR_H + 18 if rig.lidar is not None else 0)
+        return min(w, hh) / (2.0 * self.RANGE_SPAN), 0.5 * w, 0.5 * hh, 0.5 * (rig.own[0] + rig.own[1]), hh
+
+    def _range_picture(self, w, h):
+        """Every range the sensors measured, as points seen from above in the frame of the car
+        (forward is up), coloured by their height. Below it the range image of the lidar."""
+        rig = self.sim.sensor
+        s, cx, cy, xm, hh = self._range_view(w, h)
+        px = lambda q: (cx - q[1] * s, cy - (q[0] - xm) * s)
+        if self.range_bg is None:
+            bg = np.full((h, w, 3), (14, 15, 18), np.uint8)
+            a = np.linspace(0.0, 2.0 * math.pi, 720)
+            for r in (5.0, 10.0, 15.0, 20.0):                       # range rings
+                u, v = (cx + r * s * np.cos(a)).astype(int), (cy + r * s * np.sin(a)).astype(int)
+                ok = (u >= 0) & (u < w) & (v >= 0) & (v < hh)
+                bg[v[ok], u[ok]] = (46, 50, 60)
+            for dev, half, reach in [(c, 0.5 * rig.CAM_HFOV, rig.CAM_RANGE) for c in rig.cameras] + \
+                    [(d, 0.5 * rig.RADAR_HFOV, rig.RADAR_RANGE) for d in rig.radars]:
+                for a in (-half, half):                             # the edges of what each sensor looks at
+                    d = dev["R"] @ np.array([math.cos(a), math.sin(a), 0.0])
+                    self._stroke(bg[:hh], px(dev["pos"]), px(dev["pos"] + reach * d), (62, 74, 104))
+            self.range_bg = bg
+        img = self.range_bg.copy()
+
+        def plot(cloud, size, gain, colour=None):
+            if cloud is None or not len(cloud):
+                return
+            u = np.floor(cx - cloud[:, 1] * s).astype(int)
+            v = np.floor(cy - (cloud[:, 0] - xm) * s).astype(int)
+            ok = (u >= 0) & (u <= w - size) & (v >= 0) & (v <= hh - size)
+            # the colour says how high a point is, and the highest points are drawn last
+            t = (255.0 * np.sqrt(np.clip(cloud[ok, 2], 0.0, self.HEIGHT_SCALE) / self.HEIGHT_SCALE)).astype(np.uint8)
+            order = np.argsort(t, kind="stable")
+            u, v = u[ok][order], v[ok][order]
+            if colour is None:
+                colour = (RAMP * gain).astype(np.uint8)[t[order]]
+            for du in range(size):
+                for dv in range(size):
+                    img[v + dv, u + du] = colour
+
+        other = rig.lidar is not None or bool(rig.radars)
+        for cam in rig.cameras:
+            plot(cam.get("cloud"), 1, 0.7 if other else 1.0)
+        if rig.lidar is not None:
+            plot(rig.lidar.get("cloud"), 2, 1.0)
+        for radar in rig.radars:
+            plot(radar.get("cloud"), 3, 1.0, (255, 255, 255))
+        x0, x1, hw = rig.own
+        c = [px(q) for q in ((x1, hw), (x1, -hw), (x0, -hw), (x0, hw))]
+        for k in range(4):
+            self._stroke(img[:hh], c[k], c[(k + 1) % 4], (240, 242, 246))
+        self._stroke(img[:hh], px((x1 - 0.9, hw)), px((x1, 0.0)), (240, 242, 246))       # the nose
+        self._stroke(img[:hh], px((x1 - 0.9, -hw)), px((x1, 0.0)), (240, 242, 246))
+        if rig.lidar is not None and "range" in rig.lidar:
+            # one row per beam, the highest on top. The columns go round the car: the middle
+            # looks forward, the left half shows the left side, both ends look back.
+            r = rig.lidar["range"][::-1, ::-1][:, np.arange(w) * rig.LIDAR_W // w]
+            strip = RAMP[(255.0 * (1.0 - np.clip(r / rig.LIDAR_RANGE, 0.0, 1.0))).astype(np.uint8)]
+            strip[r < 0.05] = (24, 26, 31)
+            img[h - 3 * rig.LIDAR_H:] = np.repeat(strip, 3, axis=0)
+        return img
+
+    def _scale_bar(self, x, y, ramp, lo, hi):
+        """A colour scale with its two ends named, on a dark backing."""
+        n, bw = 24, 4
+        self._rect(irr.SColor(170, 0, 0, 0), x - 5, y - 5, x + 6 * (len(lo) + len(hi)) + n * bw + 15, y + 12)
+        self._text(lo, x, y, 1)
+        x += 6 * len(lo) + 4
+        for k in range(n):
+            col = ramp[k * 255 // (n - 1)]
+            self._rect(irr.SColor(255, int(col[0]), int(col[1]), int(col[2])), x + k * bw, y, x + (k + 1) * bw, y + 7)
+        self._text(hi, x + n * bw + 5, y, 1)
+
+    def _picture_labels(self, key, r, title, sub):
+        rig = self.sim.sensor
+        grey = (190, 200, 210)
+        self._rect(irr.SColor(150, 0, 0, 0), r[0] + 8, r[1] + 8, r[0] + 20 + max(12 * len(title), 6 * len(sub)), r[1] + 41)
+        self._text(title, r[0] + 14, r[1] + 11)
+        self._text(sub, r[0] + 14, r[1] + 30, 1, rgb=grey)
+        if key[1] == "depth":
+            self._scale_bar(r[0] + 14, r[3] - 17, RAMP[::-1], "0", "%.0f M" % self.DEPTH_SCALE)
+        if key[0] == "range":
+            s, cx, cy, _, hh = self._range_view(r[2] - r[0], r[3] - r[1])
+            for ring in (5, 10):
+                self._text("%d M" % ring, r[0] + int(cx) + 4, r[1] + int(cy - ring * s) + 3, 1, rgb=(120, 128, 142))
+            self._scale_bar(r[0] + 14, r[1] + hh - 17, RAMP, "HEIGHT 0", "%.1f M" % self.HEIGHT_SCALE)
+            if rig.lidar is not None:
+                self._text("LIDAR RANGE IMAGE, ALL ROUND, FORWARD IN THE MIDDLE, 0 TO %.0f M" % rig.LIDAR_RANGE,
+                           r[0] + 14, r[1] + hh + 6, 1, rgb=grey)
 
     def _hud(self):
         sim, W, H = self.sim, self.W, self.H
         dark, edge = irr.SColor(255, 18, 20, 24), irr.SColor(255, 8, 8, 10)
         self._rect(dark, 0, 0, W, 30)
-        for x0, y0, x1, y1 in self.rects:              # frames around the views
+        for x0, y0, x1, y1 in self.rects + [r for _, r, _, _ in self.pics]:      # frames around the views
             self._rect(edge, x0, y0, x1, y0 + 2); self._rect(edge, x0, y1 - 2, x1, y1)
             self._rect(edge, x0, y0, x0 + 2, y1); self._rect(edge, x1 - 2, y0, x1, y1)
         for label, r in zip(self.labels, self.rects):
@@ -3478,7 +3769,7 @@ class Viewer:
         r = self.rects[0]
         legend = (("LINE DETECTIONS", "det"), ("LINE MAP", "track"), ("FREE STALL", "free"), ("OCCUPIED", "occupied"),
                   ("PATH FWD", "fwd"), ("PATH REV", "rev"), ("RANGE SCAN", "scan"))
-        x, y = r[0] + 270, r[3] - 18
+        x, y = r[0] + (350 if r[3] > H - 60 else 270), r[3] - 18       # clear of the command read-out
         self._rect(irr.SColor(150, 0, 0, 0), x - 6, y - 5, min(x + 6 + sum(22 + 6 * len(n) for n, _ in legend), r[2] - 4), y + 12)
         for name, key in legend:
             if x + 22 + 6 * len(name) > r[2] - 6:
@@ -3504,8 +3795,10 @@ class Viewer:
             self._text("DRAG THE BOX: LEFT MOUSE.  ROTATE: RIGHT-DRAG, Q/E OR < >.  GO: SPACE", r[0] + 262, r[1] + 40, 1)
 
     # ---- internals panel -------------------------------------------------------
-    # Everything here is drawn with filled rectangles (the only 2D primitive the Python
-    # bindings expose reliably): pixel rasters are run-length encoded into rectangles.
+    # Everything here is drawn with filled rectangles, the one 2D primitive the Python bindings
+    # have on every platform: pixel rasters are run-length encoded into rectangles. Where a
+    # picture can be uploaded (see _texture_call), the rectangles go into an image that is renewed
+    # at the perception rate and drawn as one texture, which costs a fraction of the time.
 
     PALETTE = {0: (62, 68, 80), 1: (22, 23, 27), 2: (235, 80, 60), 3: (52, 132, 160), 4: (130, 130, 130),
                5: (90, 200, 110), 6: (60, 255, 90), 7: (90, 150, 255), 8: (255, 110, 235), 9: (255, 240, 60),
@@ -3585,6 +3878,19 @@ class Viewer:
             out.append((col, px[k], min(py[k], py[k + 1]), max(px[k + 1], px[k] + 1), max(py[k], py[k + 1]) + 2))
 
     def _panel(self):
+        if self.add_texture is None:
+            return self._panel_draw()
+        sim, x0 = self.sim, self.W - self.PW
+        key = (self.hist_step, sim.state, sim.plan_info is None, len(sim.slots))
+        if key != self.panel_key or time.time() - self.panel_wall > 0.25:
+            self.panel_key, self.panel_wall = key, time.time()
+            self.canvas = (np.empty((self.H - 30, self.PW, 3), np.uint8), x0, 30)
+            self._panel_draw()
+            img, self.canvas = self.canvas[0], None
+            self.tex["panel"] = self._upload("panel", img, self.tex.get("panel"))
+        self.drv.draw2DImage(self.tex["panel"], irr.recti(x0, 30, self.W, self.H), irr.recti(0, 0, self.PW, self.H - 30))
+
+    def _panel_draw(self):
         sim, trk = self.sim, self.sim.tracker
         x, w = self.W - self.PW + 10, self.PW - 20
         self._rect(irr.SColor(255, 24, 26, 31), self.W - self.PW, 30, self.W, self.H)
@@ -3764,15 +4070,17 @@ def parse_args(argv=None):
                     help="tire model of the simulated sedan (TMeasy or Pacejka 2002)")
     ap.add_argument("--sensors", choices=("auto", "sim") + SensorRig.MODES, default="auto",
                     help="what the car perceives with. camera: Chrono::Sensor stereo cameras looking forward and "
-                         "back. camera+lidar, camera+radar: the same plus a roof lidar or four corner radars. "
+                         "back. camera+lidar, camera+radar: the same plus a roof lidar or a radar on each side. "
                          "sim: detections computed from the scenario, no sensor simulated. auto (default): "
                          "camera if this PyChrono has the ray-traced sensors, otherwise sim")
     ap.add_argument("--noise", type=float, default=1.0, help="perception noise scale (0 = perfect)")
     ap.add_argument("--seed", type=int, default=1, help="random seed (layout details and noise)")
     ap.add_argument("--tour", action="store_true", help="play through a set of scenarios one after another")
     ap.add_argument("--headless", action="store_true", help="no window, run as fast as possible")
-    ap.add_argument("--layout", choices=("quad", "wide"), default=None,
-                    help="2x2 views, or a large top view with three small ones (default with --target drag)")
+    ap.add_argument("--layout", choices=("sensors", "quad", "wide"), default=None,
+                    help="sensors: two views of the scene next to the images and range data that the sensors "
+                         "deliver (default with simulated sensors). quad: 2x2 views of the scene. wide: a large "
+                         "top view with three small ones (default with --target drag and no sensors)")
     ap.add_argument("--window", default="1600x930", help="window size")
     ap.add_argument("--no-panel", action="store_true", help="hide the internals panel next to the views")
     ap.add_argument("--speed", type=float, default=1.0, help="playback speed relative to real time")
@@ -3786,8 +4094,6 @@ def parse_args(argv=None):
     if args.target is not None and args.target != "drag":
         x, y, deg = (float(v) for v in args.target.split(","))
         args.target = (x, y, math.radians(deg))
-    if args.layout is None:
-        args.layout = "wide" if args.target == "drag" else "quad"
     if args.snapshots:
         os.makedirs(args.snapshots, exist_ok=True)
     if args.sensors == "auto":
@@ -3797,6 +4103,10 @@ def parse_args(argv=None):
                  "with a ray-tracing backend and Python bindings for it, see docs/sensors.md). This one has %s. "
                  "Use --sensors sim to run without simulated sensors." %
                  (args.sensors, "no sensor module" if sens is None else "only GPS and IMU sensors"))
+    if args.layout == "sensors" and args.sensors == "sim":
+        ap.error("--layout sensors shows the output of simulated sensors, and --sensors sim has none")
+    if args.layout is None:
+        args.layout = "sensors" if args.sensors != "sim" else "wide" if args.target == "drag" else "quad"
     return args
 
 

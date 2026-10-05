@@ -14,10 +14,14 @@ ray-traced sensors, a stand-in computes noisy detections from the scenario inste
 
 ![The simulator window](docs/img/parking.gif)
 
-The window shows four live views and a panel with the internals: which stage of the pipeline is
-working, the planning map with the Hybrid A* search tree, the MPC horizon, tracking error, speed,
-the steering gain the controller is identifying as it drives, and what each camera's image is
-being read as.
+*`python parking_sim.py --sensors camera+lidar`*
+
+The window shows three things. On the left, the scene from above and from behind the car, with
+what the car knows drawn in. Next to it, what the sensors deliver: the colour and the depth image
+of both cameras, and every measured range from above, with the lidar's range image. On the right,
+a panel with the internals: which stage of the pipeline is working, the planning map with the
+Hybrid A* search tree, the MPC horizon, tracking error, speed, the steering gain the controller is
+identifying as it drives, and what each camera's image is being read as.
 
 ## Run it
 
@@ -57,6 +61,7 @@ python parking_sim.py --headless --seed 7 --noise 2     # no window, prints a re
 | `--noise` | scale, default 1 | perception noise, 0 is perfect |
 | `--seed` | integer | layout details and noise |
 | `--headless` | | no window, as fast as possible |
+| `--layout` | `sensors`, `quad`, `wide` | sensor pictures next to two views of the scene (default with sensors), or four views of the scene |
 | `--no-panel` | | hide the internals panel |
 | `--snapshots DIR` | | save window frames as PNG |
 
