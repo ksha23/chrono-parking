@@ -20,6 +20,7 @@ class Ground:
         self.nx = int(round((bounds[2] - bounds[0] + 2.0 * margin) / self.STEP)) + 1
         self.ny = int(round((bounds[3] - bounds[1] + 2.0 * margin) / self.STEP)) + 1
         self.h = np.zeros((self.ny, self.nx))
+        self.rows = None
         if amp > 0.0:
             rng = np.random.default_rng(3000 + seed)
             fx, fy = np.fft.fftfreq(self.nx, self.STEP)[None, :], np.fft.fftfreq(self.ny, self.STEP)[:, None]
@@ -48,6 +49,22 @@ class Ground:
         out = (1 - a) * (1 - b) * h[j, i] + a * (1 - b) * h[j, i + 1] + (1 - a) * b * h[j + 1, i] + a * b * h[j + 1, i + 1]
         return out if np.ndim(out) else float(out)
 
+    def at(self, x, y):
+        """Height and its slopes along x and y at one point, quickly: this is what the tires ask
+        for, a few thousand times per simulated second."""
+        if self.amp == 0.0:
+            return 0.0, 0.0, 0.0
+        if self.rows is None:
+            self.rows = self.h.tolist()
+        u = min(max((x - self.x0) / self.STEP, 0.0), self.nx - 1.001)
+        v = min(max((y - self.y0) / self.STEP, 0.0), self.ny - 1.001)
+        i, j = int(u), int(v)
+        a, b = u - i, v - j
+        h00, h10, h01, h11 = self.rows[j][i], self.rows[j][i + 1], self.rows[j + 1][i], self.rows[j + 1][i + 1]
+        return ((1.0 - a) * (1.0 - b) * h00 + a * (1.0 - b) * h10 + (1.0 - a) * b * h01 + a * b * h11,
+                ((h10 - h00) * (1.0 - b) + (h11 - h01) * b) / self.STEP,
+                ((h01 - h00) * (1.0 - a) + (h11 - h10) * a) / self.STEP)
+
     def slope(self, x, y, reach=1.5):
         """Slope of the road around (x, y) along x and along y, over `reach` metres each way:
         about what the four wheels of a car standing there rest on."""
@@ -60,6 +77,7 @@ class Ground:
         lo, hi = float(self.h.min()), float(self.h.max())
         grey = np.round((self.h[::-1] - lo) / max(hi - lo, 1e-9) * 255.0).astype(np.uint8)
         self.h = lo + grey[::-1] / 255.0 * (hi - lo)            # exactly what the image holds
+        self.rows = None
         path = os.path.join(tempfile.gettempdir(), "parking_ground_%d.png" % os.getpid())
         write_png(path, np.repeat(grey[..., None], 3, axis=2))
         return path, lo, hi

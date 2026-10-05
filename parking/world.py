@@ -108,6 +108,31 @@ def light_scene(scene, sky):
         scene.SetVignette(0.12)
 
 
+class _Road(veh.ChTerrain):
+    """The road as the tires feel it: height, normal and grip straight from the height field.
+    Chrono's own answer for a road built as a mesh comes from casting a ray at the triangles,
+    and at their edges that is up to a centimetre too high (the collision margin): the wheels
+    would run over hundreds of small steps that are not there."""
+
+    def __init__(self, ground, friction):
+        super().__init__()
+        self.ground, self.friction = ground, friction
+
+    def GetHeight(self, loc):
+        return self.ground.at(loc.x, loc.y)[0]
+
+    def GetNormal(self, loc):
+        _, sx, sy = self.ground.at(loc.x, loc.y)
+        n = 1.0 / math.sqrt(sx * sx + sy * sy + 1.0)
+        return chrono.ChVector3d(-sx * n, -sy * n, n)
+
+    def GetPoint(self, loc):                 # (the point of the road under loc: what a tire model stands on)
+        return chrono.ChVector3d(loc.x, loc.y, self.ground.at(loc.x, loc.y)[0])
+
+    def GetCoefficientFriction(self, loc):
+        return self.friction
+
+
 class World:
     def __init__(self, scn, visual=True, tire="tmeasy", wear=1.0, bumps=0.0):
         self.scn, self.wear = scn, wear
@@ -154,6 +179,8 @@ class World:
         if visual:
             patch.SetTexture(self.surfaces["asphalt"], ((x1 - x0) + 60.0) / SURFACE_TILE, ((y1 - y0) + 60.0) / SURFACE_TILE)
         self.terrain.Initialize()
+        # what the tires roll on: the flat patch itself, or the height field behind the mesh
+        self.road = _Road(self.ground, 0.9) if self.ground.amp > 0.0 else self.terrain
 
         self.contact_mat = mat
         self._decor(visual)
@@ -192,7 +219,7 @@ class World:
         t = self.system.GetChTime()
         self.inputs.m_steering, self.inputs.m_throttle, self.inputs.m_braking = rack, 0.0, braking
         self.terrain.Synchronize(t)
-        self.sedan.Synchronize(t, self.inputs, self.terrain)
+        self.sedan.Synchronize(t, self.inputs, self.road)
         for axle in self.driven:                 # Chrono's half-shafts turn opposite to the wheels
             for side in (veh.LEFT, veh.RIGHT):
                 axle.ApplyAxleTorque(side, -drive_torque / (2 * len(self.driven)))
