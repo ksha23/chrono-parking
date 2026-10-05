@@ -4,7 +4,8 @@ This document describes how `parking_sim.py` is put together: the data flow, the
 things run, the state machine that sequences a parking maneuver, and where each part lives in the
 file. The other documents go into each stage:
 
-- [perception-and-mapping.md](perception-and-mapping.md): sensors, line tracks, occupancy grid, stall inference, stall choice
+- [sensors.md](sensors.md): the Chrono::Sensor cameras, lidar and radar, and how their data becomes scans and line segments
+- [perception-and-mapping.md](perception-and-mapping.md): the stand-in perception, line tracks, occupancy grid, stall inference, stall choice
 - [planning.md](planning.md): configuration space, Hybrid A*, Reeds-Shepp curves, docking
 - [control.md](control.md): the MPC, the online steering model, speed control, plan re-anchoring
 - [simulation-and-viewer.md](simulation-and-viewer.md): the Chrono model, the scenarios, the window
@@ -13,13 +14,17 @@ file. The other documents go into each stage:
 ## The problem
 
 A car drives along a lane next to parking stalls. It knows its own pose. It does not know where the
-stalls are, which ones are free, or where the obstacles are. It receives two noisy measurements:
-segments of painted lines, as a camera based line detector would give, and a planar range scan, as
-a lidar or a ring of ultrasonic sensors would give. From those it has to find a free stall, choose
+stalls are, which ones are free, or where the obstacles are. It has to find a free stall, choose
 one, and park in it, driving forward and backward as needed.
 
-The scope is the decision, planning and control problem. Perception is simulated on purpose, and
-localization is taken as given.
+What it perceives with is selectable. With a sensor rig the car carries a stereo camera that looks
+forward and one that looks back, and optionally a lidar or two radars, all ray traced by
+Chrono::Sensor. It has no camera to the sides. Without a rig, a stand-in computes noisy line
+segments and a noisy range scan from the scenario. Either way the rest of the agent receives the
+same two things: planar scans, and segments of painted lines.
+
+The scope is the decision, planning and control problem, with perception from simulated sensors.
+Localization is taken as given.
 
 ## Data flow
 
@@ -30,7 +35,7 @@ flowchart TB
         SCN["Scenario<br/>lines, parked cars, kerbs"]
     end
     subgraph Agent["Parking agent"]
-        SENSE["Perception.sense<br/>line segments + range scan"]
+        SENSE["SensorRig.sense or Perception.sense<br/>line segments + planar scans"]
         GRID["GridMap<br/>hits / pass-throughs per cell"]
         LINES["LineMap<br/>one LineTrack per painted line"]
         SLOTS["find_slots<br/>stalls from line pairs"]
@@ -40,7 +45,7 @@ flowchart TB
     end
     VEH -- "pose" --> SENSE
     SCN --> SENSE
-    SENSE -- "range scan" --> GRID
+    SENSE -- "scans" --> GRID
     SENSE -- "line detections" --> LINES
     LINES --> SLOTS
     GRID --> SLOTS
@@ -54,7 +59,8 @@ flowchart TB
 ```
 
 The agent never reads the scenario directly. Everything it knows about lines and obstacles comes
-through `Perception.sense`. The one thing it takes from ground truth is its own pose.
+through `sense`. With a sensor rig that is rendered sensor data. The one thing it takes from
+ground truth is its own pose.
 
 ## Rates
 
@@ -62,7 +68,7 @@ through `Perception.sense`. The one thing it takes from ground truth is its own 
 | --- | --- | --- |
 | Physics | 2 ms | Chrono vehicle and terrain, tire sub-step 1 ms |
 | Control | 20 ms | error measurement, steering gain update, MPC solve, speed loop, torque commands |
-| Perception and mapping | 100 ms | sensing, grid and line map update, stall inference, decision, plan refinement, path monitor |
+| Perception and mapping | 100 ms | sensor rendering and processing, grid and line map update, stall inference, decision, plan refinement, path monitor |
 | Rendering | about 33 ms | four camera views and the internals panel |
 | Planning | on demand | runs in a worker thread while simulated time is frozen |
 
@@ -112,7 +118,9 @@ Three events can interrupt `DRIVE`:
    [control.md](control.md#keeping-the-plan-attached-to-the-stall)).
 2. Newly seen obstacle cells lie inside the footprint along the remaining path, on two consecutive
    perception ticks. The car stops and replans. If no plan exists, the run fails instead of driving
-   a blocked path.
+   a blocked path. With a sensor rig the footprint is grown by a margin for this test, because a
+   camera places an obstacle exactly only once it is close
+   ([sensors.md](sensors.md#the-monitor-looks-for-margin)).
 3. After the last segment, the pose is more than 0.08 m sideways, 1.5 degrees, or 0.3 m lengthwise
    from the goal. The car plans a correction, at most twice.
 
@@ -139,7 +147,7 @@ installation and run. It is organised in sections, in this order:
 | Ego vehicle | `Ego`, `EGO` (geometry, mass and limits read from the Chrono model) |
 | Geometry helpers | `rect_poly`, `ego_poly`, `poly_distance`, `footprint_hits` |
 | Scenarios | `Scenario`, `make_lot`, `make_street`, `parked_model` |
-| Perception | `Perception` |
+| Perception | `Perception` (stand-in), `SensorRig`, `planar_scan`, `paint_segments` (Chrono::Sensor) |
 | Mapping | `GridMap`, `LineTrack`, `LineMap` |
 | Stall inference | `Slot`, `find_slots`, `_classify`, `_align_with_kerb` |
 | Reeds-Shepp | `_rs_words`, `rs_paths`, `rs_length_table`, `rs_sample` |
@@ -156,7 +164,8 @@ installation and run. It is organised in sections, in this order:
 **Unseen space is blocked.** The planner only drives through cells that a range ray has passed
 through. The far side of a parked car was never seen to be free, so it is solid, even though only
 its near face produced range returns. This removes a whole class of plans that would cut through
-an obstacle the car has only seen one side of.
+an obstacle the car has only seen one side of. With cameras that look only forward and back, a lot
+is unseen at any moment, and the map is what carries the car past it.
 
 **Plans end with a straight docking run.** The search does not aim at the parked pose. It aims at a
 point on the stall axis a few metres short of it, and the last stretch is a straight line along the

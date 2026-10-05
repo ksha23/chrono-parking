@@ -338,11 +338,27 @@ plan was made for.
   the plan, which was checked against obstacles, is not disturbed.
 - **Large change** (over 0.5 m or 0.1 rad). The car stops and replans.
 
+**Back to the centre.** The planner may have put the goal off the stall centre, to stay clear of
+something the map showed there (see [planning.md](planning.md#goal-pose-and-docking-run)). With
+cameras that something is often not real: from 6 m away the side of a parked car is placed to a
+decimetre or two, and seen closer it turns out to be further off. So on every tick with at
+least 3 m left to drive, `_recentre` checks whether the goal could stand 30 percent nearer to the
+stall centre without the car's outline, grown by 12 cm, touching an obstacle cell. If so, the end
+of the path is moved there with the same weighting. In the verification runs this took five final
+positions from 10 to 20 cm off centre to under 1 cm.
+
 ## Watching the path
 
 Each perception tick, `_monitor` places the footprint at every third remaining path sample and
 tests it against the occupied cells. Two consecutive hits make the car stop and replan. If no plan
 exists the run fails. It does not drive a path it knows to be blocked.
+
+With a sensor rig the test is made twice. The footprint as it is decides whether the path is
+blocked, as above. The footprint grown by `min(0.10, plan margin - 0.03)` m decides whether an
+obstacle has turned out to be nearer to the path than the plan allowed for, which with cameras
+happens when a far obstacle comes close and is placed properly. That also makes the car stop and
+look for a better plan, once per plan. If there is none, it carries on with the plan it has, which
+is still drivable.
 
 After the last segment the pose is compared with the goal. More than 8 cm sideways, 1.5 degrees
 or 30 cm lengthwise triggers a correction plan, at most twice.

@@ -5,7 +5,8 @@ Needs a Python that has PyChrono and matplotlib:
 
     python docs/make_figures.py
 
-Three headless simulations are run one after another (about a minute in total)."""
+Three headless simulations are run one after another (about a minute in total), with the stand-in
+perception. The figures of the sensors are made by make_sensor_figures.py."""
 
 import importlib.util
 import math
@@ -58,7 +59,8 @@ def draw_scene(ax, scn, stalls=False):
 
 def args_for(kind, cars, seed=1, extra=()):
     old = sys.argv
-    sys.argv = ["parking_sim.py", "--headless", "--type", kind, "--cars", cars, "--seed", str(seed), *extra]
+    # these figures show the pipeline with the stand-in perception, which every PyChrono can run
+    sys.argv = ["parking_sim.py", "--headless", "--sensors", "sim", "--type", kind, "--cars", cars, "--seed", str(seed), *extra]
     try:
         return ps.parse_args()
     finally:

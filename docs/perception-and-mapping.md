@@ -3,12 +3,25 @@
 This covers everything between the true scene and the decision "park in that stall":
 `Perception`, `GridMap`, `LineTrack`, `LineMap`, `find_slots` and `ParkingSim._decide`.
 
+There are two sources of perception, and they feed the same mapping code. Every 0.1 s either one
+returns a list of planar scans (per bearing: the range of the nearest obstacle, and how far the
+ray is known to be free) and a list of line segments.
+
+| Source | `--sensors` | What it is |
+| --- | --- | --- |
+| `SensorRig` | `camera`, `camera+lidar`, `camera+radar` | cameras, lidar and radar ray traced by Chrono::Sensor. See [sensors.md](sensors.md) |
+| `Perception` | `sim` | detections computed from the scenario and corrupted. Described here |
+
+This document describes the stand-in and the mapping. Where the mapping does something only
+because a real sensor has a limited view, it says so and points to [sensors.md](sensors.md).
+
 ## Simulated perception
 
-Perception is simulated from the ground truth scene because the project is about what happens
-after perception. The noise model is still meant to be unkind in the ways a real detector is:
+The stand-in computes its detections from the ground truth scene. It runs on any PyChrono, with
+no sensor module. The noise model is still meant to be unkind in the ways a real detector is:
 range dependent noise, partial observations, occlusion, dropouts and false positives. Every 0.1 s
-`Perception.sense(pose)` returns two things. The sensor origin is the middle of the car body.
+`Perception.sense(pose)` returns one scan and the line detections. The sensor origin is the
+middle of the car body.
 
 ![One perception frame](img/perception.png)
 
@@ -52,9 +65,15 @@ lengthwise, so a single detection is not good enough to park by. The map has to 
 
 `GridMap` covers the scenario with 10 cm cells and keeps two counters per cell.
 
-- `hits`: how many range returns ended in the cell.
+- `hits`: in how many scans a range return ended in the cell.
 - `free`: in how many scans a ray passed through the cell. Rays are sampled every 20 cm up to
-  10 cm short of their return.
+  the range the scan reports as free.
+
+A scan counts once per cell, however many of its rays touch the cell. The cells under the car's
+own outline are counted as free on every tick: the ground the car stands on is free, whether a
+sensor looks at it or not. With a sensor rig there are two more counters, for ground that a
+camera sees from too far away to be sure of it (see
+[sensors.md](sensors.md#far-ground-in-the-grid)).
 
 Two derived maps are used.
 
@@ -85,7 +104,8 @@ re-fitted whenever one is added.
 **Association.** A detection joins a track if all of these hold, and the track with the smallest
 perpendicular distance wins:
 
-- direction: `|sin(angle between them)| < 0.21`, about 12 degrees
+- direction: `|sin(angle between them)| < 0.21`, about 12 degrees. This is skipped if the
+  detection or the track is shorter than 1 m: a short piece has no direction worth comparing
 - offset: both endpoints within `0.35 m + 0.03 x range` of the track's line
 - overlap: the gap between the detection and the track's extent along the line is under 0.8 m
 
@@ -115,6 +135,10 @@ endpoints that lie within 0.6 m of it, which is unbiased for a line end that was
 than 3 detections are dropped after 2.5 s, which removes clutter. Tracks that turn out to be the
 same line (nearly parallel, within 0.25 m, extents touching) are merged.
 
+With a sensor rig, a track of 0.35 m or more also counts, as a stub, and a track remembers the
+stretch along which paint was seen. Both are described in
+[sensors.md](sensors.md#what-changes-because-the-car-cannot-see-sideways).
+
 ## From lines to stalls
 
 A stall is the space between two neighbouring, parallel line tracks. `find_slots` looks at every
@@ -138,6 +162,10 @@ pair of confirmed tracks whose directions agree within about 8 degrees.
 
 For a parallel stall the two "lines" are the short ticks painted across the parking strip at its
 front and back, so the car ends up perpendicular to them.
+
+With a sensor rig a third kind of pair is accepted: one line of at least 2 m and a stub, which is
+what a camera looking along the lane sees of a stall between two cars
+([sensors.md](sensors.md#a-stall-is-one-line-and-a-stub)).
 
 **Which end is the entrance.** The end of the line pair that is nearer to where the car has driven
 (its trail of past positions) is the lane side. Only the drive along the lane counts: the trail
@@ -164,9 +192,12 @@ and from close up, so the estimate is anchored there.
 **Parallel stalls and the kerb.** Two 2.5 m ticks give a poor heading: a few centimetres of
 endpoint error become degrees. In one test run the tick based heading was off by 2.3 degrees,
 which put a corner of the goal pose on the kerb and left no feasible plan. So for parallel stalls
-`_align_with_kerb` fits a line to the occupied cells just behind the stall (the kerb, seen by the
-range scan over the full 7 m), rejects outliers beyond 15 cm, and places the car parallel to that
-line with its side 0.30 m from it. That is also what a driver does.
+`_align_with_kerb` fits a line to the occupied cells just behind the stall (the kerb, seen over
+the full 7 m), rejects outliers beyond 15 cm, and places the car parallel to that line with its
+side 0.30 m from it. That is also what a driver does. The line is fitted to the lane-side edge of
+the occupied cells: per 20 cm along the kerb, only the cells within 12 cm of the nearest one. A
+sensor that looks down on the kerb, like a lidar, also returns points from its top, and a fit
+through the middle of those would put the kerb further away than it is.
 
 ## Free, occupied or unknown
 
@@ -176,12 +207,14 @@ parallel) so that a neighbour parked close to the line does not count:
 | Result | Condition |
 | --- | --- |
 | occupied | at least 4 occupied cells inside |
-| free | at most 1 occupied cell **and** at least 60 percent of the cells seen free in two or more scans |
+| free | at most 1 occupied cell **and** enough of the stall seen free in two or more scans: 60 percent of it, or 80 percent of its first 2.5 m and 30 percent overall |
 | unknown | anything else |
 
 "Free" needs positive evidence. A stall the car has not looked into yet is unknown, not free. For
-a stall between two parked cars this means the decision usually falls when the car is roughly
-level with it, because that is when the interior becomes visible.
+a stall between two parked cars the stand-in perception sees the interior when the car is roughly
+level with it. A camera that looks along the lane never sees the far end of such a stall, which
+lies in the shadow of the nearer car. The second way to be free is for that case: a parked car
+would show at the mouth of the stall, so a mouth that is seen to be empty is enough.
 
 The same pass counts occupied cells just outside each line, which tells whether there is a
 neighbour on each side.

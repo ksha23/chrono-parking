@@ -1,0 +1,414 @@
+PyChrono: wrap the ray-traced sensors (camera, lidar, radar) for the Vulkan RT and Metal RT backends,
+and give the radar buffers their size and time stamp.
+
+Applies to projectchrono/chrono main at c6acd4e5a1:    git apply pychrono-rt-sensors.patch
+
+diff --git a/src/chrono_swig/chrono_python/CMakeLists.txt b/src/chrono_swig/chrono_python/CMakeLists.txt
+index f078ae870f..3f6fc94dc4 100644
+--- a/src/chrono_swig/chrono_python/CMakeLists.txt
++++ b/src/chrono_swig/chrono_python/CMakeLists.txt
+@@ -132,8 +132,15 @@ endif()
+ 
+ if(CH_ENABLE_MODULE_SENSOR)
+   set(CMAKE_SWIG_FLAGS "${CMAKE_SWIG_FLAGS};-DCHRONO_SENSOR")
++  # The interface files select what to wrap with the macros of chrono_sensor/ChConfigSensor.h.
++  # SWIG does not read that header, so it is told here which ray-tracing backend the public
++  # sensor headers resolve to: OptiX, else Vulkan RT, else Metal RT.
+   if(CH_USE_SENSOR_OPTIX)
+-    set(CMAKE_SWIG_FLAGS "${CMAKE_SWIG_FLAGS};-DCHRONO_HAS_OPTIX")
++    set(CMAKE_SWIG_FLAGS "${CMAKE_SWIG_FLAGS};-DCHRONO_HAS_OPTIX;-DCHRONO_HAS_SENSOR_RENDER")
++  elseif(CH_USE_SENSOR_VULKAN_RT)
++    set(CMAKE_SWIG_FLAGS "${CMAKE_SWIG_FLAGS};-DCHRONO_HAS_VULKAN_RT;-DCHRONO_HAS_SENSOR_RENDER")
++  elseif(CH_USE_SENSOR_METAL_RT)
++    set(CMAKE_SWIG_FLAGS "${CMAKE_SWIG_FLAGS};-DCHRONO_HAS_METAL_RT;-DCHRONO_HAS_SENSOR_RENDER")
+   endif()
+ endif()
+ 
+diff --git a/src/chrono_swig/interface/sensor/ChFilter.i b/src/chrono_swig/interface/sensor/ChFilter.i
+index 45b0bd91f5..9cc0e38331 100644
+--- a/src/chrono_swig/interface/sensor/ChFilter.i
++++ b/src/chrono_swig/interface/sensor/ChFilter.i
+@@ -7,18 +7,26 @@
+ #include "chrono_sensor/filters/ChFilterIMUUpdate.h"
+ #include "chrono_sensor/filters/ChFilterTachometerUpdate.h"
+ 
+-#ifdef CHRONO_HAS_OPTIX
++// Image filters: built with every ray-tracing backend.
++#ifdef CHRONO_HAS_SENSOR_RENDER
+ 
+-  #include "chrono_sensor/optix/ChFilterOptixRender.h"
+-  #include "chrono_sensor/filters/ChFilterPCfromDepth.h"
+   #include "chrono_sensor/filters/ChFilterGrayscale.h"
++  #include "chrono_sensor/filters/ChFilterCameraNoise.h"
++  #include "chrono_sensor/filters/ChFilterSave.h"
++  #include "chrono_sensor/filters/ChFilterVisualize.h"
++  #include "chrono_sensor/filters/ChFilterImageOps.h"
++
++#endif
++
++// Point-cloud, radar and physics-based camera filters: built with OptiX and with Metal RT.
++#if defined(CHRONO_HAS_OPTIX) || defined(CHRONO_HAS_METAL_RT)
++
++  #include "chrono_sensor/filters/ChFilterPCfromDepth.h"
+   #include "chrono_sensor/filters/ChFilterRadarProcess.h"
+   #include "chrono_sensor/filters/ChFilterRadarXYZReturn.h"
+   #include "chrono_sensor/filters/ChFilterRadarSavePC.h"
+   #include "chrono_sensor/filters/ChFilterRadarVisualizeCluster.h"
+   #include "chrono_sensor/filters/ChFilterRadarXYZVisualize.h"
+-  #include "chrono_sensor/filters/ChFilterCameraNoise.h"
+-  #include "chrono_sensor/filters/ChFilterCameraExposure.h"
+ 
+   #include "chrono_sensor/filters/ChFilterPhysCameraAggregator.h"
+   #include "chrono_sensor/filters/ChFilterPhysCameraDefocusBlur.h"
+@@ -26,12 +34,16 @@
+   #include "chrono_sensor/filters/ChFilterPhysCameraNoise.h"
+   #include "chrono_sensor/filters/ChFilterPhysCameraVignetting.h"
+ 
+-  #include "chrono_sensor/filters/ChFilterSave.h"
+   #include "chrono_sensor/filters/ChFilterSavePtCloud.h"
+-  #include "chrono_sensor/filters/ChFilterVisualize.h"
+-  #include "chrono_sensor/filters/ChFilterImageOps.h"
+   #include "chrono_sensor/filters/ChFilterVisualizePointCloud.h"
+-  
++
++#endif
++
++#ifdef CHRONO_HAS_OPTIX
++
++  #include "chrono_sensor/optix/ChFilterOptixRender.h"
++  #include "chrono_sensor/filters/ChFilterCameraExposure.h"
++
+ #endif
+ 
+ using namespace chrono;
+@@ -52,7 +64,7 @@ using namespace chrono::sensor;
+ %shared_ptr(chrono::sensor::ChFilterAccess< chrono::sensor::SensorBufferT< std::shared_ptr< chrono::sensor::MagnetData [] > >,std::shared_ptr< chrono::sensor::SensorBufferT< std::shared_ptr< chrono::sensor::MagnetData [] > > > > )
+ %shared_ptr(chrono::sensor::ChFilterAccess< chrono::sensor::SensorBufferT< std::shared_ptr< chrono::sensor::GPSData [] > >,std::shared_ptr< chrono::sensor::SensorBufferT< std::shared_ptr< chrono::sensor::GPSData [] > > > > )
+ 
+-#ifdef CHRONO_HAS_OPTIX
++#ifdef CHRONO_HAS_SENSOR_RENDER
+ 
+   %shared_ptr(chrono::sensor::ChFilterAccess< chrono::sensor::LidarBufferT< std::shared_ptr< chrono::sensor::PixelXYZI [] > >,std::shared_ptr< chrono::sensor::LidarBufferT< std::shared_ptr< chrono::sensor::PixelXYZI [] > > > > )
+   %shared_ptr(chrono::sensor::ChFilterAccess< chrono::sensor::LidarBufferT< std::shared_ptr< chrono::sensor::PixelDI [] > >,std::shared_ptr< chrono::sensor::LidarBufferT< std::shared_ptr< chrono::sensor::PixelDI [] > > > > )
+@@ -104,36 +116,46 @@ using namespace chrono::sensor;
+ %include "chrono_sensor/filters/ChFilterIMUUpdate.h"
+ 
+ 
+-#ifdef CHRONO_HAS_OPTIX
++#ifdef CHRONO_HAS_SENSOR_RENDER
+ 
+   %include "chrono_sensor/filters/ChFilterGrayscale.h"
+-  %include "chrono_sensor/optix/ChFilterOptixRender.h"
+-  %include "chrono_sensor/filters/ChFilterPCfromDepth.h"
+   %include "chrono_sensor/filters/ChFilterSave.h"
+-  %include "chrono_sensor/filters/ChFilterSavePtCloud.h"
+   %include "chrono_sensor/filters/ChFilterVisualize.h"
+-  %include "chrono_sensor/filters/ChFilterVisualizePointCloud.h"
+   %include "chrono_sensor/filters/ChFilterImageOps.h"
++  %include "chrono_sensor/filters/ChFilterCameraNoise.h"
++
++#endif
++
++#if defined(CHRONO_HAS_OPTIX) || defined(CHRONO_HAS_METAL_RT)
++
++  %include "chrono_sensor/filters/ChFilterPCfromDepth.h"
++  %include "chrono_sensor/filters/ChFilterSavePtCloud.h"
++  %include "chrono_sensor/filters/ChFilterVisualizePointCloud.h"
+   %include "chrono_sensor/filters/ChFilterRadarProcess.h"
+   %include "chrono_sensor/filters/ChFilterRadarSavePC.h"
+   %include "chrono_sensor/filters/ChFilterRadarVisualizeCluster.h"
+   %include "chrono_sensor/filters/ChFilterRadarXYZReturn.h"
+   %include "chrono_sensor/filters/ChFilterRadarXYZVisualize.h"
+-  %include "chrono_sensor/filters/ChFilterCameraNoise.h"
+-  %include "chrono_sensor/filters/ChFilterCameraExposure.h"
+ 
+   %include "chrono_sensor/filters/ChFilterPhysCameraAggregator.h"
+   %include "chrono_sensor/filters/ChFilterPhysCameraDefocusBlur.h"
+   %include "chrono_sensor/filters/ChFilterPhysCameraExpsrToDV.h"
+   %include "chrono_sensor/filters/ChFilterPhysCameraNoise.h"
+   %include "chrono_sensor/filters/ChFilterPhysCameraVignetting.h"
+-  
++
++#endif
++
++#ifdef CHRONO_HAS_OPTIX
++
++  %include "chrono_sensor/optix/ChFilterOptixRender.h"
++  %include "chrono_sensor/filters/ChFilterCameraExposure.h"
++
+ #endif
+ 
+ 
+ // Filter acces templates instances
+ 
+-#ifdef CHRONO_HAS_OPTIX
++#ifdef CHRONO_HAS_SENSOR_RENDER
+ 
+   // camera
+   %template(ChFilterRGBA8Access)      chrono::sensor::ChFilterAccess<  chrono::sensor::SensorBufferT<std::shared_ptr<chrono::sensor::PixelRGBA8[]>>,    std::shared_ptr< chrono::sensor::SensorBufferT<std::shared_ptr<chrono::sensor::PixelRGBA8[]>>    >  >;
+diff --git a/src/chrono_swig/interface/sensor/ChMetalScene.i b/src/chrono_swig/interface/sensor/ChMetalScene.i
+new file mode 100644
+index 0000000000..fb8cdcdc03
+--- /dev/null
++++ b/src/chrono_swig/interface/sensor/ChMetalScene.i
+@@ -0,0 +1,22 @@
++%{
++
++/* Includes the header in the wrapper code */
++#include "chrono_sensor/ChSensorRenderTypes.h"
++#include "chrono_sensor/metal/ChMetalRTScene.h"
++
++using namespace chrono;
++using namespace chrono::sensor;
++
++%}
++
++/* The render types shared by all backends (lens model, integrator, beam shape, background).
++   Without OptiX this header defines them itself, in chrono::sensor. */
++%include "chrono_sensor/ChSensorRenderTypes.h"
++
++/* Renderer-side views of the scene, not meant for simulation code. */
++%ignore chrono::sensor::MetalSceneLight;
++%ignore chrono::sensor::ChMetalRTScene::GetLights;
++%ignore chrono::sensor::ChMetalRTScene::GetRenderScene;
++
++/* Parse the header file to generate wrappers */
++%include "chrono_sensor/metal/ChMetalRTScene.h"
+diff --git a/src/chrono_swig/interface/sensor/ChModuleSensor.i b/src/chrono_swig/interface/sensor/ChModuleSensor.i
+index b358353d83..c008a037a9 100644
+--- a/src/chrono_swig/interface/sensor/ChModuleSensor.i
++++ b/src/chrono_swig/interface/sensor/ChModuleSensor.i
+@@ -78,18 +78,35 @@
+ #include "chrono_sensor/sensors/ChSensorBuffer.h"
+ #include "chrono_sensor/sensors/ChNoiseModel.h"
+ 
+-#ifdef CHRONO_HAS_OPTIX
++// Camera, lidar and radar need a ray-tracing backend. The sensor classes are the same for all
++// backends; the base class they derive from and the scene class are the backend's own.
++#ifdef CHRONO_HAS_SENSOR_RENDER
+ 
+-  #include "chrono_sensor/sensors/ChOptixSensor.h"
+   #include "chrono_sensor/sensors/ChCameraSensor.h"
+   #include "chrono_sensor/sensors/ChSegmentationCamera.h"
+   #include "chrono_sensor/sensors/ChDepthCamera.h"
+   #include "chrono_sensor/sensors/ChLidarSensor.h"
+   #include "chrono_sensor/sensors/ChRadarSensor.h"
++
++#endif
++
++#if defined(CHRONO_HAS_OPTIX)
++
++  #include "chrono_sensor/sensors/ChOptixSensor.h"
+   #include "chrono_sensor/optix/ChOptixScene.h"
+   #include "chrono_sensor/optix/ChOptixDefinitions.h"
+   #include "chrono_sensor/optix/ChOptixUtils.h"
+ 
++#elif defined(CHRONO_HAS_VULKAN_RT)
++
++  #include "chrono_sensor/sensors/ChVulkanSensor.h"
++  #include "chrono_sensor/vulkan/ChVulkanRTScene.h"
++
++#elif defined(CHRONO_HAS_METAL_RT)
++
++  #include "chrono_sensor/sensors/ChMetalSensor.h"
++  #include "chrono_sensor/metal/ChMetalRTScene.h"
++
+ #endif
+ 
+ using namespace chrono;
+@@ -172,9 +189,16 @@ using namespace chrono::sensor;
+ %shared_ptr(chrono::sensor::SensorBufferT<std::shared_ptr<chrono::sensor::MagnetData[]>>)
+ %shared_ptr(chrono::sensor::SensorBufferT<std::shared_ptr<chrono::sensor::GPSData[]>>)
+ 
+-#ifdef CHRONO_HAS_OPTIX
+-
++#if defined(CHRONO_HAS_OPTIX)
+   %shared_ptr(chrono::sensor::ChOptixScene)
++#elif defined(CHRONO_HAS_VULKAN_RT)
++  %shared_ptr(chrono::sensor::ChVulkanRTScene)
++#elif defined(CHRONO_HAS_METAL_RT)
++  %shared_ptr(chrono::sensor::ChMetalRTScene)
++#endif
++
++#ifdef CHRONO_HAS_SENSOR_RENDER
++
+   %shared_ptr(chrono::sensor::PixelDI)
+   %shared_ptr(chrono::sensor::PixelXYZI)
+   %shared_ptr(chrono::sensor::PixelRGBA8)
+@@ -188,6 +212,8 @@ using namespace chrono::sensor;
+   %shared_ptr(chrono::sensor::SensorBufferT<std::shared_ptr<chrono::sensor::PixelDI[]>>)
+   %shared_ptr(chrono::sensor::LidarBufferT<std::shared_ptr<chrono::sensor::PixelXYZI[]>>)
+   %shared_ptr(chrono::sensor::LidarBufferT<std::shared_ptr<chrono::sensor::PixelDI[]>>)
++  %shared_ptr(chrono::sensor::SensorBufferT<std::shared_ptr<chrono::sensor::RadarReturn[]>>)
++  %shared_ptr(chrono::sensor::SensorBufferT<std::shared_ptr<chrono::sensor::RadarXYZReturn[]>>)
+   %shared_ptr(chrono::sensor::RadarBufferT<std::shared_ptr<chrono::sensor::RadarReturn[]>>)
+   %shared_ptr(chrono::sensor::RadarBufferT<std::shared_ptr<chrono::sensor::RadarXYZReturn[]>>)
+   %shared_ptr(chrono::sensor::SensorBufferT<std::shared_ptr<chrono::sensor::PixelRGBA8[]>>)
+@@ -234,15 +260,23 @@ using namespace chrono::sensor;
+ %include "ChNoiseModel.i"
+ %include "ChSensorBuffer.i"
+ %include "ChFilter.i"
+-#ifdef CHRONO_HAS_OPTIX
++#if defined(CHRONO_HAS_OPTIX)
+   %include "ChScene.i"
++#elif defined(CHRONO_HAS_VULKAN_RT)
++  %include "ChVulkanScene.i"
++#elif defined(CHRONO_HAS_METAL_RT)
++  %include "ChMetalScene.i"
+ #endif
+ %include "ChSensor.i"
+ %include "ChGPSSensor.i"
+ %include "ChIMUSensor.i"
+-#ifdef CHRONO_HAS_OPTIX
++#ifdef CHRONO_HAS_SENSOR_RENDER
+   %include "ChOptixSensor.i"
+ #endif
++// The Vulkan RT and Metal RT render engines are not wrapped: the manager is driven through
++// Update() and configured through its scene.
++%ignore chrono::sensor::ChSensorManager::GetVulkanEngine;
++%ignore chrono::sensor::ChSensorManager::GetMetalEngine;
+ %include "chrono_sensor/ChSensorManager.h"
+ 
+ 
+diff --git a/src/chrono_swig/interface/sensor/ChOptixSensor.i b/src/chrono_swig/interface/sensor/ChOptixSensor.i
+index c5c550db9f..cb7c1b1b16 100644
+--- a/src/chrono_swig/interface/sensor/ChOptixSensor.i
++++ b/src/chrono_swig/interface/sensor/ChOptixSensor.i
+@@ -1,7 +1,13 @@
+ %{
+ 
+ /* Includes the header in the wrapper code */
+-#include "chrono_sensor/sensors/ChOptixSensor.h"
++#if defined(CHRONO_HAS_OPTIX)
++  #include "chrono_sensor/sensors/ChOptixSensor.h"
++#elif defined(CHRONO_HAS_VULKAN_RT)
++  #include "chrono_sensor/sensors/ChVulkanSensor.h"
++#elif defined(CHRONO_HAS_METAL_RT)
++  #include "chrono_sensor/sensors/ChMetalSensor.h"
++#endif
+ #include "chrono_sensor/sensors/ChCameraSensor.h"
+ #include "chrono_sensor/sensors/ChSegmentationCamera.h"
+ #include "chrono_sensor/sensors/ChDepthCamera.h"
+@@ -16,6 +22,8 @@ using namespace chrono::sensor;
+ %}
+ 
+ %shared_ptr(chrono::sensor::ChOptixSensor)
++%shared_ptr(chrono::sensor::ChVulkanSensor)
++%shared_ptr(chrono::sensor::ChMetalSensor)
+ %shared_ptr(chrono::sensor::ChCameraSensor)
+ %shared_ptr(chrono::sensor::ChSegmentationCamera)
+ %shared_ptr(chrono::sensor::ChDepthCamera)
+@@ -24,8 +32,17 @@ using namespace chrono::sensor;
+ %shared_ptr(chrono::sensor::ChRadarSensor)
+ %shared_ptr(chrono::sensor::ChPhysCameraSensor)
+ 
+-/* Parse the header file to generate wrappers */
+-%include "../../../chrono_sensor/sensors/ChOptixSensor.h"
++/* Parse the header file to generate wrappers. The sensors derive from the base class of the
++   active backend, which carries the pipeline type next to the image size. */
++#if defined(CHRONO_HAS_OPTIX)
++  %include "../../../chrono_sensor/sensors/ChOptixSensor.h"
++#elif defined(CHRONO_HAS_VULKAN_RT)
++  %include "../../../chrono_sensor/vulkan/ChVulkanRTDefinitions.h"
++  %include "../../../chrono_sensor/sensors/ChVulkanSensor.h"
++#elif defined(CHRONO_HAS_METAL_RT)
++  %include "../../../chrono_sensor/metal/ChMetalRTDefinitions.h"
++  %include "../../../chrono_sensor/sensors/ChMetalSensor.h"
++#endif
+ %include "../../../chrono_sensor/sensors/ChCameraSensor.h"    
+ %include "../../../chrono_sensor/sensors/ChSegmentationCamera.h"
+ %include "../../../chrono_sensor/sensors/ChDepthCamera.h"
+diff --git a/src/chrono_swig/interface/sensor/ChSensor.i b/src/chrono_swig/interface/sensor/ChSensor.i
+index 282b381d5a..38eda4aaa3 100644
+--- a/src/chrono_swig/interface/sensor/ChSensor.i
++++ b/src/chrono_swig/interface/sensor/ChSensor.i
+@@ -17,7 +17,7 @@ using namespace chrono::sensor;
+ %include "../../../chrono_sensor/sensors/ChSensor.h"
+ %include "../../../chrono_sensor/sensors/Sensor.h"
+ 
+-#ifdef CHRONO_HAS_OPTIX
++#ifdef CHRONO_HAS_SENSOR_RENDER
+   %template(GetMostRecentRGBA8Buffer) chrono::sensor::ChSensor::GetMostRecentBuffer< std::shared_ptr < chrono::sensor::SensorBufferT<std::shared_ptr<chrono::sensor::PixelRGBA8[]>>> > ;
+   %template(GetMostRecentR8Buffer)    chrono::sensor::ChSensor::GetMostRecentBuffer< std::shared_ptr < chrono::sensor::SensorBufferT<std::shared_ptr<char[]>>> > ;
+ 
+diff --git a/src/chrono_swig/interface/sensor/ChSensorBuffer.i b/src/chrono_swig/interface/sensor/ChSensorBuffer.i
+index fa97e17375..2dde5b8723 100644
+--- a/src/chrono_swig/interface/sensor/ChSensorBuffer.i
++++ b/src/chrono_swig/interface/sensor/ChSensorBuffer.i
+@@ -32,7 +32,7 @@ using namespace chrono::sensor;
+ 
+ // BufferT Templates
+ 
+-#ifdef CHRONO_HAS_OPTIX
++#ifdef CHRONO_HAS_SENSOR_RENDER
+ 
+   //camera
+   %template(UserR8Buffer) chrono::sensor::SensorBufferT<std::shared_ptr<char[]>>;
+@@ -44,7 +44,9 @@ using namespace chrono::sensor;
+   %template(UserDIBuffer) chrono::sensor::LidarBufferT<std::shared_ptr<chrono::sensor::PixelDI[]>>;
+   %template(UserXYZIBuffer) chrono::sensor::LidarBufferT<std::shared_ptr<chrono::sensor::PixelXYZI[]>>;
+   
+-  //radar
++  //radar (as for the lidar, the base buffer is instantiated first: it holds Width, Height and TimeStamp)
++  %template(UserRadarSensorBuffer) chrono::sensor::SensorBufferT<std::shared_ptr<chrono::sensor::RadarReturn[]>>;
++  %template(UserRadarXYZSensorBuffer) chrono::sensor::SensorBufferT<std::shared_ptr<chrono::sensor::RadarXYZReturn[]>>;
+   %template(UserRadarBuffer) chrono::sensor::RadarBufferT<std::shared_ptr<chrono::sensor::RadarReturn[]>>;
+   %template(UserRadarXYZBuffer) chrono::sensor::RadarBufferT<std::shared_ptr<chrono::sensor::RadarXYZReturn[]>>;
+   
+@@ -63,7 +65,7 @@ using namespace chrono::sensor;
+ // ADDITIONAL C++ FUNCTIONS / CLASSES THAT ARE USED ONLY FOR PYTHON WRAPPER
+ //
+ 
+-#ifdef CHRONO_HAS_OPTIX
++#ifdef CHRONO_HAS_SENSOR_RENDER
+ 
+   %extend chrono::sensor::SensorConfig<std::shared_ptr<chrono::sensor::PixelDI[]>> {
+           public:
+diff --git a/src/chrono_swig/interface/sensor/ChVulkanScene.i b/src/chrono_swig/interface/sensor/ChVulkanScene.i
+new file mode 100644
+index 0000000000..29da3105c2
+--- /dev/null
++++ b/src/chrono_swig/interface/sensor/ChVulkanScene.i
+@@ -0,0 +1,29 @@
++%{
++
++/* Includes the header in the wrapper code */
++#include "chrono_sensor/ChSensorRenderTypes.h"
++#include "chrono_sensor/vulkan/ChVulkanRTScene.h"
++
++using namespace chrono;
++using namespace chrono::sensor;
++
++%}
++
++/* The render types shared by all backends (lens model, integrator, beam shape, background).
++   Without OptiX this header defines them itself, in chrono::sensor. */
++%include "chrono_sensor/ChSensorRenderTypes.h"
++
++/* Renderer-side views of the scene, not meant for simulation code. */
++%ignore chrono::sensor::ChVulkanRTSceneStats;
++%ignore chrono::sensor::ChVulkanRTTexCoord;
++%ignore chrono::sensor::ChVulkanRTMaterial;
++%ignore chrono::sensor::ChVulkanRTTriangle;
++%ignore chrono::sensor::ChVulkanRTPrimitive;
++%ignore chrono::sensor::ChVulkanRTLight;
++%ignore chrono::sensor::ChVulkanRTScene::GetStats;
++%ignore chrono::sensor::ChVulkanRTScene::GetPrimitives;
++%ignore chrono::sensor::ChVulkanRTScene::GetLights;
++%ignore chrono::sensor::ChVulkanRTScene::SetLights;
++
++/* Parse the header file to generate wrappers */
++%include "chrono_sensor/vulkan/ChVulkanRTScene.h"
+diff --git a/src/tests/unit_tests/python/sensor/CMakeLists.txt b/src/tests/unit_tests/python/sensor/CMakeLists.txt
+index 9442f0102f..4879979f44 100644
+--- a/src/tests/unit_tests/python/sensor/CMakeLists.txt
++++ b/src/tests/unit_tests/python/sensor/CMakeLists.txt
+@@ -2,7 +2,7 @@ set(TESTS
+     pyutest_SEN_gps
+ )
+ 
+-if(CH_USE_SENSOR_OPTIX)
++if(CH_USE_SENSOR_OPTIX OR CH_USE_SENSOR_VULKAN_RT OR CH_USE_SENSOR_METAL_RT)
+    set(TESTS ${TESTS}
+        pyutest_SEN_data_access
+    )

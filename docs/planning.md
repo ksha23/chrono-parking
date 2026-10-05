@@ -47,7 +47,7 @@ The nominal goal comes from the stall estimate (see
 `_plan_once` does two things with it.
 
 **Nudge it clear.** If the car at the nominal pose would touch a blocked cell with a small margin,
-the pose is shifted. Candidate shifts are tried in order of size: up to 0.3 m sideways and up to
+the pose is shifted. The plan line in the log says so when that happens. Candidate shifts are tried in order of size: up to 0.3 m sideways and up to
 0.6 m back toward the lane for ordinary stalls, up to 0.6 m along the kerb and 0.3 m away from it
 for parallel stalls. This is how the car ends up centred in the free space when a neighbour is
 parked over the line.
@@ -110,6 +110,16 @@ Safety margins are tried from generous to tight, and the first that yields a pla
 
 Parallel stalls start tighter because a car parked 0.30 m from the kerb has no room for a 0.25 m
 sideways margin.
+
+With a sensor rig the margins are wider:
+
+| Stalls | Sideways, lengthwise margin [m] with a sensor rig |
+| --- | --- |
+| perpendicular, angled | (0.30, 0.35), then (0.20, 0.25), then (0.12, 0.15) |
+| parallel | (0.20, 0.30), then (0.12, 0.22), then (0.10, 0.18) |
+
+A camera places an obstacle less exactly than the stand-in scan does, and what it has not looked
+at lately it knows only from before. The wider first setting costs nothing where there is room.
 
 ## Hybrid A*
 
@@ -230,7 +240,7 @@ The winning chain of primitives plus its analytic ending is sampled every 10 cm 
 `(x, y, heading, direction, curvature)`. `split_segments` cuts that at every direction change into
 `Segment` objects, drops fragments under 8 cm, and merges neighbours that end up with the same
 direction. Each segment stores its curvature for the controller and a speed limit derived from the
-steering rate (see [control.md](control.md#speed)).
+steering rate (see [control.md](control.md#speed-and-torque)).
 
 ## Final check
 

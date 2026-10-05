@@ -97,9 +97,9 @@ is typed in.
 | steering stop and angle to rack table | sweep of the rack at power-up, `GetSteeringAngle()` | 35.4 deg |
 | brake torque capacity | `GetBrakeTorque()` with the brakes fully applied | 8000 N m |
 | planning curvature limit | `tan(GetMaxSteeringAngle()) / wheelbase`, the declared 25 deg | 0.168 per metre, radius 5.95 m |
+| roof, for the sensor mounts | top of the chassis collision hull | 1.47 m above the reference point, 1.17 m long |
 
-The footprint and ride height of the parked cars come from the bounding boxes of their meshes in
-the same way.
+The outline and ride height of the parked cars come from their meshes in the same way.
 
 ## Scenarios
 
@@ -134,6 +134,14 @@ Parallel stalls are 7.2 m long because of the car, not the planner: with a 5.95 
 4.9 m car needs about 8 m between its neighbours to reverse in with one sweep, and the neighbours
 are parked up to 0.3 m toward the free stall.
 
+**The outline of a parked car** is the convex outline of its body seen from above, taken from the
+mesh below half its height. That leaves out the mirrors and follows the rounded corners. The same
+32-point polygon is the car's collision shape (as a convex hull), the obstacle the stand-in scan
+hits, and what clearance is measured against. An earlier version used the bounding box of the
+mesh. That is 13 to 17 cm wider per side where the mirrors are, and its corners stand 10 to 20 cm
+outside the rounded bumper. A sensor reports the body, so a plan that kept 12 cm from what the
+lidar saw of a car counted as touching it.
+
 ## The window
 
 ![The window](img/window.png)
@@ -162,6 +170,8 @@ Drawn into the 3D scene, on the ground:
 | yellow, on the path | the MPC's predicted positions over its horizon |
 | white rectangle | goal pose |
 | orange | range scan of the current frame (top view only) |
+| light blue outline | what each sensor is looking at: a fan per camera or radar, a circle for the lidar (top view only) |
+| dark teal | line stubs, shorter than a confirmed line (sensor rig only) |
 
 ### The internals panel
 
@@ -177,8 +187,13 @@ The right-hand panel shows what the agent is doing, updated at the perception ra
 5. **Speed.** Speed and the speed command.
 6. **Steering gain.** The identified gain forward and in reverse against the ideal bicycle value
    `1 / L`. This is the trace to watch when the car first turns in a new direction.
-7. Counts: line tracks, stalls by status, what was read from the model (dimensions, mass, steering
-   stop, brake capacity), smallest clearance so far, margin and segment count of the current plan.
+7. Counts: the perception source, line tracks, stalls by status, what was read from the model
+   (dimensions, mass, steering stop, brake capacity), smallest clearance so far, margin and segment
+   count of the current plan.
+8. **Cameras, as read** (sensor rig only). For the front and the rear camera, what each pixel is
+   taken to be: ground, obstacle, unclear, paint, or the car's own body. This is the depth image's
+   classification with the paint from the colour image on top, the picture that the mapping is
+   built from. See [sensors.md](sensors.md#ground-obstacle-or-unclear).
 
 `--no-panel` hides it.
 
@@ -240,8 +255,9 @@ macOS only. Input is ignored unless the window is in front.
 
 ## Running without a window
 
-`--headless` skips the viewer and runs as fast as it can, about seven times real time. It prints
-a log and one result line:
+`--headless` skips the viewer and runs as fast as it can: about four times real time with
+`--sensors sim`, about real time with a sensor rig, where rendering and processing the sensor
+data is most of the work. It prints a log and one result line:
 
 ```
 [result] ok=True  time=32.220  plan_time=0.188  gear_changes=1  replans=0  corrections=0
@@ -257,3 +273,8 @@ truly free, and no contact (smallest clearance above zero). The exit code is 0 w
 
 A windowed run and a headless run of the same options give the same result line. Planning is
 limited by node expansions, not wall time, and simulated time is frozen while the planner runs.
+That holds with a sensor rig too: the sensors are rendered for the simulated instant, and the
+noise added to their data comes from the seeded generator.
+
+With a sensor rig the Chrono visual assets are created in a headless run as well, because they
+are what the sensors render. Identical parked cars share one mesh.
