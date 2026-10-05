@@ -275,6 +275,14 @@ def test_depth_from_images():
     assert near.sum() > 20000 and np.abs(P[near][:, 2] + h).max() < 2e-3                  # the road comes out flat
     assert np.all(r[:, 4:][z[:, 4:] > rig.CAM_FAR] >= 0.99 * rig.CAM_FAR)                 # and the sky far away
     assert np.all(r[rig.CAM_H // 4 - 40, :2] == 0.0)          # near ground at the left rim: not in the right image
+    disp = (rig.CAM_F * rig.BASELINE / zf).astype(np.float32)[::-1]                       # top row first, as it comes back
+    rig.rows = (0, rig.CAM_H)
+    whole = rig._stereo_rows(disp)
+    assert np.array_equal(whole, r)
+    rig.rows = (160, 544)                                 # only these rows go to the network: no sky, no bonnet
+    part = rig._stereo_rows(disp[160:544])
+    lo, hi = (rig.CAM_H - 544) // 2, (rig.CAM_H - 160) // 2                               # the same rows, from the bottom, at half size
+    assert np.array_equal(part[lo + 1:hi - 1], whole[lo + 1:hi - 1]) and not part[:lo].any() and not part[hi:].any()
     step = (rig.CAM_F * rig.BASELINE / zf).astype(np.float32)
     step[:, 480:] += 6.0                                                                  # something nearer on one side
     r = rig._stereo_range(step)               # (rows 100 to 145 show the road from 5 m on, where 6 pixels is a jump)

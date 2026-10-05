@@ -60,7 +60,8 @@ python parking_sim.py --headless --seed 7 --noise 2     # no window, prints a re
 | Option | Values | Meaning |
 | --- | --- | --- |
 | `--sensors` | `camera`, `camera+lidar`, `sim` | what the car perceives with. Default: `camera` if the PyChrono has the sensors and the depth networks are set up, else `sim` |
-| `--stereo` | `igev`, `rt` | stereo network: IGEV++, or its real-time version, three times faster |
+| `--stereo` | `igev`, `rt` | stereo network: IGEV++, or its real-time version, three times faster and less exact (see [docs/sensors.md](docs/sensors.md#what-it-needs)) |
+| `--stereo-rows` | `TOP,BOTTOM`, for example `160,544` | give the stereo network only these rows of the 600 of an image, counted from the top: above is sky, below is the car's own bonnet. Default: all rows |
 | `--stereo-hz`, `--mono-hz` | per second, default 5 | how often the stereo network and the monocular network run, up to the 10 frames per second of the cameras. The maps add up time, not frames, so nothing is tuned to a rate: see [docs/sensors.md](docs/sensors.md#how-often-the-networks-run) |
 | `--sky` | `clear`, `low`, `overcast` | light for the sensors: sun at 41 degrees, sun at 32 degrees, or a grey sky. Default: by the seed |
 | `--depth-host` | ssh host | run the depth networks on another machine, see [docs/sensors.md](docs/sensors.md#what-it-needs) |

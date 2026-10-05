@@ -127,6 +127,22 @@ them. With the networks on the other machine it is 2.7 s. NumPy is held to one B
 its OpenBLAS keeps a thread per core spinning, and four runs side by side then each took seven
 times as long as one alone.
 
+**Faster stereo.** Two options trade time for something:
+
+- `--stereo-rows 160,544` gives the network only those rows of an image. Above them is sky and
+  below them the car's own bonnet, and the network spends as long on those as on the road. The
+  full network takes 0.50 s instead of 0.91 s for rows 176 to 496. Two runs with the full network
+  came out the same with rows 160 to 544 as with all rows (clearance 0.281 against 0.282 m in a
+  parallel stall, 0.531 against 0.532 m in a perpendicular one). It is off by default because
+  it was not run on the whole set.
+- `--stereo rt` is the real-time version of the network, at 0.28 s per pair. Its disparity
+  differs from that of the full network by 0.36 pixels in the median, which at 6.5 m is 14 cm
+  of range. That is where the pair has to place the kerb of a parallel stall. In the one
+  parallel stall it was tried on, the car ended 17 cm from the kerb instead of 28 cm, and 0.4 cm
+  from it in a second run with other rows. Use it to watch, not to measure.
+
+With both, a run on the Mac alone takes 2.1 s per simulated second instead of 5.7 s.
+
 ## The scene the cameras see
 
 A stereo matcher has nothing to match on a road of one flat colour, and a line detector that only

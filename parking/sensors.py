@@ -177,8 +177,13 @@ class SensorRig:
     Z_GROUND, Z_OBSTACLE, Z_TOP = 0.05, 0.08, 2.3     # a kerb is 0.15 m high
     Z_LIDAR = 0.30             # lidar returns below this are not placed in the map as obstacles
 
-    def __init__(self, world, mode, noise, rng, depth, sky, stereo_hz=5.0, mono_hz=5.0):
+    def __init__(self, world, mode, noise, rng, depth, sky, stereo_hz=5.0, mono_hz=5.0, stereo_rows=None):
         self.mode, self.noise, self.rng, self.depth = mode, noise, rng, depth
+        # The rows of the stereo images that go to the network, counted from the top. The top of
+        # an image is sky and the bottom is the car's own bonnet, and the network spends as long
+        # on those rows as on the road. (Even numbers: the range image is made of 2 x 2 blocks.)
+        top, bottom = stereo_rows or (0, self.CAM_H)
+        self.rows = (max(0, top - top % 2), min(self.CAM_H, bottom + bottom % 2))
         # How often each network runs is a matter of how much computing there is, not of the
         # method: the maps add up the time each answer stands for, not the number of answers.
         # The cameras can deliver a frame per perception tick.
@@ -307,7 +312,8 @@ class SensorRig:
                                  [c["image"] for c in monos]))
         if take_stereo and {"front", "right"} <= fresh and \
                 self.left["stamp"] == self.right["stamp"]:
-            ident = self.depth.submit("stereo", [self.left["image"][::-1], self.right["image"][::-1]])
+            r0, r1 = self.rows
+            ident = self.depth.submit("stereo", [self.left["image"][::-1][r0:r1], self.right["image"][::-1][r0:r1]])
             self.pending.append((self.tick + int(round(self.STEREO_LAG / PERCEPTION_DT)), ident, [self.left], self.left["stamp"],
                                  [self.left["image"]]))
         scans, dets, paint = [], [], []
@@ -316,7 +322,7 @@ class SensorRig:
             maps = self.depth.collect(ident)
             for cam, image, out in zip(cams, images, maps):
                 frame = self.frames[stamp]
-                rng_img = self._stereo_range(out[::-1]) if cam["role"] == "stereo" else \
+                rng_img = self._stereo_rows(out) if cam["role"] == "stereo" else \
                     self._mono_range(cam, out[::-1], *frame)
                 if rng_img is None:
                     continue
@@ -337,6 +343,15 @@ class SensorRig:
         if paint:
             self.paint = np.concatenate(paint)
         return scans, dets
+
+    def _stereo_rows(self, disp):
+        """The range image from the disparity of the rows that were sent to the network (top row
+        first, as it comes back). The rows that were not sent have no range."""
+        (r0, r1), full = self.rows, np.zeros((self.CAM_H, self.CAM_W), dtype=np.float32)
+        full[r0:r1] = disp
+        r = self._stereo_range(full[::-1])
+        r[:(self.CAM_H - r1) // 2] = r[(self.CAM_H - r0) // 2:] = 0.0
+        return r
 
     def _stereo_range(self, disp):
         """The range along each ray of the half-size depth image, from the disparity of the left

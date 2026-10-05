@@ -53,6 +53,10 @@ def parse_args(argv=None):
                          "count frames, so nothing has to be retuned for another rate")
     ap.add_argument("--mono-hz", type=float, default=5.0,
                     help="how often the monocular network runs on the single cameras")
+    ap.add_argument("--stereo-rows", default=None, metavar="TOP,BOTTOM",
+                    help="give the stereo network only these rows of the 600 of an image, counted from the top, "
+                         "for example 160,544: above is sky, below is the car's own bonnet. The network is "
+                         "faster by about the share of rows left out. Default: all rows")
     ap.add_argument("--sky", choices=("auto",) + tuple(SKIES), default="auto",
                     help="light for the sensors: a clear sky with the sun at 41 degrees, a low sun at 32 degrees, "
                          "or an overcast sky. auto picks by the seed")
@@ -86,6 +90,14 @@ def parse_args(argv=None):
     if args.target is not None and args.target != "drag":
         x, y, deg = (float(v) for v in args.target.split(","))
         args.target = (x, y, math.radians(deg))
+    if args.stereo_rows is not None:
+        try:
+            top, bottom = (int(v) for v in args.stereo_rows.split(","))
+        except ValueError:
+            ap.error("--stereo-rows takes two row numbers, like 160,544")
+        if not 0 <= top < bottom <= SensorRig.CAM_H or bottom - top < 64:
+            ap.error("--stereo-rows: rows are 0 to %d from the top, and at least 64 of them are needed" % SensorRig.CAM_H)
+        args.stereo_rows = (top, bottom)
     if args.snapshots:
         os.makedirs(args.snapshots, exist_ok=True)
     if args.sky == "auto":

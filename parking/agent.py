@@ -57,7 +57,8 @@ class ParkingSim:
         rig = args.sensors != "sim"
         self.world = World(self.scn, visual=rig or not args.headless, tire=args.tire)   # sensors render the visual assets
         self.sensor = SensorRig(self.world, args.sensors, args.noise, rng, start_depth_worker(args), args.sky,
-                                args.stereo_hz, args.mono_hz) if rig else Perception(self.scn, args.noise, rng)
+                                args.stereo_hz, args.mono_hz, args.stereo_rows) if rig else \
+            Perception(self.scn, args.noise, rng)
         self.grid = GridMap(self.scn.bounds)
         self.lines = LineMap(keep=rig)
         self.planner = Planner()
@@ -99,9 +100,10 @@ class ParkingSim:
         print("[parking] perception: %s" % self.sensor.name, flush=True)
         if rig:
             info = self.sensor.depth.info
-            print("[parking] depth from images: %s (%s) for the stereo pair at %.3g Hz, %s for the single cameras at "
+            rows = "" if args.stereo_rows is None else " on rows %d to %d of the images" % self.sensor.rows
+            print("[parking] depth from images: %s (%s) for the stereo pair at %.3g Hz%s, %s for the single cameras at "
                   "%.3g Hz, on %s of %s; sky: %s" % (
-                      info["model"], info["weights"], 1.0 / (self.sensor.stereo_every * PERCEPTION_DT), info["mono"],
+                      info["model"], info["weights"], 1.0 / (self.sensor.stereo_every * PERCEPTION_DT), rows, info["mono"],
                       1.0 / (self.sensor.mono_every * PERCEPTION_DT), info["device"], info["where"], args.sky), flush=True)
 
     @property
