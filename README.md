@@ -199,8 +199,9 @@ parking/
   stereo_worker.py              the networks (IGEV++, Depth Anything V2, Mask2Former), a process of their own
   networks.py                   starting that process and talking to it
   scene_net.py                  the network that labels markings, kerbs and the car's own body
-  mapping.py, stalls.py         occupancy grid and line tracks, stalls inferred from them
-  rows.py                       what the stalls on one side of the lane have in common
+  mapping.py, stalls.py         occupancy grid and line tracks, stalls inferred from pairs of lines
+  slot.py                       a stall, and what the map says about it: free or taken, neighbours, kerb
+  rows.py, one_line.py          what the stalls on one side of the lane have in common, and stalls taken from that
   reeds_shepp.py, planner.py    Reeds-Shepp curves, configuration space, Hybrid A*
   control.py                    steering MPC, online steering gain, speed control
   viewer.py                     the window, with viewer_pictures.py, viewer_panel.py, draw.py, inputs.py
