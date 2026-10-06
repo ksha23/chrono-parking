@@ -17,8 +17,9 @@ no sensor of the car: it is there for the video. On its picture are drawn
     blue dots         kerb that the scene network has pointed out
     dotted green      the stalls that really are free (the car is not told)
 
-Frames are written to OUT/frame_00000.jpg and so on, one per 0.1 s of the run, and if ffmpeg is
-installed they are made into OUT.mp4 at twice the speed of the run. The frames are drawn in a
+Beside that picture are the front camera's, what the colours mean, and the time. Frames are
+written to OUT/frame_00000.jpg and so on, one per 0.1 s of the run, and if ffmpeg is installed
+they are made into OUT.mp4 at twice the speed of the run. The frames are drawn in a
 second process, with the Python of the networks: that one has an image library, and the Python
 that has PyChrono usually has none. Needs the sensor rig (docs/sensors.md)."""
 
@@ -29,6 +30,7 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 
 import numpy as np
 
@@ -37,7 +39,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 W, H = 1280, 800                     # of the picture from above
 HEIGHT, HFOV = 20.0, math.radians(75.0)
 FOCAL = 0.5 * W / math.tan(0.5 * HFOV)
-SMALL = (480, 300)                   # the front camera's picture in the corner
+SMALL = (480, 300)                   # the front camera's picture, in a column beside the one from above
+BAR = 44                             # a strip below both for the car's last message
 SPEED = 2                            # the video runs this many times faster than the run
 
 
@@ -212,21 +215,29 @@ def draw(out):
         if f["goal"]:
             ring(f["goal"], (255, 255, 255), 2)
         ring(f["car"], (0, 220, 255), 2)
-        # the front camera, the legend, and what is going on
-        img.paste(front, (W - SMALL[0] - 12, 12))
-        d.rectangle([W - SMALL[0] - 13, 11, W - 12, 12 + SMALL[1]], outline=(255, 255, 255))
-        d.text((W - SMALL[0] - 6, 16), "front camera", font=small, fill=(255, 255, 255))
-        d.rectangle([0, 0, 12 + d.textlength(f["title"], font=big) + 12, 30], fill=(0, 0, 0))
-        d.text((10, 4), f["title"], font=big, fill=(255, 255, 255))
-        d.rectangle([8, H - 60 - 20 * len(legend), 290, H - 52], fill=(0, 0, 0))
-        for k, (rgb, what) in enumerate(legend):
-            d.rectangle([14, H - 54 - 20 * (len(legend) - k), 26, H - 62 - 20 * (len(legend) - k - 1)], fill=rgb)
-            d.text((34, H - 58 - 20 * (len(legend) - k)), what, font=small, fill=(255, 255, 255))
-        d.rectangle([0, H - 44, W, H], fill=(0, 0, 0))
-        words = f["result"] or "t = %5.1f s   %-7s %4.1f m/s   %s" % (f["t"], f["state"], f["v"], f["text"])
-        d.text((10, H - 36), words[:120], font=big, fill=(255, 235, 120) if f["result"] else (255, 255, 255))
+        # Beside the picture, so that nothing is drawn over the scene: the front camera, what
+        # the colours mean, and what is going on. Below it, the car's last message.
+        page = Image.new("RGB", (W + SMALL[0], H + BAR), (0, 0, 0))
+        page.paste(img, (0, 0))
+        page.paste(front, (W, 0))
+        d = ImageDraw.Draw(page)
+        d.rectangle([W, 0, W + 112, 24], fill=(0, 0, 0))
+        d.text((W + 8, 4), "front camera", font=small, fill=(255, 255, 255))
+        y = SMALL[1] + 14
+        for row in textwrap.wrap(f["title"], 44):
+            d.text((W + 12, y), row, font=big, fill=(255, 255, 255))
+            y += 26
+        y += 10
+        for rgb, what in legend:
+            d.rectangle([W + 14, y + 3, W + 28, y + 15], fill=rgb)
+            d.text((W + 38, y), what, font=small, fill=(230, 230, 230))
+            y += 22
+        d.text((W + 12, y + 14), "t = %.1f s" % f["t"], font=big, fill=(255, 255, 255))
+        d.text((W + 12, y + 42), "%s, %.1f m/s" % (f["state"].lower(), f["v"]), font=big, fill=(255, 255, 255))
+        words = f["result"] or f["text"]
+        d.text((10, H + 9), words[:150], font=big, fill=(255, 235, 120) if f["result"] else (255, 255, 255))
         for _ in range(f["hold"]):
-            img.save(os.path.join(out, "frame_%05d.jpg" % count), quality=88)
+            page.save(os.path.join(out, "frame_%05d.jpg" % count), quality=88)
             count += 1
 
 
