@@ -10,8 +10,22 @@ import numpy as np
 from .chrono_env import chrono, sens
 from .config import PERCEPTION_DT
 from .perception import _rot_y, _rot_z, angular_rays, paint_segments, pinhole_rays, planar_scan
+from .scene_net import KERB, MARKING, OWN
 from .vehicle import EGO
 from .world import light_scene
+
+
+def _grown(mask, k):
+    """A mask and everything within k cells of it, along rows and columns."""
+    out = mask.copy()
+    for axis in (0, 1):
+        src = out.copy()
+        for step in range(1, k + 1):
+            a, b = [slice(None)] * 2, [slice(None)] * 2
+            a[axis], b[axis] = slice(step, None), slice(None, -step)
+            out[tuple(a)] |= src[tuple(b)]
+            out[tuple(b)] |= src[tuple(a)]
+    return out
 
 
 def sensor_mounts(body):
@@ -89,9 +103,18 @@ class SensorRig:
     LIDAR_RANGE = 20.0
     Z_GROUND, Z_OBSTACLE, Z_TOP = 0.05, 0.08, 2.3     # a kerb is 0.15 m high
     Z_LIDAR = 0.30             # lidar returns below this are not placed in the map as obstacles
+    # With the scene network (scene_net.py):
+    SCENE_TOP = 224            # rows of the stereo image above this one, from the top, are sky: not sent to it
+    PAINT_HINT = 1.2           # where it sees a marking, paint has to be this much lighter than the ground (not 1.8)
+    KERB_RANGE = {"stereo": 13.0, "mono": 4.0}      # a kerb it sees is placed up to here [m]
+    SCENE_MONO = 2             # it gets every second frame that the monocular network gets: what the single
+    #                            cameras add (a kerb behind the car, faint paint beside it) is used at walking pace
 
     def __init__(self, world, mode, noise, rng, depth, sky, stereo_hz=5.0, mono_hz=5.0, stereo_rows=None, given=()):
         self.mode, self.noise, self.rng, self.depth = mode, noise, rng, depth
+        # (the worker says whether it has the network that labels markings, kerbs and the car's own body)
+        self.scene = depth is not None and bool(depth.info.get("scene"))
+        self.kerbs = []                                   # the kerbs in each camera frame of the last call of sense: (seconds, points)
         # How the car leans and how high it rides come from the road the stereo pair sees
         # (_road_plane), unless it is told ('attitude' in given).
         self.own_attitude = "attitude" not in given
@@ -307,19 +330,27 @@ class SensorRig:
         # (the quicker answer is asked for first: the answers come back in the order of the requests)
         if take_mono and all(c["label"] in fresh for c in monos):
             ident = self.depth.submit("mono", [c["image"][::-1] for c in monos])
+            also = None
+            if self.scene and (self.tick // self.mono_every) % self.SCENE_MONO == 0:
+                also = self.depth.submit("scene", [c["image"][::-1] for c in monos])
             self.pending.append((self.tick + int(round(self.MONO_LAG / PERCEPTION_DT)), ident, monos, monos[0]["stamp"],
-                                 [c["image"] for c in monos]))
+                                 [c["image"] for c in monos], also))
         if take_stereo and {"front", "right"} <= fresh and \
                 self.left["stamp"] == self.right["stamp"]:
             r0, r1 = self.rows
             ident = self.depth.submit("stereo", [self.left["image"][::-1][r0:r1], self.right["image"][::-1][r0:r1]])
+            also = self.depth.submit("scene", [self.left["image"][::-1][self.SCENE_TOP:]]) if self.scene else None
             self.pending.append((self.tick + int(round(self.STEREO_LAG / PERCEPTION_DT)), ident, [self.left], self.left["stamp"],
-                                 [self.left["image"]]))
-        scans, dets, paint = [], [], []
+                                 [self.left["image"]], also))
+        scans, dets, paint, self.kerbs = [], [], [], []
         while self.pending and self.pending[0][0] <= self.tick:
-            _, ident, cams, stamp, images = self.pending.pop(0)
+            _, ident, cams, stamp, images, also = self.pending.pop(0)
             maps = self.depth.collect(ident)
-            for cam, image, out in zip(cams, images, maps):
+            labels = [None] * len(cams)
+            if also is not None:           # (as the images are: the whole frame, bottom row first)
+                labels = [np.concatenate([np.zeros((self.CAM_H - len(m), self.CAM_W), np.uint8), m])[::-1]
+                          for m in self.depth.collect(also)]
+            for cam, image, out, seen in zip(cams, images, maps, labels):
                 frame = self.frames[stamp]
                 if cam["role"] == "stereo":
                     rng_img = self._stereo_rows(out)
@@ -334,12 +365,13 @@ class SensorRig:
                     rng_img = self._mono_range(cam, out[::-1], *frame)
                 if rng_img is None:
                     continue
-                scan, xy, segs = self._camera(cam, image, rng_img, *frame)
+                scan, xy, segs, kerb = self._camera(cam, image, rng_img, *frame, labels=seen)
                 # (each answer stands for the time since the one before it from the same network)
                 dt = (self.stereo_every if cam["role"] == "stereo" else self.mono_every) * PERCEPTION_DT
                 scans.append((dt,) + scan)
                 dets += [tuple(seg) + (dt,) for seg in segs]
                 paint.append(xy)
+                self.kerbs.append((dt * (self.SCENE_MONO if cam["role"] == "mono" else 1), kerb))
         if self.lidar is not None:
             buf = self.lidar["sensor"].GetMostRecentDIBuffer()
             stamp = round(buf.TimeStamp, 4) if buf.HasData() else -1.0
@@ -416,15 +448,22 @@ class SensorRig:
         x0, x1, hw = self.own
         return (loc[..., 0] > x0 - grow) & (loc[..., 0] < x1 + grow) & (np.abs(loc[..., 1]) < hw + grow)
 
-    def _paint(self, image, flat, p, R, head, reach):
+    def _paint(self, image, flat, p, R, head, reach, labels=None):
         """Ground cells that look painted. The image is laid out on the ground plane, as a picture
         from above with 5 cm cells, in linear light. A cell is paint if it is 1.8 times lighter
         than the ground 20 cm to both sides of it, in one of four directions, and the depth image
         ('flat', at half the size) says that both of those are ground. That holds for a stripe in
         the sun and for one in the shade. It does not hold for the edge of a shadow, which is
         lighter than one side only, for anything wide, or for the light sill of a car, which has
-        the car on one side. Returns the world position of the cells and the pixel each was read
-        from."""
+        the car on one side.
+
+        Paint that is nearly worn away is not 1.8 times lighter than the road. Where the scene
+        network sees a marking ('labels', the size of the image), and 10 cm around that, 1.2 times
+        is enough. The network alone would not do: far away it smears a line over the cells
+        next to it. The two together find faint paint about five times as often as the rule
+        alone, with hardly more false cells (docs/sensors.md).
+
+        Returns the world position of the cells and the pixel each was read from."""
         c, n = 0.05, int(reach / 0.05)
         gx, gy = (np.arange(n) + 0.5) * c, (np.arange(2 * n) + 0.5 - n) * c
         ch, sh = math.cos(head), math.sin(head)
@@ -442,17 +481,29 @@ class SensorRig:
         G = np.pad(ok & flat[v // 2, u // 2], 4)
         s = lambda A, i, j: A[4 + i:4 + i + B.shape[0], 4 + j:4 + j + B.shape[1]]
         ridge = np.zeros(B.shape, dtype=bool)
+        hint = None
+        if labels is not None:
+            hint = _grown((labels[v, u] == MARKING) & G[4:-4, 4:-4], 2)
+            faint = np.zeros(B.shape, dtype=bool)
         with np.errstate(invalid="ignore"):
             for i, j in ((4, 0), (0, 4), (3, 3), (3, -3)):
-                ridge |= (B > 1.8 * np.maximum(s(P, i, j), s(P, -i, -j)) + 0.004) & s(G, i, j) & s(G, -i, -j)
+                sides, ground = np.maximum(s(P, i, j), s(P, -i, -j)), s(G, i, j) & s(G, -i, -j)
+                ridge |= (B > 1.8 * sides + 0.004) & ground
+                if hint is not None:
+                    faint |= (B > self.PAINT_HINT * sides + 0.004) & ground
+        if hint is not None:
+            ridge |= faint & hint
         ii, jj = np.nonzero(ridge)
         return np.stack([X[ii, jj], Y[ii, jj]], axis=1), v[ii, jj], u[ii, jj]
 
-    def _camera(self, cam, image, depth, ref_p, ref_R):
+    def _camera(self, cam, image, depth, ref_p, ref_R, labels=None):
         """One camera with its depth image: obstacles and free ground from the depth, painted
         lines from the image. image is (h, w, 3) uint8, depth (h/2, w/2) the range along each
         pixel's ray (0 where unknown), both with the bottom row first. The chassis frame is the
-        one at the time the image was taken."""
+        one at the time the image was taken. labels is what the scene network makes of the image
+        (h, w), if it runs: it points out faint paint, the kerbs, and the car's own body.
+        Returns the planar scan, the cells of paint, the line pieces among them, and the points
+        of kerb."""
         p, R = ref_p + ref_R @ cam["pos"], (ref_R @ cam["R"]).astype(np.float32)
         e0, e1, e2 = cam["err"]
         err = lambda r: e0 + e1 * r + e2 * r * r          # the range error the processing assumes
@@ -475,6 +526,22 @@ class SensorRig:
         zs = err(depth) * np.abs(dw[..., 2])              # height error that the range error causes
         own = self._is_own(P, ref_p, ref_R, 0.15)
         seen = (depth > 0.3) & (depth < 28.0) & (z < self.Z_TOP) & ~own
+        kerb = np.zeros((0, 2))
+        if labels is not None:
+            small = labels[::2, ::2]
+            # Along the edge of the car's own bonnet in the image, a depth network puts pixels
+            # somewhere between the bonnet and what lies behind it: points in the air next to
+            # the car, which the outline above does not cover. Within 3 pixels of what the
+            # network calls the car itself, a point less than 0.6 m from the car is taken only
+            # if it is ground. (Not every point in that band: the road 4 to 5 m ahead lies in
+            # it too, and that is where the pair sees a kerb as an obstacle.)
+            beside = _grown(small == OWN, 3) & self._is_own(P, ref_p, ref_R, 0.6)
+            seen &= ~beside | (np.abs(z) < self.Z_GROUND + 1.25 * zs)
+            # A kerb is too low to be told from the ground by its height beyond 8 m, and a single
+            # camera cannot tell it at all. The network knows one when it sees it.
+            there = seen & (small == KERB) & (depth < self.KERB_RANGE[cam["role"]]) & (z > -0.15 - 2.5 * zs) & \
+                (z < 0.30 + 2.5 * zs)
+            kerb = P[there][:, :2].astype(float)
         if self.show:
             self._keep(cam, P[::2, ::2], ((depth > 0.3) & (depth < 0.99 * self.CAM_FAR))[::2, ::2], ref_p, ref_R,
                        rgb=image, range=np.where(depth < 0.99 * self.CAM_FAR, depth, 0.0))
@@ -494,7 +561,7 @@ class SensorRig:
             r_far = np.where(np.isfinite(r_stop), r_free, r_far)      # not past something that stands up
 
         # paint: found in the image as laid out on the ground, then checked against the depth
-        xy, vv, uu = self._paint(image, ground, p, R, head, cam["paint"])
+        xy, vv, uu = self._paint(image, ground, p, R, head, cam["paint"], labels)
         t = np.sqrt((xy[:, 0] - p[0]) ** 2 + (xy[:, 1] - p[1]) ** 2 + p[2] ** 2)      # range of the ground cell
         vd, ud = np.minimum(vv // 2, depth.shape[0] - 1), np.minimum(uu // 2, depth.shape[1] - 1)
         # the depth has to agree that the pixel is on the ground: a white car is not, nor is the
@@ -516,7 +583,7 @@ class SensorRig:
         cam["view"] = view
         # (a single camera places a stripe by the ground alone, so only a longer piece counts)
         segs = paint_segments(xy, p[:2], min_count=1, min_len=0.35 if cam["role"] == "stereo" else 0.6)
-        return (p[:2], ang, r_hit, r_free, r_far, r_stop), xy, segs
+        return (p[:2], ang, r_hit, r_free, r_far, r_stop), xy, segs, kerb
 
     def _scanner(self, dev, r, ref_p, ref_R, r_max, sigma, dropout, n_bins, half_fov, z_min=0.0):
         """A lidar: a range per beam (0 where nothing came back).

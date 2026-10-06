@@ -34,51 +34,95 @@ tire model and hand-placed targets were not run with the rig.
 ([sensors.md](sensors.md#limits)): a pose with the error of a satellite receiver with an inertial
 unit (10 cm and 0.3 degrees, wandering slowly), its speed from a wheel encoder, its pitch, roll
 and height from the road it sees, and that it starts in a lane with stalls somewhere along it.
-The paint is worn, the road is uneven by 1.5 cm, and the simulation step is 1 ms. Means and
-largest offsets are over the runs that parked.
+The paint is worn, the road is uneven by 1.5 cm, and the simulation step is 1 ms. A network
+that labels each image points out faint paint and kerbs, and a stall can be taken from the two
+ends of its lines and the row it stands in
+([sensors.md](sensors.md#between-two-cars-a-stall-is-two-stubs)). Means and largest offsets
+are over the runs that parked. All of these runs were rendered with OptiX on an RTX 5070 Ti.
 
-The 60 runs with the rig were made twice: rendered with Metal RT on an Apple M4 Pro, and with
-OptiX on an RTX 5070 Ti. The two renderers give the same scenes with other pixels
-([sensors.md](sensors.md#what-it-needs)), so these are two draws of the same scenarios.
+**Seeds 10 to 12 had never been run.** They were run once with the code as it is, and once with
+the version before the network and the rows, for comparison:
 
-| Perception | Parked | Lateral: mean, worst | Depth: mean, worst | Heading: mean, worst | Smallest clearance | Runs that replanned or corrected | Time |
+| Perception, unseen seeds 10 to 12 | Parked | Lateral: mean, worst | Depth: mean, worst | Heading: mean, worst | Smallest clearance | Runs that replanned or corrected | Time |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| cameras, Metal RT | 39 of 42 | 5.0, at most 14.2 cm | 7.6, at most 34.5 cm | 0.9, at most 2.1 deg | 0.15 m | 9 | 40 s |
-| cameras + lidar, Metal RT | 17 of 18 | 5.3, at most 12.9 cm | 6.1, at most 15.2 cm | 1.2, at most 2.8 deg | 0.27 m | 4 | 38 s |
-| cameras, OptiX | 33 of 42 | 5.5, at most 16.7 cm | 7.9, at most 21.8 cm | 0.9, at most 2.0 deg | 0.27 m | 7 | 38 s |
-| cameras + lidar, OptiX | 16 of 18 | 5.7, at most 12.0 cm | 5.4, at most 18.5 cm | 1.1, at most 3.1 deg | 0.01 m | 5 | 38 s |
-| stand-in, no sensors | 73 of 74 | 4.1, at most 14.7 cm | 4.7, at most 22.3 cm | 0.7, at most 3.1 deg | 0.08 m | 13 | 37 s |
+| cameras | 29 of 36 | 6.0, at most 25.2 cm | 8.0, at most 23.3 cm | 0.8, at most 4.2 deg | 0.03 m | 11 | 41 s |
+| cameras + lidar | 7 of 9 | 2.4, at most 4.2 cm | 5.9, at most 10.6 cm | 0.6, at most 1.4 deg | 0.14 m | 1 | 35 s |
+| cameras, the version before | 24 of 36 | 4.9, at most 12.2 cm | 9.9, at most 22.3 cm | 0.7, at most 2.1 deg | 0.07 m | 8 | 38 s |
+| cameras + lidar, the version before | 7 of 9 | 4.4, at most 10.5 cm | 6.5, at most 14.2 cm | 0.8, at most 2.8 deg | 0.32 m | 2 | 36 s |
 
-By sky, both sensor sets together: with Metal RT clear 24 of 24, low sun 22 of 24, overcast 10
-of 12. With OptiX clear 20 of 24, low sun 21 of 24, overcast 8 of 12.
+That is 36 of 45 against 31 of 45. Nine scenarios that did not park before park now, four that
+did park do not, and five fail with both. By sky: clear 14 of 15, low sun 10 of 15 (it was 7),
+overcast 12 of 15 (it was 10).
 
-**What did not park.** With the rig it all comes from worn paint, in two ways.
+**Seeds 1 to 3 are the scenarios the method was changed on**, so they are no test of it:
 
-- *A stall that is not recognised* (2 of the 4 runs with Metal RT, 9 of the 11 with OptiX). The
-  car drives to the end of the lane without choosing one. A stall between parked cars counts
-  when one of its lines has been found over 2 m and the other shows at least its end. One such
-  line is 5.5 m long, with a faded piece 2 m from its start and a missing piece further in. It
-  was found over 3.4 m with Metal RT and over 1.9 m with OptiX, and that scenario parked with
-  the first and drove past with the second.
-- *A stall placed too deep* (2 and 2). The car ends 0.9 m too far into the stall, against the
-  kerb. In the one that was looked at, the first metre of one line at the lane is not found,
-  and the stall is taken to begin where the paint does.
+| Perception, seeds 1 to 3 | Parked | Lateral: mean, worst | Depth: mean, worst | Heading: mean, worst | Smallest clearance | Runs that replanned or corrected | Time |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| cameras | 42 of 42 | 5.2, at most 16.3 cm | 7.6, at most 41.7 cm | 1.0, at most 2.6 deg | 0.19 m | 13 | 40 s |
+| cameras + lidar | 18 of 18 | 5.3, at most 13.1 cm | 4.7, at most 11.0 cm | 1.1, at most 2.3 deg | 0.10 m | 4 | 36 s |
+| cameras, the version before | 33 of 42 | 5.5, at most 16.7 cm | 7.9, at most 21.8 cm | 0.9, at most 2.0 deg | 0.27 m | 7 | 38 s |
+| cameras + lidar, the version before | 16 of 18 | 5.7, at most 12.0 cm | 5.4, at most 18.5 cm | 1.1, at most 3.1 deg | 0.01 m | 5 | 38 s |
+| stand-in, no sensors | 73 of 74 | 4.1, at most 14.7 cm | 4.7, at most 22.3 cm | 0.7, at most 2.9 deg | 0.08 m | 13 | 37 s |
 
-The set has some scenarios up to three times (with the cameras, at double noise, with the
-lidar), and such a scenario fails all three times. The 11 runs with OptiX are 7 scenarios, the 4
-with Metal RT are 4. Seven of these 11 have cars on both sides of the free stall, where the
-least of its lines is in view. One batch each does not tell whether OptiX is harder on the
-paint detection or whether this is the spread between two draws. One parallel run with OptiX
-parked 1 cm from the kerb.
+Sixty of 60 here and 36 of 45 on scenarios never seen: what was chosen on seeds 1 to 3 (how
+much lighter than the road faint paint has to be, how a row is read) carries over in part. The
+36 of 45 is the number to go by.
+
+**What did not park on the unseen seeds.**
+
+- *The car drives past* (3 runs: angled and parallel with cars on one side, perpendicular with
+  cars on both). No stall is recognised. The same three drove past with the version before,
+  which drove past nine.
+- *The car touches something* (4 runs).
+  - A parallel stall, twice, once with the lidar: the car ends 0.6 m off along the kerb and
+    touches something. Why the stall was placed there was not looked into. With the version
+    before, one of the two drove past and the other ended as far outside the lines.
+  - A parallel stall with no cars around: the car touches the kerb on its way in. The planner
+    does not know the kerb is there, and the stereo pair sees it as an obstacle only from 4 m.
+    The version before planned a first swing forward that was 0.7 m shorter, and passed the
+    kerb by 13 cm.
+  - An angled stall, with the lidar: the car drives in, takes its heading to be 2.7 degrees off
+    the stall's, and makes a second manoeuvre to correct it. Somewhere in that it touches
+    something.
+- *The car parks 0.6 m short* (1 run, angled, cars on both sides) and sticks out of the stall.
+  The estimate of the stall jumps while the car drives in. Without the network's hint for
+  faint paint the run parks.
+- *The car gives up* (1 run, angled, no cars). It chooses a stall, something newly seen blocks
+  the planned path 0.3 s later, and it finds no other way in.
+
+Four of these parked with the version before: the parallel stall with no cars around, the
+angled stall with the lidar, the run that parks short and the run that gives up. Seeing more
+paint has a price: the estimate of a stall can still move when the car is already on its way
+in.
 
 The stand-in's one miss is a parallel stall. The car touched something while backing in, at 40
 degrees to the stall. The planner keeps 6 to 12 cm in a parallel stall, and a pose that is 10 cm
-off uses that up.
+off uses that up. The stand-in runs are the same, line for line, as before the network and
+the rows, which it does not use.
+
+`python tests/run_set.py cameras`, `python tests/run_set.py cameras --seeds 10,11,12` and
+`python tests/run_set.py standin` run these sets.
+
+**The version before, and Metal RT.** The 60 runs of seeds 1 to 3 were also rendered with Metal
+RT on an Apple M4 Pro, with the version before: 56 of 60 (cameras 39 of 42, cameras and lidar
+17 of 18), against 49 of 60 with OptiX. The two renderers give the same scenes with other pixels
+([sensors.md](sensors.md#what-it-needs)). They were not run again with Metal RT: on a Mac the
+network takes 0.4 s per image, and it is off there unless asked for. One run with it on parked.
+
+What did not park then came from worn paint, in two ways, and this is what the network and
+the rows were made for.
+
+- *A stall that is not recognised* (2 of the 4 runs with Metal RT, 9 of the 11 with OptiX). A
+  stall between parked cars counted when one of its lines had been found over 2 m and the other
+  showed at least its end. One such line is 5.5 m long, with a faded piece 2 m from its start
+  and a missing piece further in. It was found over 3.4 m with Metal RT and over 1.9 m with
+  OptiX, and that scenario parked with the first and drove past with the second.
+- *A stall placed too deep* (2 and 2). The car ended 0.9 m too far into the stall, against the
+  kerb. In the one that was looked at, the first metre of one line at the lane was not found,
+  and the stall was taken to begin where the paint did.
 
 The offsets are several times those of the earlier version below, where the car knew its pose
 exactly. It now parks where it believes it is, and that is 10 cm off.
-
-`python tests/run_set.py cameras` and `python tests/run_set.py standin` run these sets.
 
 **Before that: the car told its pose, on clean paint.** Everything from here to the end of this
 section is from the version before. There the car was given its true pose, pitch, roll, height

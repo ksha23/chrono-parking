@@ -179,7 +179,10 @@ lines was seen to start late (see [sensors.md](sensors.md#a-line-in-pieces-is-on
 
 With a sensor rig a third kind of pair is accepted: one line of at least 2 m and a stub, which is
 what a camera looking along the lane sees of a stall between two cars
-([sensors.md](sensors.md#a-stall-is-one-line-and-a-stub)).
+([sensors.md](sensors.md#a-stall-is-one-line-and-a-stub)). And a fourth: two stubs at the mouth
+of a row. Neither has a direction, so the row they stand in is worked out first, from all the
+lines on that side of the lane (`parking/rows.py`,
+[sensors.md](sensors.md#between-two-cars-a-stall-is-two-stubs)).
 
 **Which end is the entrance.** The end of the line pair that is nearer to where the car has driven
 (its trail of past positions) is the lane side. Only the drive along the lane counts: the trail
@@ -201,7 +204,9 @@ s_0 = \max(a_{in}, b_{in}), \quad s_1 = \min(a_{bk}, b_{bk})
 ```
 
 The clamp guards against a far end that has not been seen well. The entrance ends are seen often
-and from close up, so the estimate is anchored there.
+and from close up, so the estimate is anchored there. Where a camera network saw the kerb behind
+the stall, the car's end stays 0.40 m short of it
+([sensors.md](sensors.md#how-deep-a-stall-is)).
 
 **Parallel stalls and the kerb.** Two 2.5 m ticks give a poor heading: a few centimetres of
 endpoint error become degrees. In one test run the tick based heading was off by 2.3 degrees,
@@ -212,6 +217,12 @@ side 0.30 m from it. That is also what a driver does. The line is fitted to the 
 the occupied cells: per 20 cm along the kerb, only the cells within 12 cm of the nearest one. A
 sensor that looks down on the kerb, like a lidar, also returns points from its top, and a fit
 through the middle of those would put the kerb further away than it is.
+
+A kerb runs along the lane, and the fit starts from that: it takes the cells within 15 cm of a
+line along the lane through the middle of the hits, and a line that comes out more than 4
+degrees off the lane is not used. The window also holds a corner of the car parked next to the
+stall. A fit to everything in it once came out 7 degrees off, while the car stood in the stall,
+and the car set out to correct a heading that was right.
 
 ## Free, occupied or unknown
 
@@ -241,7 +252,10 @@ neighbour on each side.
 
 1. Candidates are stalls that are free, whose two lines have both been watched for 0.65 s, that
    have not been rejected by the planner before, and that lie between 8 m behind and 10 m ahead
-   of the car.
+   of the car. A stall that is known only from two stubs and its row is a candidate once the
+   car is level with it, its middle at most 1 m ahead of the car's: until then more of its far
+   line is still coming into view. Taken from 2 to 4 m before that, such a stall was placed
+   badly enough that the car needed five to nine gear changes to get into it, where two do.
 2. The candidate with the lowest score leads:
 
    ```math
@@ -267,8 +281,9 @@ search continues down the lane.
 
 ## What this stage does not do
 
-- It does not estimate the car's own pose. The true pose from Chrono is used to place detections
-  in the world.
+- It does not estimate the car's own pose. Detections are placed in the world with the pose the
+  car is given, which carries the error of a satellite receiver with an inertial unit
+  (`parking/localization.py`, [sensors.md](sensors.md#limits)).
 - Obstacles are static. Nothing moves except the car.
 - The stall size thresholds assume ordinary car stalls. They are prior knowledge about parking
   lots, not something learned from the scene.

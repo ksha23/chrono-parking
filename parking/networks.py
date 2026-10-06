@@ -44,18 +44,20 @@ class DepthWorker:
                 head = json.loads(line)
                 size = head["h"] * head["w"]
                 kind = np.dtype(head.get("dtype", "float32"))
+                keep = np.float32 if kind.kind == "f" else kind          # (labels stay what they are)
                 if "sizes" in head:
-                    maps = [unpack(out.read(n), (head["h"], head["w"]), kind).astype(np.float32) for n in head["sizes"]]
+                    maps = [unpack(out.read(n), (head["h"], head["w"]), kind).astype(keep) for n in head["sizes"]]
                 else:
-                    maps = [np.frombuffer(out.read(kind.itemsize * size), kind).reshape(head["h"], head["w"]).astype(np.float32)
+                    maps = [np.frombuffer(out.read(kind.itemsize * size), kind).reshape(head["h"], head["w"]).astype(keep)
                             for _ in range(head["n"])]
                 self.replies.put((head, maps))
         finally:
             self.replies.put((None, None))
 
     def submit(self, op, images):
-        """Ask for the disparity of a pair ('stereo') or the relative inverse depth of each
-        image ('mono'). Images are (rows, columns, 3) uint8 with the top row first."""
+        """Ask for the disparity of a pair ('stereo'), the relative inverse depth of each image
+        ('mono') or the labels of each image ('scene'). Images are (rows, columns, 3) uint8 with
+        the top row first."""
         self.sent += 1
         h, w = images[0].shape[:2]
         pipe = self.proc.stdin

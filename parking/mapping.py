@@ -30,6 +30,9 @@ class GridMap:
         # and a closer look that finds something there (stop) overrules it.
         self.far = np.zeros((self.ny, self.nx), dtype=np.float32)
         self.stop = np.zeros((self.ny, self.nx), dtype=np.float32)
+        # Where a camera network saw a kerb (add_kerb). Kept apart from the obstacles: it is
+        # placed less exactly than they are, and it only says how deep a stall can be.
+        self.kerb = np.zeros((self.ny, self.nx), dtype=np.float32)
         self._t = np.arange(0.1, self.RANGE, 0.2)
 
     def cells(self, x, y):
@@ -62,6 +65,15 @@ class GridMap:
             mark(self.far, (self._t[None, :] >= r_free[:, None]) & (self._t[None, :] < r_far[:, None]))
         if r_stop is not None:
             mark(self.stop, np.isfinite(r_stop), r_stop)
+
+    def add_kerb(self, xy, dt=PERCEPTION_DT):
+        """Points of kerb that one camera frame showed, for the time the frame stands for."""
+        if not len(xy):
+            return
+        ix, iy, ok = self.cells(xy[:, 0], xy[:, 1])
+        once = np.zeros_like(self.free, dtype=bool)
+        once[iy[ok], ix[ok]] = True
+        self.kerb[once] += min(dt, FRAME_MAX)
 
     def mark_free(self, pose, dt=PERCEPTION_DT):
         """The ground the car stands on is free, whether a sensor looks at it or not."""

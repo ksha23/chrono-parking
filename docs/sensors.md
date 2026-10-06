@@ -102,6 +102,16 @@ first time it is used.
 It is a separate process for two reasons. The Python that has PyChrono usually has no PyTorch.
 And on macOS the two bring their own OpenMP runtimes, which abort when loaded into one process.
 
+**The scene network.** A third network runs in the same process and says what each pixel shows:
+a painted marking, a kerb, the car's own body, or none of these (`parking/scene_net.py`). It is
+Mask2Former with the weights its authors trained on Mapillary Vistas, 25 000 street photographs
+labelled in 65 classes, fetched from the Hugging Face hub the first time it is used (0.9 GB).
+Nothing was trained on the simulated cameras. Mapillary Vistas is licensed for non-commercial
+use (CC BY-NC-SA), and that goes for these weights. `--scene net` turns it on and `--scene none`
+off. The default, `auto`, turns it on where the networks run on a CUDA GPU: an image takes
+0.06 s there and 0.4 s on Apple silicon. What it is used for is in
+[Painted lines](#painted-lines), [Kerbs](#kerbs) and [The car's own bonnet](#the-cars-own-bonnet).
+
 **The networks on another machine.** Because they are a process that talks over a pipe, they can
 run somewhere else:
 
@@ -158,14 +168,17 @@ And with everything on the machine with the RTX 5070 Ti (a Ryzen 9 9950X, render
 
 | | Value |
 | --- | --- |
-| simulation process | 0.8 GB, and 0.95 GB on the GPU for the scene |
-| network process | 2.6 GB on the GPU |
+| simulation process | 0.8 GB, and 1.0 GB on the GPU for the scene |
+| network process | 2.6 GB on the GPU, 3.5 GB with the scene network |
 | rendering four cameras at 960 x 600, 4 rays per pixel | 40 ms |
-| a run that simulates 40 s | 1 minute alone, 2 minutes with three at a time |
-| the 60 runs of [results.md](results.md), three at a time | 47 minutes |
+| the scene network on one image | 0.06 s, and 0.04 s on the rows of a stereo image that go to it |
+| a run that simulates 40 s | 1 minute alone. Three at a time: 2 minutes, and 3 with the scene network |
+| the 60 runs of [results.md](results.md), three at a time | 47 minutes, and 59 with the scene network |
 
-Three runs at a time keep that GPU busy 99 percent of the time, so a fourth would not help.
-`tests/run_set.py` runs a set that way.
+Three runs at a time keep that GPU busy 99 percent of the time, so a fourth would not help,
+and with the scene network three fill 14 of its 16 GB. `tests/run_set.py` runs a set that way.
+On the Mac alone the scene network takes 0.4 s per image, and a run then takes 9 s per
+simulated second.
 
 The stand-in perception needs 0.2 GB and runs four times faster than real time. The sensor rig
 runs at about a sixth of real time on the Mac alone: 5.7 s per simulated second. The networks set
@@ -440,6 +453,57 @@ where two shadows nearly meet is a spot. So the segments that the Hough vote and
 squares fit produce are built only from **solid pieces of at least 0.25 m**, and pieces may be
 bridged over gaps of 0.45 m. A spot does not start a line, end one, or extend one.
 
+**Faint paint.** The factor of 1.8 keeps shadows, stones and cracks out, and it is also what
+loses worn paint: a line that is nearly gone is 1.4 to 2 times lighter than the road where any
+paint is left, and less on average. With the scene network there is a second opinion. Where it
+sees a marking, and 10 cm around that, a cell is paint if it is **1.2 times** lighter than the
+ground on both sides.
+
+The network is not used alone, although it finds a worn line better than the rule does. Far away
+it smears a line over the cells beside it. Counted on 1080 frames of six drives, as the share
+of the true paint cells that were found, among those in view that the depth calls ground:
+
+| Front camera, at 4 to 7 m / 7 to 11 m | Rule | Network | Rule, and 1.2 where the network sees a marking |
+| --- | --- | --- | --- |
+| worn paint | 94 / 90 % | 95 / 78 % | 98 / 93 % |
+| faded | 78 / 67 % | 92 / 60 % | 92 / 77 % |
+| nearly gone | 11 / 10 % | 53 / 26 % | 56 / 35 % |
+| cells called paint more than 15 cm from any, per frame | 11 | 56 | 15 |
+
+In the rear camera, nearly gone paint at 4 to 7 m goes from 19 to 87 percent. The six drives
+are scenarios of the regression set, and the 1.2 and the 10 cm were chosen on them.
+
+### Kerbs
+
+A kerb is 15 cm high. The stereo pair can tell that from the road up to about 8 m, and the depth
+of a single camera cannot tell it at all, because it is anchored to the ground. The kerb at the
+back of a perpendicular stall is 9 m or more from the lane, and behind the car while it backs
+in. No depth image shows it as an obstacle.
+
+The scene network knows a kerb by its looks. The pixels it labels as kerb are placed with the
+range of the depth image, up to 13 m for the pair and 4 m for a single camera, and go into a
+layer of their own in the grid, in seconds like everything else there. They are not obstacles
+for the planner: they are placed to a few tens of centimetres only. They are used for one
+thing, how deep a stall can be ([below](#how-deep-a-stall-is)), and they tell a row of parallel
+stalls from other rows.
+
+### The car's own bonnet
+
+Along the edge of the bonnet in the image, a depth network puts pixels somewhere between the
+bonnet and the road behind it. They come out as points in the air 20 to 30 cm off the car's
+wing, outside the outline that takes the car's own body out of a depth image. The scene network
+labels the car itself. Within 3 pixels of that label, a point less than 0.6 m from the car is
+taken only if it is ground: no obstacle there, and nothing unclear.
+
+The 0.6 m matter. In the image, the band along the bonnet also holds the road 4 to 5 m ahead,
+and that is the only range at which the pair sees a kerb as an obstacle. A first version took
+only ground from the whole band, and in two runs the car then drove its nose onto a kerb that
+the path monitor would have caught. An earlier try, before the network, left out the band
+altogether, which hid the nearest strip of road, and a nose-in run parked too deep.
+
+The single cameras' images go to the scene network at half the rate of the monocular network.
+What they add, a kerb behind the car and faint paint beside it, is used at walking pace.
+
 ### Lidar
 
 The lidar is processed like before: a point per beam, the same three classes, the same scan.
@@ -597,6 +661,39 @@ This also covers an angled stall at the end of a row, of which the pair sees onl
 both lines that are near the lane: far parts of a line 6 to 8 m to the side come into the 105
 degree view only beyond the 11 m to which paint is looked for.
 
+### Between two cars a stall is two stubs
+
+The longer line of such a pair has to be 2 m long, because it gives the stall its direction.
+Between two parked cars neither line is: both show as half a metre at the lane. Worn paint
+shortens what is seen of a line in the open as well. In one run a line 5.5 m long with one faded
+piece was found over 1.9 m, and the car drove past the stall.
+
+The published stall detectors do not ask for more than the entrance. Their cameras look down
+on the lane side of the stalls, and a stall is the two points where its lines meet the lane and
+the direction of the lines. Its depth is not measured but assumed for the kind of stall
+(DMPR-PS, Huang et al. 2019, and Suhr and Jung 2021, among others). The same works here with
+one more step, because a stub has no direction either: the row is worked out first
+(`parking/rows.py`).
+
+| Of the row on one side of the lane | From |
+| --- | --- |
+| its mouth: how far off the car's path the stalls open | the lane-side ends of all lines on that side that cross the lane's direction: the middle one |
+| its direction | the lines of at least 1.5 m, weighted by length. If there are none, the direction of the row across the lane, mirrored |
+
+Two stubs that start at the mouth of a row of three lines or more are a stall if they are 2.2
+to 3.5 m apart across the row's direction. Each line is taken from where it meets the mouth, and
+the stall is as deep as the car and 0.7 m.
+
+Two pieces 5.0 to 7.8 m apart along the lane with no line between them, at least one of them
+shorter than a tick has to be, are a parallel stall, if no line of the row is longer than a tick
+(3.6 m) and something stands 1.8 to 3.8 m behind the mouth over at least 1.5 m: the kerb, as an
+obstacle in the map or as the scene network saw it. Without the kerb, two such stubs could as
+well be two perpendicular stalls with the line between them hidden.
+
+A stall known from stubs alone is placed less well than one with a line of its own. The car
+takes it only once it is level with it
+([perception-and-mapping.md](perception-and-mapping.md#choosing-a-stall)).
+
 ### A line in pieces is one line
 
 A camera often sees a stripe in pieces. Paint wears off. And where the edge of a shadow runs
@@ -627,9 +724,28 @@ The two lines of a stall start on one line along the lane, whatever the angle of
 if one was seen to start between 0.1 and 0.75 m further in than the other, measured across the
 lane, the stall starts where the other one does. The lane direction is the way the car has come.
 
+With three lines or more on a side, the mouth of the row takes the place of the other line: a
+line seen to start 0.25 to 2 m further in than the mouth is taken from the mouth. Two lines by
+themselves can differ by 0.75 m at most before it is unclear which of them is right. A row can
+say so for 2 m.
+
 While the car backs in, the rear camera sees both lines of the stall at close range. The
 estimate then rests on those, and the plan follows it (see
 [control.md](control.md#keeping-the-plan-attached-to-the-stall)).
+
+### How deep a stall is
+
+The car's middle is put 2.65 to 2.95 m in from the mouth, wherever the far ends of the lines
+were seen. That is right if the mouth is. If the mouth is taken too far in, the car ends too
+deep, and behind a stall there is a kerb: in four runs the car ended 0.9 m too deep and against
+it.
+
+Where the scene network saw the kerb behind a stall ([Kerbs](#kerbs)), the car's end stays
+0.40 m short of it, whatever the lines say. The kerb is looked for between the two lines, 2.5
+to 9.5 m in from the mouth. Behind an angled stall it lies at a slant, so a line is fitted to
+what was seen, and the distance that counts is the one at the side of the car that the kerb is
+nearer to. Seen from far away a kerb is smeared over half a metre in range, most of it beyond
+its face, so the line is put where the nearest fifth of what was seen begins.
 
 ### Lines remember
 
@@ -684,6 +800,10 @@ A parallel stall is aligned with the kerb behind it, which only the stereo pair 
 kerb. It does so while the car drives up, from 5 to 8 m. During the reverse the rear camera sees
 the two tick lines and the road, not the kerb, so the alignment rests on what was mapped before.
 
+Between two parked cars, the ticks of a parallel stall show as stubs too: 0.6 and 0.8 m of
+their 2.5 m in one run. Such a stall is taken from its row
+([above](#between-two-cars-a-stall-is-two-stubs)).
+
 ## In the viewer
 
 With a sensor rig the window shows what the cameras deliver next to the scene: the left image of
@@ -729,8 +849,23 @@ made of that data shows up in three more places:
 - **A stripe along a shadow edge goes unseen.** Paint has to be lighter than the ground on both
   sides. With the edge of a shadow within 20 cm of a stripe, it is not. The pieces on either side
   are joined, which covers gaps up to 1.5 m.
-- **The lines are found by a rule, not learned.** A scene with other bright, narrow things on
-  the ground would produce false ones.
+- **The lines are found by a rule.** The scene network points out where faint paint may be, but
+  a cell still has to be lighter than the ground on both sides of it. A scene with other bright,
+  narrow things on the ground would produce false lines.
+- **One row a side.** The mouth and the direction of a row come from all the lines on one side
+  of the lane. Two lots at different distances from the lane on the same side would be read as
+  one row.
+- **Chosen on a few scenarios.** How much lighter faint paint has to be where the network sees a
+  marking, and how a row is read, were settled on the scenarios of seeds 1 to 3. All 60 of
+  those park. Of 45 on seeds never run, 36 do, against 31 before
+  ([results.md](results.md#verification)).
+- **A stall's estimate can still move late.** With more paint seen, a stall is found more
+  often, and its estimate also changes more often while the car is on its way in. On the unseen
+  seeds one run parked 0.6 m short for that reason, and one touched something in a manoeuvre
+  that corrected a heading.
+- **The planner does not know the kerbs the network sees.** They limit how deep a stall is and
+  nothing else. A plan can still swing the nose towards a kerb that the stereo pair has not yet
+  seen as an obstacle, which it does from 4 m.
 - **The networks were not trained for this.** They run with published weights. IGEV++ does well
   on the textured road and badly on a road of one flat colour, where it has nothing to match.
 - **Points in the air next to the car.** Along the edge of the car's own bonnet in the image, a
@@ -738,8 +873,9 @@ made of that data shows up in three more places:
   come out as points 20 to 30 cm off the car's own wing. While the car drives they fall into a
   different cell in every frame. While it stands they pile up in one, and in one of 150 runs that
   cell became an obstacle the car could not get away from ([results.md](results.md#verification)).
-  Leaving out a band of pixels around the car's body in each image removes them, but as tried it
-  also hid the nearest strip of road and made a nose-in run park too deep, so it is not in.
+  With the scene network they are left out ([The car's own bonnet](#the-cars-own-bonnet)).
+  Without it (`--scene none`, and by default on Apple silicon) they are still there. The one run
+  that showed the fault was not repeated with the network.
 - **Stray obstacle cells with the lidar.** The map of the lidar run above has a handful of
   obstacle cells in the open lane, and one false line along the side of a parked car. Where the
   cells come from was not tracked down. They did not change a run.

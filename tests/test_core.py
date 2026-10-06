@@ -23,6 +23,7 @@ from parking.mapping import GridMap, LineMap, LineTrack
 from parking.paint import STATES, lay, paint_textures
 from parking.perception import _rot_y, paint_segments, pinhole_rays, planar_scan
 from parking.reeds_shepp import rs_length_table, rs_paths, rs_sample
+from parking.scene_net import MARKING
 from parking.sensors import SensorRig
 from parking.vehicle import EGO
 from parking.world import surface_textures
@@ -334,7 +335,18 @@ def test_paint_in_light_and_shade():
     spot = np.stack(np.meshgrid(np.arange(5.0, 5.2, 0.05), np.arange(0.75, 0.9, 0.05)), axis=-1).reshape(-1, 2)
     segs = paint_segments(np.concatenate([xy, spot]), np.zeros(2), min_count=1)
     assert len(segs) == 1 and max(segs[0][0], segs[0][2]) < 4.6
-    print("paint in sun and shade, shadow edges, light spots: ok")
+    # Paint that is nearly worn away, 1.4 times lighter than the road: the rule alone does not see
+    # it. It does where a network that labels the image sees a marking, and only there: a label
+    # on bare road makes no paint.
+    faint = (255.0 * (np.where(image[..., 0] > 150, 1.4, 1.0) * 0.16) ** (1.0 / 2.2) + 0.5).astype(np.uint8)
+    faint = np.repeat(faint[..., None], 3, axis=2)
+    assert len(rig._paint(faint, flat, np.array([0.0, 0.0, h]), R.astype(np.float32), 0.0, 5.0)[0]) == 0
+    labels = np.where(image[..., 0] > 150, MARKING, 0).astype(np.uint8)
+    xy, _, _ = rig._paint(faint, flat, np.array([0.0, 0.0, h]), R.astype(np.float32), 0.0, 5.0, labels)
+    assert len(xy) > 40 and np.abs(xy[:, 1] - 0.8).max() < 0.10 and xy[:, 0].max() < 2.7, "the lit part of the stripe"
+    wrong = np.roll(labels, 60, axis=1)                    # the label beside the stripe
+    assert len(rig._paint(faint, flat, np.array([0.0, 0.0, h]), R.astype(np.float32), 0.0, 5.0, wrong)[0]) == 0
+    print("paint in sun and shade, shadow edges, light spots, faint paint with a network's hint: ok")
 
 
 def test_evidence_in_seconds():
@@ -423,6 +435,90 @@ def test_half_seen_stall():
     finally:
         EGO.rear, EGO.front, EGO.half_width, EGO.length = old
     print("a half-seen stall in an angled lot: ok")
+
+
+def test_stalls_from_their_row():
+    """Stalls of which a camera sees little: taken from the row they stand in."""
+    def line(x, y0, y1, watched=2.0):                     # along -y, from y0 (at the lane) to y1
+        t = types.SimpleNamespace(c=np.array([x, 0.5 * (y0 + y1)]), d=np.array([0.0, -1.0]), length=y0 - y1, watched=watched)
+        t.ends = lambda: (np.array([x, y0]), np.array([x, y1]))
+        return t
+
+    old = (EGO.rear, EGO.front, EGO.half_width, EGO.length)
+    EGO.rear, EGO.front, EGO.half_width, EGO.length = 1.0, 3.8, 0.9, 4.8
+    try:
+        trail = [np.array([-8.0, 0.0]), np.array([-4.0, 0.0])]
+        grid = GridMap((-12.0, -14.0, 24.0, 4.0))
+        # perpendicular stalls 2.7 m wide that open at y = -3.5, most of them with cars in them:
+        # of their lines only the first 0.6 m shows. One line further on is seen over 3 m.
+        stubs = [line(2.7 * k, -3.5, -4.1) for k in range(5)]
+        slots = find_slots(stubs + [line(13.5, -3.5, -6.5)], trail, grid, True)
+        between = [s for s in slots if s.center[0] < 10.8]
+        assert len(between) == 4 and all(s.kind == "perpendicular" for s in between), [(s.kind, s.center.round(1)) for s in slots]
+        for s in between:           # the car's middle 2.75 m in from the mouth, between the two stubs
+            assert abs(s.center[1] + 3.5 + 2.75) < 0.05 and abs((s.center[0] - 1.35) % 2.7) < 0.05, s.center
+        assert find_slots(stubs, trail, grid, True) == [], "stubs alone do not say which way a stall points"
+        # a line that has lost its first 1.2 m: the stall starts where the row does all the same
+        worn = [line(0.0, -3.5, -9.0), line(2.7, -4.7, -9.0), line(5.4, -3.5, -9.0), line(8.1, -3.5, -9.0)]
+        slots = find_slots(worn, trail, grid, True)
+        first = min(slots, key=lambda s: s.center[0])
+        assert abs(first.center[1] + 3.5 + 2.75) < 0.05, "0.4 m too deep without the row: %s" % first.center.round(2)
+        # a kerb that a camera network saw 5.0 m in: the car ends 0.4 m short of it
+        X = np.arange(-1.0, 10.0, 0.1)
+        grid.add_kerb(np.stack([np.repeat(X, 3), np.tile([-8.5, -8.6, -8.7], len(X))], axis=1), 0.4)
+        capped = min(find_slots(worn, trail, grid, True), key=lambda s: s.center[0])
+        assert abs(capped.center[1] + 8.5 - 0.4 - 0.5 * EGO.length) < 0.11, capped.center.round(2)
+        # and one that lies at a slant, 0.58 m further in per metre along the lane: what counts is
+        # where it is at the side of the car that it is nearer to
+        grid = GridMap((-12.0, -14.0, 24.0, 4.0))
+        grid.add_kerb(np.stack([X, -8.5 - 0.58 * (X - 1.35)], axis=1), 0.4)
+        capped = min(find_slots(worn, trail, grid, True), key=lambda s: s.center[0])
+        assert abs(capped.center[1] + 8.5 - 0.58 * (EGO.half_width + 0.1) - 0.4 - 0.5 * EGO.length) < 0.15, capped.center.round(2)
+        # parallel stalls along a kerb, 6.5 m long: two ends of ticks and the kerb behind them
+        grid = GridMap((-12.0, -14.0, 24.0, 4.0))
+        ticks = [line(6.5 * k, -1.75, -2.3) for k in range(4)]
+        assert find_slots(ticks, trail, grid, True) == [], "without a kerb these could be anything"
+        X = np.arange(-1.0, 21.0, 0.1)
+        grid.add_kerb(np.stack([np.repeat(X, 2), np.tile([-4.3, -4.4], len(X))], axis=1), 0.4)
+        slots = find_slots(ticks, trail, grid, True)
+        assert len(slots) == 3 and all(s.kind == "parallel" for s in slots), [(s.kind, s.center.round(1)) for s in slots]
+        assert all(abs(s.center[1] + 1.75 + 1.25) < 0.05 for s in slots)
+    finally:
+        EGO.rear, EGO.front, EGO.half_width, EGO.length = old
+    print("stalls taken from their row: ok")
+
+
+def test_parallel_stall_and_kerb():
+    """A parallel stall is aligned with the kerb behind it, and not with what else was hit there."""
+    def tick(x):                                          # from the lane edge at y = -1.75 to the kerb
+        t = types.SimpleNamespace(c=np.array([x, -3.0]), d=np.array([0.0, -1.0]), length=2.5, watched=2.0)
+        t.ends = lambda: (np.array([x, -1.75]), np.array([x, -4.25]))
+        return t
+
+    old = (EGO.rear, EGO.front, EGO.half_width, EGO.length)
+    EGO.rear, EGO.front, EGO.half_width, EGO.length = 1.0, 3.8, 0.9, 4.8
+    try:
+        trail = [np.array([0.0, 0.0]), np.array([6.0, 0.0])]
+        grid = GridMap((-5.0, -10.0, 30.0, 4.0))
+        X = np.arange(13.0, 23.0, 0.1)
+        ix, iy, _ = grid.cells(np.repeat(X, 3), np.tile([-4.30, -4.40, -4.50], len(X)))     # the kerb, its face at y = -4.25
+        grid.hits[iy, ix] = 1.0
+        slot = find_slots([tick(14.4), tick(21.6)], trail, grid, True)[0]
+        angle = math.degrees(math.atan2(slot.along[1], slot.along[0]))
+        assert slot.kind == "parallel" and abs((angle + 90.0) % 180.0 - 90.0) < 0.5
+        assert abs(slot.center[1] - (-4.25 + 0.30 + EGO.half_width)) < 0.08, slot.center
+        # The kerb seen only as far as x = 19.5, and the corner of the car parked behind the stall,
+        # 0.5 m nearer than the kerb. A plain fit to all of that comes out 2.8 degrees off.
+        grid = GridMap((-5.0, -10.0, 30.0, 4.0))
+        for xs, ys in ((np.arange(13.0, 19.5, 0.1), [-4.30, -4.40, -4.50]), (np.arange(20.4, 21.4, 0.1), [-3.70, -3.80, -3.90])):
+            ix, iy, _ = grid.cells(np.repeat(xs, 3), np.tile(ys, len(xs)))
+            grid.hits[iy, ix] = 1.0
+        again = find_slots([tick(14.4), tick(21.6)], trail, grid, True)[0]
+        angle = math.degrees(math.atan2(again.along[1], again.along[0]))
+        assert abs((angle + 90.0) % 180.0 - 90.0) < 0.5 and np.hypot(*(again.center - slot.center)) < 0.05, (angle, again.center)
+    finally:
+        EGO.rear, EGO.front, EGO.half_width, EGO.length = old
+    print("a parallel stall and the kerb behind it: ok")
 
 
 def test_own_pose():
@@ -520,6 +616,8 @@ if __name__ == "__main__":
     test_evidence_in_seconds()
     test_lines_in_pieces()
     test_half_seen_stall()
+    test_stalls_from_their_row()
+    test_parallel_stall_and_kerb()
     test_own_pose()
     test_worn_paint()
     test_surfaces()

@@ -157,13 +157,16 @@ agent, and `cli.py` starts one or both.
 | `scenario.py` | 216 | `Scenario`, `make_lot`, `make_street`, `parked_model` |
 | `world.py` | 347 | `World` (the model, the scene, the physical actuation in `step`), `surface_textures`, `light_scene` |
 | `perception.py` | 233 | `Perception` (stand-in), `planar_scan`, `paint_segments`, the ray helpers |
-| `sensors.py` | 624 | `SensorRig`, `DepthWorker`, `sensor_mounts` |
-| `stereo_worker.py` | 251 | the process that runs IGEV++ and Depth Anything V2 |
+| `sensors.py` | 616 | `SensorRig`, `sensor_mounts` |
+| `networks.py` | 96 | `DepthWorker`: the process with the networks, as the simulation sees it. `find_depth_python` |
+| `stereo_worker.py` | 279 | the process that runs IGEV++, Depth Anything V2 and the scene network |
+| `scene_net.py` | 47 | `SceneNet`: Mask2Former labels for markings, kerbs and the car's own body |
 | `localization.py` | 145 | `Localization`: the pose the car believes it has (satellite receiver with inertial unit, or dead reckoning) |
 | `paint.py` | 90 | `paint_textures`, `lay`: worn paint for the lines |
 | `ground.py` | 83 | `Ground`: the height of the road, flat or uneven |
-| `mapping.py` | 298 | `GridMap`, `LineTrack`, `LineMap` |
-| `stalls.py` | 290 | `Slot`, `find_slots`, `_classify`, `_align_with_kerb` |
+| `mapping.py` | 310 | `GridMap`, `LineTrack`, `LineMap` |
+| `stalls.py` | 405 | `Slot`, `find_slots`, `_classify`, `_kerb_behind`, `_align_with_kerb` |
+| `rows.py` | 69 | `Row`, `lane_rows`: the mouth and the direction of the stalls on one side of the lane |
 | `reeds_shepp.py` | 179 | `_rs_words`, `rs_paths`, `rs_length_table`, `rs_sample` |
 | `planner.py` | 446 | `CSpace`, `holonomic_distance`, `Planner` (`search`, `shoot`, `_rs_shot`, `_arc_shot`), `Segment`, `split_segments` |
 | `control.py` | 262 | `LateralMPC`, `SteeringGain`, `MpcTracker` |

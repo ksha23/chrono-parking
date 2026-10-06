@@ -45,8 +45,8 @@ def record(out, sim_args):
     labels, frames = [], []
     camera = SensorRig._camera
 
-    def camera_noted(self, cam, *rest):
-        res = camera(self, cam, *rest)
+    def camera_noted(self, cam, *rest, **more):
+        res = camera(self, cam, *rest, **more)
         labels.append((cam["role"], len(res[2])))        # which network, and how many line pieces
         return res
 
@@ -56,7 +56,8 @@ def record(out, sim_args):
     def sense_kept(pose, *rest):
         labels.clear()
         scans, dets = sense(pose, *rest)
-        frames.append(dict(t=sim.time, pose=tuple(pose), scans=scans, dets=dets, cams=list(labels)))
+        frames.append(dict(t=sim.time, pose=tuple(pose), scans=scans, dets=dets, cams=list(labels),
+                           kerbs=list(sim.sensor.kerbs)))
         return scans, dets
 
     sim.sensor.sense = sense_kept
@@ -123,6 +124,8 @@ def replay(rec, k, phase, counts=False):
                     continue
                 dt = 1.0 if counts else scan[0] * k          # an answer stands for the time since the one before
                 dets += [tuple(p[:5]) + (dt,) for p in pieces]
+                if i < len(f.get("kerbs", ())):              # (a kerb that the scene network saw in the same frame)
+                    grid.add_kerb(f["kerbs"][i][1], f["kerbs"][i][0] * k)
             else:                                            # the lidar: every scan
                 dt = 1.0 if counts else scan[0]
             grid.update(*scan[1:], dt=dt)

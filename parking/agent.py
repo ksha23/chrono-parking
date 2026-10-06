@@ -20,16 +20,18 @@ from .scenario import make_scenario
 from .networks import DepthWorker, find_depth_python
 from .sensors import SensorRig
 from .stalls import Slot, find_slots
+from .scene_net import NAME as SCENE_NET
 from .vehicle import EGO
 from .world import World
 
 
 def start_depth_worker(args):
-    """Start the process with the depth networks, or exit with what is missing."""
+    """Start the process with the networks, or exit with what is missing."""
+    scene = SCENE_NET if args.scene == "net" else args.scene          # (auto: the worker knows its device)
     if args.depth_host:
         # on another machine, which has a copy of this repository and a Python with PyTorch
-        there = "%s %s/parking/stereo_worker.py --repo %s/third_party/IGEV-plusplus --model %s" % (
-            args.depth_python or "python3", args.depth_dir, args.depth_dir, args.stereo)
+        there = "%s %s/parking/stereo_worker.py --repo %s/third_party/IGEV-plusplus --model %s --scene %s" % (
+            args.depth_python or "python3", args.depth_dir, args.depth_dir, args.stereo, scene)
         try:
             return DepthWorker(["ssh", "-T", "-o", "BatchMode=yes", args.depth_host, there], remote=True)
         except RuntimeError as exc:
@@ -43,7 +45,7 @@ def start_depth_worker(args):
                  "--sensors sim runs without sensors." % args.sensors)
     try:
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stereo_worker.py")
-        return DepthWorker([python, script, "--repo", repo, "--model", args.stereo])
+        return DepthWorker([python, script, "--repo", repo, "--model", args.stereo, "--scene", scene])
     except RuntimeError as exc:
         sys.exit("[parking] %s" % exc)
 
@@ -127,6 +129,8 @@ class ParkingSim:
                   "%.3g Hz, on %s of %s; sky: %s" % (
                       info["model"], info["weights"], 1.0 / (self.sensor.stereo_every * PERCEPTION_DT), rows, info["mono"],
                       1.0 / (self.sensor.mono_every * PERCEPTION_DT), info["device"], info["where"], args.sky), flush=True)
+            if self.sensor.scene:
+                print("[parking] markings, kerbs and the car's own body in each image: %s" % info["scene"], flush=True)
 
     @property
     def time(self):
@@ -236,6 +240,8 @@ class ParkingSim:
             self.grid.update(origin, ang, r_hit, r_free, *more, dt=dt)
             ok = np.isfinite(r_hit)
             hits.append(np.stack([origin[0] + r_hit[ok] * np.cos(ang[ok]), origin[1] + r_hit[ok] * np.sin(ang[ok])], axis=1))
+        for dt, xy in getattr(self.sensor, "kerbs", ()):          # (kerbs that the scene network pointed out)
+            self.grid.add_kerb(xy, dt)
         self.grid.mark_free(self.pose)
         self.lines.update(dets, self.time)
         self.scan = np.concatenate(hits)
@@ -293,6 +299,11 @@ class ParkingSim:
             rel = s.center - ctr
             ahead, lat = rel @ fwd, rel @ left
             if not -8.0 < ahead < 10.0:
+                continue
+            # A stall known from two stubs and its row is not taken from afar. Until the car is
+            # level with it, more of its far line is still coming into view, and a stall taken
+            # on less is placed worse: the car then needs two or three goes to get into it.
+            if s.by_row and ahead > 1.0:
                 continue
             score = abs(ahead) + 0.3 * abs(lat) + 1.5 * sum(s.neighbors)
             if best is None or score < best[0]:

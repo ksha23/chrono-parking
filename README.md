@@ -42,8 +42,11 @@ The sensors need two more things, both described in
   Chrono built with Metal RT (macOS) or Vulkan RT needs a small patch to its Python bindings,
   which is in this repository. Everything here was developed with Metal RT. It also runs with
   OptiX on Linux, there without a window.
-- A Python with PyTorch for the depth networks, which run in a process of their own
-  (`parking/stereo_worker.py`), and a checkout of IGEV++ with its published weights.
+- A Python with PyTorch for the networks, which run in a process of their own
+  (`parking/stereo_worker.py`), and a checkout of IGEV++ with its published weights. The other
+  two networks are fetched when first used: Depth Anything V2 for the single cameras, and
+  Mask2Former for what is in an image (markings, kerbs, the car's own body). The weights of the
+  last one are for non-commercial use.
 
 ```
 python parking_sim.py                                   # perpendicular stalls, a car on each side
@@ -69,6 +72,7 @@ python parking_sim.py --headless --seed 7 --noise 2     # no window, prints a re
 | `--bumps` | cm, default 1.5 | how uneven the road is: up to this much up and down, in waves 6 to 25 m long |
 | `--give` | any of `pose`, `attitude`, `speed`, `lane`, `map`, or `all` | tell the car things a real car would not know, to tell causes apart. Default: nothing. See [docs/sensors.md](docs/sensors.md#limits) |
 | `--wear` | scale, default 1 | worn paint: every line is patchy with ragged edges, one in four is faded and one in twelve is barely lighter than the road. 0 = clean bars, as the results below were measured with |
+| `--scene` | `auto`, `net`, `none` | a network that labels each image points out faint paint, kerbs and the car's own bonnet. `auto` turns it on where the networks run on a CUDA GPU, see [docs/sensors.md](docs/sensors.md#what-it-needs) |
 | `--depth-host` | ssh host | run the depth networks on another machine, see [docs/sensors.md](docs/sensors.md#what-it-needs) |
 | `--type` | `perpendicular`, `angled`, `parallel` | kind of stalls |
 | `--cars` | `both`, `left`, `right`, `none`, `random` | parked cars next to the free stall, seen from the lane looking into it |
@@ -134,20 +138,20 @@ anything. All offsets are measured against the ground-truth stall.
 The car is told only what a real car would know: a pose with the error of a satellite receiver
 with an inertial unit (10 cm and 0.3 degrees), its speed from a wheel encoder, its pitch, roll
 and height from the road it sees, and that it starts in a lane with stalls along it. The paint
-is worn and the road is uneven. The 60 runs with the rig were made twice, rendered with Metal RT
-on a Mac and with OptiX on an RTX 5070 Ti:
+is worn and the road is uneven. Rendered with OptiX on an RTX 5070 Ti:
 
-| Perception | Parked | Lateral offset: mean, worst | Heading error: mean, worst | Smallest clearance |
-| --- | --- | --- | --- | --- |
-| cameras: stereo pair, rear, bumper (Metal RT) | 39 of 42 | 5.0, at most 14.2 cm | 0.9, at most 2.1 deg | 0.15 m |
-| cameras + forward lidar (Metal RT) | 17 of 18 | 5.3, at most 12.9 cm | 1.2, at most 2.8 deg | 0.27 m |
-| cameras (OptiX) | 33 of 42 | 5.5, at most 16.7 cm | 0.9, at most 2.0 deg | 0.27 m |
-| cameras + forward lidar (OptiX) | 16 of 18 | 5.7, at most 12.0 cm | 1.1, at most 3.1 deg | 0.01 m |
-| stand-in, no sensors | 73 of 74 | 4.1, at most 14.7 cm | 0.7, at most 3.1 deg | 0.08 m |
+| Perception | Parked, unseen seeds 10 to 12 | Parked, seeds 1 to 3 | Lateral offset: mean, worst | Heading error: mean, worst | Smallest clearance |
+| --- | --- | --- | --- | --- | --- |
+| cameras: stereo pair, rear, bumper | 29 of 36 | 42 of 42 | 6.0, at most 25.2 cm | 0.8, at most 4.2 deg | 0.03 m |
+| cameras + forward lidar | 7 of 9 | 18 of 18 | 2.4, at most 4.2 cm | 0.6, at most 1.4 deg | 0.14 m |
+| stand-in, no sensors | | 73 of 74 | 4.1, at most 14.7 cm | 0.7, at most 2.9 deg | 0.08 m |
 
-What does not park with the rig comes from worn paint. Either a stall is not recognised, because
-too little of its lines is found, and the car drives past it. Or the stall is placed 0.9 m too
-deep, because the start of a line is worn away, and the car ends against the kerb. The
+Seeds 1 to 3 are the scenarios the method was changed on, and seeds 10 to 12 had never been
+run: 36 of 45 is the number to go by. (The offsets of the rig are those of the unseen seeds.)
+The version before the last change, in which a network that labels the images points out faint
+paint and kerbs and a stall can be taken from the ends of its lines, parked 31 of the same 45
+and 49 of the 60. What still does not park: the car drives past a stall it does not recognise
+(3 runs), touches something (4), parks 0.6 m short (1) or gives up after replanning (1). The
 [results](docs/results.md) have the list.
 
 **Before that**, the car was given its true pose, pitch, roll, height and speed, the lane and
@@ -189,8 +193,11 @@ parking/
   localization.py               the pose the car believes it has, its wheel encoder
   perception.py                 the stand-in perception, planar scans, line segments from paint
   sensors.py                    the sensor rig: cameras, lidar, depth from the images
-  stereo_worker.py              the depth networks (IGEV++, Depth Anything V2), a process of their own
+  stereo_worker.py              the networks (IGEV++, Depth Anything V2, Mask2Former), a process of their own
+  networks.py                   starting that process and talking to it
+  scene_net.py                  the network that labels markings, kerbs and the car's own body
   mapping.py, stalls.py         occupancy grid and line tracks, stalls inferred from them
+  rows.py                       what the stalls on one side of the lane have in common
   reeds_shepp.py, planner.py    Reeds-Shepp curves, configuration space, Hybrid A*
   control.py                    steering MPC, online steering gain, speed control
   viewer.py                     the window, with viewer_pictures.py, viewer_panel.py, draw.py, inputs.py

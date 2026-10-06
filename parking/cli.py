@@ -52,6 +52,11 @@ def parse_args(argv=None):
     ap.add_argument("--stereo", choices=("igev", "rt"), default="igev",
                     help="stereo network: IGEV++ or its real-time version, which is three times faster and "
                          "a little less accurate")
+    ap.add_argument("--scene", choices=("auto", "net", "none"), default="auto",
+                    help="net: a network that labels each image (Mask2Former, trained on street photographs) "
+                         "points out faint paint, kerbs and the car's own bonnet. none: paint by brightness alone. "
+                         "auto (default): net if the networks run on a CUDA GPU, where it takes 0.06 s per image "
+                         "(0.4 s on Apple silicon)")
     ap.add_argument("--stereo-hz", type=float, default=5.0,
                     help="how often the stereo network runs, up to the 10 frames per second of the cameras. "
                          "The default is what IGEV++ reaches in real time on a desktop GPU. The method does not "

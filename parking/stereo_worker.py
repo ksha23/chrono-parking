@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # =============================================================================
-# Depth networks for parking_sim.py
+# The networks of parking_sim.py
 #
-# Two networks, in a process of their own:
+# Two depth networks, and one that labels what is in an image, in a process of their own:
 #
 #   stereo   IGEV++ (Xu et al., "IGEV++: Iterative Multi-range Geometry Encoding
 #            Volumes for Stereo Matching", github.com/gangweiX/IGEV-plusplus,
@@ -12,6 +12,9 @@
 #            the transformers package, on single images. Returns relative
 #            inverse depth: it has neither scale nor offset, parking_sim.py
 #            fixes both with the ground it knows.
+#   scene    Mask2Former with weights trained on Mapillary Vistas (scene_net.py),
+#            on single images. Returns a label per pixel: painted marking,
+#            kerb, the car's own body, or none of these.
 #
 # It is a separate process because the networks need PyTorch, which the Python
 # that runs Chrono usually does not have, and because the two bring their own
@@ -19,12 +22,14 @@
 #
 # parking_sim.py starts it and talks to it over its stdin and stdout:
 #
-#   request    one line of JSON {"id": n, "op": "stereo" or "mono", "h": rows,
-#              "w": columns, "n": images}, then the images, each rows x columns
-#              x 3 bytes (RGB, top row first). A stereo request has two: left, right
+#   request    one line of JSON {"id": n, "op": "stereo", "mono" or "scene",
+#              "h": rows, "w": columns, "n": images}, then the images, each rows x
+#              columns x 3 bytes (RGB, top row first). A stereo request has two:
+#              left, right
 #   reply      one line of JSON {"id": n, "h": rows, "w": columns, "n": maps,
 #              "seconds": t, "dtype": type}, then the maps, each rows x columns
-#              float32, or float16 if the request said "half": true (for a slow link)
+#              float32, or float16 if the request said "half": true (for a slow
+#              link). The labels of a scene request are uint8
 #
 # For a slow link the images and the maps can also travel packed (see pack below):
 # the request then carries "sizes", the number of bytes of each packed image, and
@@ -164,7 +169,7 @@ def read_exact(stream, n):
     return bytes(buf)
 
 
-def serve(matcher, mono, info):
+def serve(matcher, mono, scene, info):
     stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
     stdout.write((json.dumps(dict(info, ready=True, pack=True)) + "\n").encode())
     stdout.flush()
@@ -180,8 +185,12 @@ def serve(matcher, mono, info):
         else:
             images = [np.frombuffer(read_exact(stdin, h * w * 3), np.uint8).reshape(h, w, 3) for _ in range(n)]
         t0 = time.perf_counter()
-        maps = [matcher.disparity(*images)] if req.get("op", "stereo") == "stereo" else mono.inverse_depth(images)
-        kind = "float16" if req.get("half") or sizes else "float32"
+        op = req.get("op", "stereo")
+        if op == "scene":
+            maps, kind = scene.labels(images), "uint8"
+        else:
+            maps = [matcher.disparity(*images)] if op == "stereo" else mono.inverse_depth(images)
+            kind = "float16" if req.get("half") or sizes else "float32"
         reply = dict(id=req.get("id"), h=h, w=w, n=len(maps), seconds=round(time.perf_counter() - t0, 4), dtype=kind)
         data = [pack(m.astype(kind)) if sizes else m.astype(kind).tobytes() for m in maps]
         if sizes:
@@ -194,7 +203,8 @@ def serve(matcher, mono, info):
 
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
-    ap = argparse.ArgumentParser(description="Depth networks for parking_sim.py: IGEV++ and Depth Anything V2")
+    ap = argparse.ArgumentParser(description="The networks of parking_sim.py: IGEV++, Depth Anything V2, and "
+                                                 "Mask2Former for what is in an image")
     ap.add_argument("--repo", default=os.environ.get("IGEV_ROOT", os.path.join(os.path.dirname(here), "third_party",
                                                                           "IGEV-plusplus")),
                     help="checkout of github.com/gangweiX/IGEV-plusplus")
@@ -203,6 +213,10 @@ def main():
     ap.add_argument("--iters", type=int, default=8, help="disparity update iterations")
     ap.add_argument("--mono", default="depth-anything/Depth-Anything-V2-Small-hf",
                     help="monocular depth model on the Hugging Face hub or in a directory, 'none' to leave it out")
+    ap.add_argument("--scene", default="none",
+                    help="network that labels markings, kerbs and the car's own body: a Mask2Former model on the "
+                         "Hugging Face hub or in a directory with the classes of Mapillary Vistas, 'none' to leave it "
+                         "out, 'auto' for the one of scene_net.py if the device is a CUDA GPU")
     ap.add_argument("--device", default="auto", help="auto, cuda, mps or cpu")
     ap.add_argument("--check", action="store_true", help="run made-up images through the networks and exit")
     a = ap.parse_args()
@@ -221,9 +235,18 @@ def main():
     stdout, sys.stdout = sys.stdout, sys.stderr      # whatever the libraries print must not end up in the replies
     matcher = Matcher(a.repo, weights, a.model == "rt", a.device, a.iters)
     mono = None if a.mono == "none" else MonoDepth(a.mono, matcher.device)
+    scene = None
+    if a.scene != "none":
+        sys.path.insert(0, here)
+        from scene_net import NAME, SceneNet
+        if a.scene == "auto":          # 0.06 s per image on a desktop GPU, 0.4 s on Apple silicon
+            a.scene = NAME if matcher.device.type == "cuda" else "none"
+    if a.scene != "none":
+        scene = SceneNet(a.scene, matcher.device)
     sys.stdout = stdout
     info = dict(model="RT-IGEV++" if a.model == "rt" else "IGEV++", weights=os.path.basename(weights),
-                device=str(matcher.device), iters=a.iters, mono=None if mono is None else a.mono.split("/")[-1])
+                device=str(matcher.device), iters=a.iters, mono=None if mono is None else a.mono.split("/")[-1],
+                scene=None if scene is None else a.scene.split("/")[-1])
     if a.check:
         rng = np.random.default_rng(0)
         base = rng.integers(0, 255, (600, 1000, 3), dtype=np.uint8)
@@ -240,9 +263,14 @@ def main():
             out = mono.inverse_depth([left, right])
             print("%s, 2 images of %d x %d: %.2f s, output %s" % (info["mono"], left.shape[1], left.shape[0],
                                                               time.perf_counter() - t0, out[0].shape))
+        for k in range(3 if scene is not None else 0):
+            t0 = time.perf_counter()
+            out = scene.labels([left])
+            print("%s, 1 image of %d x %d: %.2f s, output %s" % (info["scene"], left.shape[1], left.shape[0],
+                                                             time.perf_counter() - t0, out[0].shape))
         return
     try:
-        serve(matcher, mono, info)
+        serve(matcher, mono, scene, info)
     except (BrokenPipeError, EOFError):          # the simulation is gone
         os._exit(0)
 
