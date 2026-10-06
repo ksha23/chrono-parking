@@ -32,11 +32,13 @@ RATES = ((1, 10.0), (2, 5.0), (4, 2.5))          # keep every k-th answer: answe
 
 
 def record(out, sim_args):
-    sys.argv = ["parking_sim.py", "--headless", "--stereo-hz", "10", "--mono-hz", "10"] + sim_args
+    # (imported before the arguments are swapped: a Python without PyChrono starts this script
+    # again with one that has it, and it has to start it with this script's own arguments)
     from parking.agent import ParkingSim
     from parking.cli import parse_args
     from parking.sensors import SensorRig
     from parking.vehicle import EGO
+    sys.argv = ["parking_sim.py", "--headless", "--stereo-hz", "10", "--mono-hz", "10"] + sim_args
 
     sim = ParkingSim(parse_args())
     if not isinstance(sim.sensor, SensorRig):
