@@ -30,7 +30,61 @@ The sensor rig is verified on fewer scenarios than the stand-in because a run ta
 minutes instead of 10 seconds. Parking forward on request, the left side of the lane, the second
 tire model and hand-placed targets were not run with the rig.
 
-**Totals**
+**Totals, as the car is now.** The car is told only what a real car would know
+([sensors.md](sensors.md#limits)): a pose with the error of a satellite receiver with an inertial
+unit (10 cm and 0.3 degrees, wandering slowly), its speed from a wheel encoder, its pitch, roll
+and height from the road it sees, and that it starts in a lane with stalls somewhere along it.
+The paint is worn, the road is uneven by 1.5 cm, and the simulation step is 1 ms. Means and
+largest offsets are over the runs that parked.
+
+The 60 runs with the rig were made twice: rendered with Metal RT on an Apple M4 Pro, and with
+OptiX on an RTX 5070 Ti. The two renderers give the same scenes with other pixels
+([sensors.md](sensors.md#what-it-needs)), so these are two draws of the same scenarios.
+
+| Perception | Parked | Lateral: mean, worst | Depth: mean, worst | Heading: mean, worst | Smallest clearance | Runs that replanned or corrected | Time |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| cameras, Metal RT | 39 of 42 | 5.0, at most 14.2 cm | 7.6, at most 34.5 cm | 0.9, at most 2.1 deg | 0.15 m | 9 | 40 s |
+| cameras + lidar, Metal RT | 17 of 18 | 5.3, at most 12.9 cm | 6.1, at most 15.2 cm | 1.2, at most 2.8 deg | 0.27 m | 4 | 38 s |
+| cameras, OptiX | 33 of 42 | 5.5, at most 16.7 cm | 7.9, at most 21.8 cm | 0.9, at most 2.0 deg | 0.27 m | 7 | 38 s |
+| cameras + lidar, OptiX | 16 of 18 | 5.7, at most 12.0 cm | 5.4, at most 18.5 cm | 1.1, at most 3.1 deg | 0.01 m | 5 | 38 s |
+| stand-in, no sensors | 73 of 74 | 4.1, at most 14.7 cm | 4.7, at most 22.3 cm | 0.7, at most 3.1 deg | 0.08 m | 13 | 37 s |
+
+By sky, both sensor sets together: with Metal RT clear 24 of 24, low sun 22 of 24, overcast 10
+of 12. With OptiX clear 20 of 24, low sun 21 of 24, overcast 8 of 12.
+
+**What did not park.** With the rig it all comes from worn paint, in two ways.
+
+- *A stall that is not recognised* (2 of the 4 runs with Metal RT, 9 of the 11 with OptiX). The
+  car drives to the end of the lane without choosing one. A stall between parked cars counts
+  when one of its lines has been found over 2 m and the other shows at least its end. One such
+  line is 5.5 m long, with a faded piece 2 m from its start and a missing piece further in. It
+  was found over 3.4 m with Metal RT and over 1.9 m with OptiX, and that scenario parked with
+  the first and drove past with the second.
+- *A stall placed too deep* (2 and 2). The car ends 0.9 m too far into the stall, against the
+  kerb. In the one that was looked at, the first metre of one line at the lane is not found,
+  and the stall is taken to begin where the paint does.
+
+The set has some scenarios up to three times (with the cameras, at double noise, with the
+lidar), and such a scenario fails all three times. The 11 runs with OptiX are 7 scenarios, the 4
+with Metal RT are 4. Seven of these 11 have cars on both sides of the free stall, where the
+least of its lines is in view. One batch each does not tell whether OptiX is harder on the
+paint detection or whether this is the spread between two draws. One parallel run with OptiX
+parked 1 cm from the kerb.
+
+The stand-in's one miss is a parallel stall. The car touched something while backing in, at 40
+degrees to the stall. The planner keeps 6 to 12 cm in a parallel stall, and a pose that is 10 cm
+off uses that up.
+
+The offsets are several times those of the earlier version below, where the car knew its pose
+exactly. It now parks where it believes it is, and that is 10 cm off.
+
+`python tests/run_set.py cameras` and `python tests/run_set.py standin` run these sets.
+
+**Before that: the car told its pose, on clean paint.** Everything from here to the end of this
+section is from the version before. There the car was given its true pose, pitch, roll, height
+and speed, the lane and the extent of the lot, on a flat road with clean paint
+(`--give all --wear 0 --bumps 0`, and a 2 ms simulation step). It shows what the method does
+when localization and paint are not the problem.
 
 | Perception | Stalls | Parked | Lateral | Heading | Clearance | Gear changes | Runs that replanned |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -44,7 +98,6 @@ tire model and hand-placed targets were not run with the rig.
 | stand-in (`sim`) | angled | 24 of 24 | at most 1.3 cm | at most 1.50 deg | at least 0.33 m | 0 to 2 | 2 |
 | stand-in (`sim`) | parallel | 24 of 24 | at most 2.8 cm | at most 0.47 deg | at least 0.11 m | 1 to 4 | 0 |
 
-WHERE: camera 0 local 42 north, camera + lidar 0 local 18 north
 By sky, camera: clear 15 of 15, low 15 of 15, overcast 12 of 12.
 By sky, camera + lidar: clear 9 of 9, low 9 of 9.
 
@@ -239,10 +292,9 @@ stall between two cars that was planned with a margin of 0.12 m. It used to be 0
 - **With the rig:** parking forward on request, stalls on the left of the lane, the Pacejka tire
   model, hand-placed targets, the tour, and `--stereo rt` beyond single runs.
 - **Other backends and platforms.** The sensor rig ran on macOS on Apple silicon with Metal RT
-  only. The bindings patch was built and checked with Vulkan RT in its CPU fallback, but the
-  parking simulation was not run on it, and nothing was run with OptiX. The scene relies on how
-  Metal RT handles light, textures and glass. The stand-in perception was checked on three
-  PyChrono 10 builds (two conda builds and one from source).
+  and on Linux with OptiX, there without a window. The bindings patch was built and checked with
+  Vulkan RT in its CPU fallback, but the parking simulation was not run on it. The stand-in
+  perception was checked on three PyChrono 10 builds (two conda builds and one from source).
 - **Other vehicles.** Only the Chrono sedan. The geometry and the sensor mounts are read from the
   model, so another Chrono vehicle with a hull collision shape and a mesh with glass materials
   should work, but none was tried. One was ruled out early: the BMW E90 model's front wheel flips
@@ -250,8 +302,11 @@ stall between two cars that was planned with a margin of 0.12 m. It used to be 0
 
 ## Limits
 
-- **Localization is given.** The car knows its true pose, including roll and pitch. A real system
-  would have odometry drift and would need to localise against the map it builds.
+- **Localization is an error model, not a filter.** The car's pose is the true one with the
+  error of a satellite receiver with an inertial unit put on it: 10 cm and 0.3 degrees, wandering
+  slowly. No filter runs on simulated GPS, gyro and wheel readings, and the car does not
+  localise against the map it builds. Pitch, roll and height do come from what the car sees,
+  and speed from a wheel encoder ([sensors.md](sensors.md#limits)).
 - **The perception is networks plus rules.** Depth comes from two published networks that were
   not trained on this scene. Lines are found by a rule on brightness and shape, with no learned
   detector. See [sensors.md](sensors.md#limits).
@@ -261,8 +316,8 @@ stall between two cars that was planned with a margin of 0.12 m. It used to be 0
 - **One exposure.** The cameras do not adapt when the car drives from sun into shade.
 - **The world is static.** No moving cars or pedestrians. A new obstacle on the path makes the car
   stop and replan, nothing more.
-- **The lane is known.** While searching, the car follows a straight lane it is given. It does
-  not explore.
+- **The lane is assumed.** The car takes it that it starts in a lane that runs straight ahead,
+  with stalls on either side somewhere in the next 70 m. It does not explore.
 - **This car turns wide.** The sedan's kinematic turning radius is 5.95 m at the rear axle. Tight
   maneuvers need an extra back and forth, and the parallel stalls are 7.2 m long to make a single
   reverse sweep possible. A car with a 4.5 m radius would do visibly better with the same code.

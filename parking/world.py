@@ -87,7 +87,9 @@ SKIES = {"clear": ("sensor/textures/sky_2_4k.hdr", 36.0, 40.8, 2.2, 0.14),
 
 
 def light_scene(scene, sky):
-    """Sun, sky light, background and exposure of the scene that the sensors render."""
+    """Sun, sky light, background and exposure of the scene that the sensors render. Returns the
+    exposure and the vignette that are left to be put on the images (1 and 0 with a renderer
+    that has these settings: Metal RT has, OptiX and Vulkan RT have not)."""
     image, az, el, sun, ambient = SKIES[sky]
     scene.SetAmbientLight(chrono.ChVector3f(ambient, ambient, 1.08 * ambient))
     scene.AddDirectionalLight(chrono.ChColor(sun, 0.97 * sun, 0.90 * sun), math.radians(el), math.radians(az))
@@ -103,9 +105,12 @@ def light_scene(scene, sky):
     # comes out at 120 of 255. The backend has no auto-exposure, so shade is dark and white cars
     # in a low sun burn out. The lens darkens the corners by a quarter.
     road = 0.16 * (sun * math.sin(math.radians(el)) ** 2 + 1.5 * ambient)
-    if hasattr(scene, "SetExposure"):
-        scene.SetExposure((120.0 / 255.0) ** 2.2 / road)
-        scene.SetVignette(0.12)
+    exposure, vignette = (120.0 / 255.0) ** 2.2 / road, 0.12
+    if not hasattr(scene, "SetExposure"):
+        return exposure, vignette
+    scene.SetExposure(exposure)
+    scene.SetVignette(vignette)
+    return 1.0, 0.0
 
 
 class _Road(veh.ChTerrain):

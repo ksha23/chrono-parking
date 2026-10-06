@@ -48,10 +48,37 @@ cmake --build build
 `PARKING_PYCHRONO`. Any `python parking_sim.py` then starts again with that build and the Python
 it was made for, which is read from the build's `CMakeCache.txt`.
 
-Everything on this page was developed and tested with **Metal RT**. The scene uses features that
-the other backends may render differently (textures without mip-maps, glass as plain
-transparency, the exposure and vignette settings of the scene), so expect to retune the light on
-OptiX or Vulkan RT.
+**On Linux with OptiX.** The same build with OptiX in place of Metal RT, as it was made on a
+machine with an RTX 5070 Ti, OptiX 9.0 and CUDA 13. It has no Irrlicht, so no window: runs there
+are `--headless`.
+
+```
+cmake -S chrono -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_DEMOS=OFF \
+      -DCH_ENABLE_MODULE_VEHICLE=ON -DCH_ENABLE_MODULE_SENSOR=ON -DCH_ENABLE_MODULE_PYTHON=ON \
+      -DCH_USE_SENSOR_OPTIX=ON -DCH_USE_SENSOR_VULKAN_RT=OFF \
+      -DOptiX_INSTALL_DIR=/path/to/NVIDIA-OptiX-SDK-9.0.0-linux64-x86_64 \
+      -DCHRONO_CUDA_ARCHITECTURES=120 -DCH_ENABLE_VEHICLE_SCM_GPU=OFF \
+      -DPython3_EXECUTABLE=/path/to/python
+cmake --build build
+```
+
+`CHRONO_CUDA_ARCHITECTURES` names the architecture of the card (120 is the RTX 50 series).
+Without it Chrono compiles for a list of older ones that CUDA 13 no longer knows, and the build
+stops with `Unsupported gpu architecture 'compute_60'`. The patch was applied for this build as
+well, although OptiX is the backend the bindings already cover.
+
+**What differs between the two.** Everything on this page was developed with Metal RT. The same
+scenes rendered with OptiX look alike: over three scenes the rear and bumper cameras are within
+3 percent in brightness. What is not the same:
+
+- OptiX has no exposure and no vignette setting, so with it both are put on the image after it
+  is rendered. An area that is burnt out keeps the value the renderer cut it off at, so away
+  from the middle of the image it can come out a little darker than white.
+- Its windshield takes more light: the stereo pair behind it sees 5 to 8 percent less.
+- The parked SUV has its colours with OptiX. With Metal RT it is plain grey, windows included
+  (the other car models look the same with both).
+
+Vulkan RT has not been tried.
 
 **The depth networks.** They run in a process of their own, `parking/stereo_worker.py`, with a Python
 that has PyTorch:
@@ -108,6 +135,13 @@ asks cuDNN for its repeatable routines, which are no slower here. With that, thr
 scenario gave the same messages at the same times and the same result line to the last digit.
 A run with the networks on another kind of device (the Mac's GPU) is a different run.
 
+The OptiX renderer has the same habit. It spreads the rays of a pixel at random and takes the
+seed for that from the clock: two renders of one scene differed in 40 to 80 percent of their
+pixels, by one count on average and by far more along edges. The rig therefore gives the sensor
+manager a seed that follows from the scenario's. With it two renders are equal pixel for pixel,
+and a run rendered with OptiX repeats to the last digit as well. Metal RT renders the same
+with and without the seed. A run rendered with the other backend is a different run.
+
 **Memory and time.** Measured on an Apple M4 Pro with 48 GB:
 
 | | Value |
@@ -119,6 +153,19 @@ A run with the networks on another kind of device (the Mac's GPU) is a different
 | RT-IGEV++ on one pair (`--stereo rt`) | 0.28 s |
 | Depth Anything V2 Small on two images | 0.11 s, run every second tick |
 | a run that simulates 40 s | 4 minutes, or 2 with the networks on the RTX 5070 Ti |
+
+And with everything on the machine with the RTX 5070 Ti (a Ryzen 9 9950X, rendering with OptiX):
+
+| | Value |
+| --- | --- |
+| simulation process | 0.8 GB, and 0.95 GB on the GPU for the scene |
+| network process | 2.6 GB on the GPU |
+| rendering four cameras at 960 x 600, 4 rays per pixel | 40 ms |
+| a run that simulates 40 s | 1 minute alone, 2 minutes with three at a time |
+| the 60 runs of [results.md](results.md), three at a time | 47 minutes |
+
+Three runs at a time keep that GPU busy 99 percent of the time, so a fourth would not help.
+`tests/run_set.py` runs a set that way.
 
 The stand-in perception needs 0.2 GB and runs four times faster than real time. The sensor rig
 runs at about a sixth of real time on the Mac alone: 5.7 s per simulated second. The networks set
@@ -700,4 +747,5 @@ made of that data shows up in three more places:
   the least it takes to believe anything, and at 2.5 answers per second some ground is in view
   for less than that. See [How often the networks run](#how-often-the-networks-run).
 - **Static scene.** Nothing moves but the car.
-- **Other backends.** OptiX and Vulkan RT were not run with this scene.
+- **Other backends.** Vulkan RT was not run with this scene. OptiX was
+  ([What it needs](#what-it-needs)).

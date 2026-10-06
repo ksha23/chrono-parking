@@ -40,7 +40,8 @@ The sensors need two more things, both described in
 
 - A PyChrono whose `sensor` module has cameras and lidar. A Chrono built with OptiX has that. A
   Chrono built with Metal RT (macOS) or Vulkan RT needs a small patch to its Python bindings,
-  which is in this repository. Everything here was developed with Metal RT.
+  which is in this repository. Everything here was developed with Metal RT. It also runs with
+  OptiX on Linux, there without a window.
 - A Python with PyTorch for the depth networks, which run in a process of their own
   (`parking/stereo_worker.py`), and a checkout of IGEV++ with its published weights.
 
@@ -128,11 +129,30 @@ identified online while it drives.
 ## Results
 
 A run counts as parked when the car ends inside the lines of a free stall without having touched
-anything. All offsets are measured against the ground-truth stall. **The numbers below are from
-before the car stopped being told things a real car would not know**: its true pose, pitch, roll,
-height and speed, the lane and the extent of the lot, on a flat road with clean paint
-(`--give all --wear 0 --bumps 0`, and a 2 ms simulation step). None of that is the default any
-more. A run of the set as it is now is under way.
+anything. All offsets are measured against the ground-truth stall.
+
+The car is told only what a real car would know: a pose with the error of a satellite receiver
+with an inertial unit (10 cm and 0.3 degrees), its speed from a wheel encoder, its pitch, roll
+and height from the road it sees, and that it starts in a lane with stalls along it. The paint
+is worn and the road is uneven. The 60 runs with the rig were made twice, rendered with Metal RT
+on a Mac and with OptiX on an RTX 5070 Ti:
+
+| Perception | Parked | Lateral offset: mean, worst | Heading error: mean, worst | Smallest clearance |
+| --- | --- | --- | --- | --- |
+| cameras: stereo pair, rear, bumper (Metal RT) | 39 of 42 | 5.0, at most 14.2 cm | 0.9, at most 2.1 deg | 0.15 m |
+| cameras + forward lidar (Metal RT) | 17 of 18 | 5.3, at most 12.9 cm | 1.2, at most 2.8 deg | 0.27 m |
+| cameras (OptiX) | 33 of 42 | 5.5, at most 16.7 cm | 0.9, at most 2.0 deg | 0.27 m |
+| cameras + forward lidar (OptiX) | 16 of 18 | 5.7, at most 12.0 cm | 1.1, at most 3.1 deg | 0.01 m |
+| stand-in, no sensors | 73 of 74 | 4.1, at most 14.7 cm | 0.7, at most 3.1 deg | 0.08 m |
+
+What does not park with the rig comes from worn paint. Either a stall is not recognised, because
+too little of its lines is found, and the car drives past it. Or the stall is placed 0.9 m too
+deep, because the start of a line is worn away, and the car ends against the kerb. The
+[results](docs/results.md) have the list.
+
+**Before that**, the car was given its true pose, pitch, roll, height and speed, the lane and
+the extent of the lot, on a flat road with clean paint (`--give all --wear 0 --bumps 0`, and a
+2 ms simulation step). The numbers of that version:
 
 | Perception | Parked, seeds 1 to 3 | Seeds 4 to 6 | Unseen seeds 7 to 9 | Lateral offset | Heading error | Smallest clearance |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -165,6 +185,8 @@ parking/
   config.py, vehicle.py         rates and speeds, the car as read from the Chrono model
   geometry.py                   footprints and distances
   scenario.py, world.py         the lot and its ground truth, the Chrono world built from it
+  ground.py, paint.py           the uneven road, the worn paint of the lines
+  localization.py               the pose the car believes it has, its wheel encoder
   perception.py                 the stand-in perception, planar scans, line segments from paint
   sensors.py                    the sensor rig: cameras, lidar, depth from the images
   stereo_worker.py              the depth networks (IGEV++, Depth Anything V2), a process of their own
@@ -173,6 +195,7 @@ parking/
   control.py                    steering MPC, online steering gain, speed control
   viewer.py                     the window, with viewer_pictures.py, viewer_panel.py, draw.py, inputs.py
 tests/test_core.py              checks of the planner curves, the MPC solver, the image processing and the map
+tests/run_set.py                runs a set of scenarios a few at a time and says what parked
 docs/                           design documents and figures
 docs/make_figures.py            regenerates the figures of the pipeline from real runs
 docs/make_sensor_figures.py     regenerates the sensor figures from real runs and measures the perception

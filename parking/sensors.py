@@ -205,10 +205,20 @@ class SensorRig:
         mounts = sensor_mounts(self.body)
         k = noise
 
+        # (the renderer's own random numbers, with which OptiX spreads the rays of a pixel: the
+        # same in every run of a scenario, so that a run can be repeated)
+        sens.ChSensorManager.SetRandomSeed(1 + getattr(world.scn, "seed", 0))
         self.manager = sens.ChSensorManager(self.system)
-        light_scene(self.manager.scene, sky)
+        exposure, vignette = light_scene(self.manager.scene, sky)
         rate = 1.05 / PERCEPTION_DT        # a little faster than it is read, so every read is fresh
         W, H = self.CAM_W, self.CAM_H
+        # Exposure and the darker corners of the lens, where the renderer does not do them: both
+        # scale the light, and a pixel value is the light to the power 1 / 2.2
+        self.lens = None
+        if exposure != 1.0 or vignette != 0.0:
+            px, py = np.meshgrid((np.arange(W) + 0.5) / W * 2.0 - 1.0, (np.arange(H) + 0.5) / H * 2.0 - 1.0)
+            light = exposure * np.maximum(1.0 - vignette * (px * px + py * py), 0.0)
+            self.lens = (light ** (1.0 / 2.2)).astype(np.float32)[..., None]
         self.rays = pinhole_rays(W // 2, H // 2, self.CAM_HFOV)        # of the half-size depth images
         self.cameras, self.lidar = [], None
 
@@ -335,6 +345,8 @@ class SensorRig:
         """What a camera delivers for a rendered frame: its own exposure and the noise of its
         sensor, different in every camera and every frame."""
         img = rgba[..., :3]
+        if self.lens is not None:
+            img = np.minimum(img * self.lens + 0.5, 255.0).astype(np.uint8)
         if self.grain is None:
             return np.array(img)
         n = self.grain[int(self.rng.integers(len(self.grain)))]
