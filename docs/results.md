@@ -74,9 +74,11 @@ much lighter than the road faint paint has to be, how a row is read) carries ove
   cars on both). No stall is recognised. The same three drove past with the version before,
   which drove past nine.
 - *The car touches something* (4 runs).
-  - A parallel stall, twice, once with the lidar: the car ends 0.6 m off along the kerb and
-    touches something. Why the stall was placed there was not looked into. With the version
-    before, one of the two drove past and the other ended as far outside the lines.
+  - A parallel stall, twice, once with the lidar: the car ends 0.6 m too far out, over the
+    line on the lane side, and touches something on the way. The stall was built from two
+    short diagonal pieces that were found at its corners and are not its ticks. What they
+    are was not looked into. With the version before, one of the two runs drove past and the
+    other ended as far outside the lines.
   - A parallel stall with no cars around: the car touches the kerb on its way in. The planner
     does not know the kerb is there, and the stereo pair sees it as an obstacle only from 4 m.
     The version before planned a first swing forward that was 0.7 m shorter, and passed the
@@ -101,7 +103,9 @@ off uses that up. The stand-in runs are the same, line for line, as before the n
 the rows, which it does not use.
 
 `python tests/run_set.py cameras`, `python tests/run_set.py cameras --seeds 10,11,12` and
-`python tests/run_set.py standin` run these sets.
+`python tests/run_set.py standin` run these sets. `python docs/run_video.py OUT` with the
+arguments of a run makes a video of it: the scene from above with what the car believes drawn
+on it. A run repeats exactly, so a run that failed in a set fails the same way for the video.
 
 **The version before, and Metal RT.** The 60 runs of seeds 1 to 3 were also rendered with Metal
 RT on an Apple M4 Pro, with the version before: 56 of 60 (cameras 39 of 42, cameras and lidar

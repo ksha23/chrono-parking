@@ -207,5 +207,6 @@ docs/                           design documents and figures
 docs/make_figures.py            regenerates the figures of the pipeline from real runs
 docs/make_sensor_figures.py     regenerates the sensor figures from real runs and measures the perception
 docs/rate_check.py              replays recorded drives at several network rates: the choice of stall must not depend on the rate
+docs/run_video.py               a video of a run: the scene from above with what the car believes drawn on it
 docs/pychrono-rt-sensors.patch  Python bindings for Chrono's ray-traced sensors with Metal RT and Vulkan RT
 ```
