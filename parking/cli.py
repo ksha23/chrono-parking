@@ -9,7 +9,8 @@ import sys
 from .agent import ParkingSim
 from .chrono_env import HAVE_SENSORS, rerun_with_own_build, sens
 from .localization import Localization
-from .sensors import SensorRig, find_depth_python
+from .networks import find_depth_python
+from .sensors import SensorRig
 from .world import SKIES
 
 

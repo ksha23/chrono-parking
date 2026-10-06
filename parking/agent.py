@@ -17,7 +17,8 @@ from .localization import Localization
 from .perception import Perception
 from .planner import CSpace, Planner, Segment, holonomic_distance, split_segments
 from .scenario import make_scenario
-from .sensors import DepthWorker, SensorRig, find_depth_python
+from .networks import DepthWorker, find_depth_python
+from .sensors import SensorRig
 from .stalls import Slot, find_slots
 from .vehicle import EGO
 from .world import World
