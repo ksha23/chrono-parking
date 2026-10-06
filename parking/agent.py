@@ -60,7 +60,18 @@ class ParkingSim:
     # than to 10 cm, nor the stall: asking for more makes it shuffle after noise.
     ARRIVED = (0.20, 0.40, math.radians(3.0))
     SETTLED = 2.0            # for the last metres of its way in, the stall is where it was taken to be [m]
-    JUMP_HOLD = 1.0          # a stall estimate that jumps is believed once it has stayed there this long [s]
+    # The estimate of the chosen stall is followed while it stays this near to where the stall
+    # was when the plan was made [m, rad]. An estimate further off than that is another reading of
+    # the paint, not a better one of the same: of those that were looked at, each was wrong.
+    FOLLOW = (0.5, 0.1)
+    # Parallel parking: no part of the car may come nearer to the kerb than the side of the
+    # parked car will be, plus this [m]. The room for the maneuver is on the street. What lies
+    # beyond the stall is a kerb whether or not anything has seen it, and a camera cannot tell
+    # it from the road until it is close. The first value is tried with every margin before
+    # the second is: backing in between two cars takes the rear corner 10 cm beyond that side,
+    # which with the planner's margins at a turned corner and its grid needs the second. With
+    # the second alone, a car that drove nose first into a stall met the kerb with its corner.
+    KERB_SIDE = (0.15, 0.25)
 
     def __init__(self, args):
         self.args = args
@@ -82,7 +93,7 @@ class ParkingSim:
         self.state = "SETTLE"
         self.message = ""
         self.slots, self.target, self.goal = [], None, None
-        self.jump_t = None           # since when the stall estimate has stood away from the one in use
+        self.planned = None          # the chosen stall as it was when the plan was made: (centre, axis)
         self.path, self.seg_i = [], 0
         self.rejected = []
         self.watch = []                # recent estimates of the leading candidate stall
@@ -457,17 +468,18 @@ class ParkingSim:
 
     def _plan_job(self, start, spec, occ):
         try:
-            for k, (m_lat, m_lon) in enumerate(spec["margins"]):
-                self.planner.max_iter = 30000 if k == len(spec["margins"]) - 1 else 12000
-                res = self._plan_once(start, spec, occ, m_lat, m_lon)
-                if res is not None:
-                    self.plan_result = res
-                    return
+            for kerb_side in self.KERB_SIDE if spec["kind"] == "parallel" else (None,):
+                for k, (m_lat, m_lon) in enumerate(spec["margins"]):
+                    self.planner.max_iter = 30000 if k == len(spec["margins"]) - 1 else 12000
+                    res = self._plan_once(start, spec, occ, m_lat, m_lon, kerb_side)
+                    if res is not None:
+                        self.plan_result = res
+                        return
         except Exception:             # never leave the main loop waiting on a dead thread
             import traceback
             traceback.print_exc()
 
-    def _plan_once(self, start, spec, occ, m_lat, m_lon):
+    def _plan_once(self, start, spec, occ, m_lat, m_lon, kerb_side=None):
         g, res = self.grid, self.grid.RES
         nominal = spec["nominal"]
         win = 13.0
@@ -477,6 +489,12 @@ class ParkingSim:
         j1 = min(g.ny, int((max(start[1], nominal[1]) + win - g.y0) / res))
         sub = occ[j0:j1, i0:i1]
         wx0, wy0 = g.x0 + i0 * res, g.y0 + j0 * res
+        if kerb_side is not None:
+            # nothing of the car beyond the kerb-side edge of where it will stand (KERB_SIDE)
+            u, th = spec["u"], nominal[2]
+            X, Y = np.meshgrid(wx0 + (np.arange(sub.shape[1]) + 0.5) * res - nominal[0] - EGO.center * math.cos(th),
+                               wy0 + (np.arange(sub.shape[0]) + 0.5) * res - nominal[1] - EGO.center * math.sin(th))
+            sub = sub | (X * u[0] + Y * u[1] > EGO.half_width + kerb_side + m_lat)
         cs = CSpace(sub, wx0, wy0, res, m_lat, m_lon)
         if cs.query(*start) == CSpace.HARD:
             return None
@@ -564,6 +582,8 @@ class ParkingSim:
             return
         segs = res["segments"]
         self.goal, self.nominal = res["goal"], res["nominal"]
+        if self.target is not None:
+            self.planned = (self.target.center.copy(), math.atan2(self.target.u_in[1], self.target.u_in[0]))
         self.blocked, self.must_replan, self.watch_margin = 0, False, True
         self.plan_info = dict(res["stats"], margin=res["margin"], explored=res["explored"])
         st = res["stats"]
@@ -594,9 +614,13 @@ class ParkingSim:
     # ---- execution -------------------------------------------------------------
 
     def _retarget(self):
-        """Follow the chosen stall through the stream of fresh stall estimates."""
+        """Follow the chosen stall through the stream of fresh stall estimates. Once a plan has
+        been made for it, only as far as FOLLOW from where it was then."""
         cand = [s for s in self.slots if s.kind == self.target.kind and
                 np.hypot(*(s.center - self.target.center)) < 1.2]
+        if self.planned is not None and self.path:
+            cand = [s for s in cand if np.hypot(*(s.center - self.planned[0])) < self.FOLLOW[0] and
+                    abs(wrap(math.atan2(s.u_in[1], s.u_in[0]) - self.planned[1])) < self.FOLLOW[1]]
         if cand:
             self.target = min(cand, key=lambda s: np.hypot(*(s.center - self.target.center)))
         return bool(cand)
@@ -610,32 +634,14 @@ class ParkingSim:
         rest = cur.s[-1] - cur.s[min(self.tracker.i, len(cur.s) - 1)] + sum(sg.length for sg in self.path[self.seg_i + 1:])
         if rest < self.SETTLED:
             return
-        held = self.target
         if not self._retarget():
             return
         new = self.target.goal(self.nose_in, self.park_dir)
         old = self.nominal
         d, dth = math.hypot(new[0] - old[0], new[1] - old[1]), abs(wrap(new[2] - old[2]))
         if d < 0.01 and dth < 0.003:
-            self.jump_t = None
             self._recentre()
             return
-        if d > 0.5 or dth > 0.1:
-            # A jump may be one bad frame's worth of lines: it has to last before it is acted on.
-            self.target = held
-            if self.jump_t is None:
-                self.jump_t = self.time
-            if self.time - self.jump_t < self.JUMP_HOLD - 1e-6:
-                return
-            self.jump_t = None
-            self._retarget()
-            if self.replans < self.MAX_REPLANS:
-                self.replans += 1
-                self.say("the stall estimate jumped, replanning")
-                self.tracker.stop()
-                self.state, self.t_still = "BRAKE", None
-            return
-        self.jump_t = None
         a = 0.3                       # move the plan gradually so the tracker is not jerked around
         new = (old[0] + a * (new[0] - old[0]), old[1] + a * (new[1] - old[1]),
                old[2] + a * wrap(new[2] - old[2]))

@@ -55,15 +55,20 @@ def _seen_along(grid, u, nu, s_lo, s_hi, l0, l1):
     return 0.1 * len(np.unique(np.floor(Lc[m] / 0.1))) if m.any() else 0.0
 
 
-def _kerb_behind(grid, u, nu, s0, l0, l1):
+def _kerb_behind(grid, u, nu, s0, l0, l1, lane=None):
     """Where the kerb at the back of a stall is: the distance along u (into the stall) at which the
     car would meet it, or None if no kerb was seen there. It is read from the map's kerb layer
     between the two lines, from 2.5 to 9.5 m in from the mouth.
 
-    Behind an angled stall the kerb lies at a slant, so a line is fitted to what was seen, and
-    the answer is for the side of the car that the kerb is nearer to. A kerb seen from far away is
-    smeared over half a metre in range, most of it beyond its face: the line is put where the
-    nearest fifth of what was seen begins to count."""
+    The kerb behind a row runs along the lane, so behind an angled stall it lies at a slant, and
+    the answer is for the side of the car that the kerb is nearer to. The slant is that of the
+    lane, if the car has driven enough of it to tell (lane: its direction). It is not read from
+    what was seen of the kerb: from 12 m away a kerb is smeared along the line of sight, which
+    crosses the stall at an angle, and a line fitted to that came out slanted behind a stall the
+    kerb is square to. The car then stopped 0.5 m short. Without a lane a line is fitted.
+
+    A kerb seen from far away is smeared over half a metre in range, most of it beyond its face:
+    the line is put where the nearest fifth of what was seen begins to count."""
     kerb = getattr(grid, "kerb", None)
     if kerb is None or not kerb.any():
         return None
@@ -77,8 +82,12 @@ def _kerb_behind(grid, u, nu, s0, l0, l1):
     if m.sum() < 8 or np.ptp(Lc[m]) < 1.0:
         return None
     S, Lc, K = S[m], Lc[m] - 0.5 * (l0 + l1), K[m]
-    slant = float(np.polyfit(Lc, S, 1, w=np.sqrt(K))[0]) if np.ptp(Lc) >= 1.5 else 0.0
-    slant = 0.0 if abs(slant) < 0.25 else max(-1.2, min(1.2, slant))       # (square to the stall, or up to 50 degrees off)
+    if lane is not None and abs(lane @ nu) > 0.5:
+        slant = float((lane @ u) / (lane @ nu))
+    else:
+        slant = float(np.polyfit(Lc, S, 1, w=np.sqrt(K))[0]) if np.ptp(Lc) >= 1.5 else 0.0
+        slant = 0.0 if abs(slant) < 0.25 else slant       # (square to the stall)
+    slant = max(-1.2, min(1.2, slant))                    # (up to 50 degrees off)
     level = S - slant * Lc                                # as far in as the kerb is at the middle of the stall
     order = np.argsort(level)
     share = np.cumsum(K[order]) / K.sum()

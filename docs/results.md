@@ -42,98 +42,111 @@ where the other was not found ([sensors.md](sensors.md#one-line-found-the-other-
 and largest offsets are over the runs that parked. All of these runs were rendered with OptiX,
 on an RTX 5070 Ti unless said otherwise.
 
-Three versions were run on three groups of seeds. A group tests a version only if nobody had
+Four versions were run on four groups of seeds. A group tests a version only if nobody had
 looked at its runs when that version was made. Those are marked:
 
-| Version | Seeds 1 to 3, 60 runs | Seeds 10 to 12, 45 runs | Seeds 13 to 15, 45 runs |
-| --- | --- | --- | --- |
-| before the network and the rows | 49 | 31 (unseen) | not run |
-| with the network and the rows | 60 | 36 (unseen) | 38 (unseen) |
-| as it is now | 60 | 44 | 42 (unseen) |
+| Version | Seeds 1 to 3, 60 runs | Seeds 10 to 12, 45 runs | Seeds 13 to 15, 45 runs | Seeds 16 to 18, 45 runs |
+| --- | --- | --- | --- | --- |
+| before the network and the rows | 49 | 31 (unseen) | not run | not run |
+| with the network and the rows | 60 | 36 (unseen) | 38 (unseen) | not run |
+| with stalls from one line | 60 | 44 | 42 (unseen) | 43 (unseen) |
+| as it is now | 60 | 45 | 45 | 43 (unseen) |
 
-The version as it is now was made on what the nine failures of seeds 10 to 12 showed. So 44 of
-45 there is no test of it. The 42 of 45 on seeds 13 to 15 is the number to go by, and the
-version before parks 38 of those.
+Each version was made on what the failures of the one before showed, on the seeds that were
+unseen for that one. So a version does well on the seeds it was made on, and the number to go
+by is the one on seeds nobody had looked at: 43 of 45 on seeds 16 to 18.
 
-**Seeds 13 to 15 had never been run.** Each scenario was run once with the code as it is and
-once with the version before, both on the same machine: seeds 13 and 14 on the RTX 5070 Ti,
-seed 15 on an RTX 5060 Ti in another one. The two cards do not render the same pixels, so a
-run repeats exactly only on the card it was made on.
+**Seeds 16 to 18 had never been run.** Each scenario was run once with the code as it is and
+once with the version before, both on the same RTX 5070 Ti.
 
-| Perception, unseen seeds 13 to 15 | Parked | Lateral: mean, worst | Depth: mean, worst | Heading: mean, worst | Smallest clearance | Runs that replanned or corrected | Time |
+| Perception, unseen seeds 16 to 18 | Parked | Lateral: mean, worst | Depth: mean, worst | Heading: mean, worst | Smallest clearance | Runs that replanned or corrected | Time |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| cameras | 35 of 36 | 5.5, at most 18.9 cm | 9.0, at most 30.3 cm | 1.3, at most 3.4 deg | 0.14 m | 3 | 36 s |
-| cameras + lidar | 7 of 9 | 4.1, at most 9.9 cm | 10.6, at most 23.0 cm | 0.9, at most 2.1 deg | 0.15 m | 0 | 32 s |
-| cameras, the version before | 31 of 36 | 4.9, at most 18.6 cm | 8.5, at most 30.1 cm | 1.2, at most 3.8 deg | 0.12 m | 8 | 39 s |
-| cameras + lidar, the version before | 7 of 9 | 5.6, at most 14.1 cm | 7.4, at most 15.6 cm | 0.7, at most 1.3 deg | 0.15 m | 2 | 37 s |
+| cameras | 34 of 36 | 5.6, at most 14.5 cm | 10.6, at most 33.3 cm | 0.9, at most 3.3 deg | 0.12 m | 4 | 38 s |
+| cameras + lidar | 9 of 9 | 6.3, at most 16.1 cm | 8.6, at most 25.6 cm | 0.8, at most 1.6 deg | 0.18 m | 0 | 35 s |
+| cameras, the version before | 34 of 36 | 5.3, at most 12.2 cm | 9.7, at most 32.5 cm | 0.8, at most 3.3 deg | 0.18 m | 4 | 38 s |
+| cameras + lidar, the version before | 9 of 9 | 8.4, at most 19.0 cm | 10.9, at most 41.6 cm | 0.8, at most 1.5 deg | 0.18 m | 0 | 35 s |
 
-That is 42 of 45 against 38 of 45. Four scenarios that did not park before park now, none
-that parked fails, and three fail with both. By sky: clear 14 of 15 (13 before), low sun 13 of
-15 (11), overcast 15 of 15 (14). The runs that parked took 1.6 gear changes on average and 3
-at most, where the version before took 2.0 and 6. None of them made a correction at the end.
-The version before made 12.
+That is 43 of 45 with both. The same two scenarios fail, and no other changes sides. What
+was changed in this version made no difference here: none of these 45 scenarios runs into
+it. It shows on the seeds it was made on.
 
-**Seeds 10 to 12 and 1 to 3 are scenarios the method was changed on**, so they are no test of
-it:
+**Seeds 1 to 3 and 10 to 15 are scenarios the method was changed on**, so they are no test of
+it. Seeds 10 to 12 and 15 were run on an RTX 5060 Ti in another machine. The two cards do
+not render the same pixels, so a run repeats exactly only on the card it was made on.
 
 | Perception | Parked | Lateral: mean, worst | Depth: mean, worst | Heading: mean, worst | Smallest clearance | Runs that replanned or corrected | Time |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| cameras, seeds 10 to 12 | 35 of 36 | 4.8, at most 12.5 cm | 8.0, at most 23.9 cm | 1.1, at most 3.5 deg | 0.06 m | 7 | 38 s |
-| cameras + lidar, seeds 10 to 12 | 9 of 9 | 2.3, at most 4.0 cm | 7.2, at most 13.9 cm | 0.9, at most 2.9 deg | 0.14 m | 0 | 34 s |
-| cameras, seeds 1 to 3 | 42 of 42 | 5.8, at most 16.3 cm | 7.6, at most 18.7 cm | 1.2, at most 2.6 deg | 0.21 m | 5 | 38 s |
-| cameras + lidar, seeds 1 to 3 | 18 of 18 | 6.5, at most 13.3 cm | 6.4, at most 16.8 cm | 1.2, at most 2.4 deg | 0.10 m | 2 | 35 s |
-| stand-in, no sensors | 74 of 74 | 5.0, at most 14.6 cm | 5.7, at most 22.3 cm | 0.8, at most 2.5 deg | 0.08 m | 0 | 35 s |
+| cameras, seeds 13 to 15 | 36 of 36 | 5.5, at most 16.5 cm | 8.3, at most 24.3 cm | 1.1, at most 2.9 deg | 0.14 m | 3 | 37 s |
+| cameras + lidar, seeds 13 to 15 | 9 of 9 | 4.5, at most 11.4 cm | 10.6, at most 23.0 cm | 1.2, at most 2.2 deg | 0.20 m | 0 | 33 s |
+| cameras, seeds 10 to 12 | 36 of 36 | 4.7, at most 12.7 cm | 10.5, at most 32.3 cm | 0.9, at most 3.6 deg | 0.00 m | 3 | 37 s |
+| cameras + lidar, seeds 10 to 12 | 9 of 9 | 3.1, at most 9.6 cm | 6.1, at most 15.0 cm | 1.1, at most 3.7 deg | 0.12 m | 0 | 34 s |
+| cameras, seeds 1 to 3 | 42 of 42 | 5.6, at most 17.7 cm | 7.5, at most 17.4 cm | 1.1, at most 2.6 deg | 0.22 m | 5 | 38 s |
+| cameras + lidar, seeds 1 to 3 | 18 of 18 | 6.7, at most 14.7 cm | 6.2, at most 16.8 cm | 1.4, at most 3.6 deg | 0.21 m | 1 | 35 s |
+| stand-in, no sensors | 74 of 74 | 5.0, at most 15.3 cm | 5.7, at most 22.3 cm | 0.8, at most 2.5 deg | 0.08 m | 0 | 35 s |
 
-On seeds 10 to 12, eight scenarios that did not park with the version before park now, none
-that parked fails, and one fails with both. On seeds 1 to 3 the 60 runs made 11 corrections at
-the end with the version before and make none now.
+**A parked car that came within 2 mm of the kerb.** The 0.00 m in that table is one run on
+seeds 10 to 12, a parallel stall between two cars. It counts as parked, because nothing was
+touched, and it should not have come that near. At the end of the short forward run that
+centres the car in the stall, the car pointed 3 degrees towards the kerb, which is the known
+weakness of a docking run driven forwards ([control.md](control.md#limits)). The stall had
+been placed 8 cm nearer to the kerb than it is, and the car believed itself 16 cm further
+from the kerb than it was. Its front corner was 1.4 cm from the kerb. It then set out to
+correct its heading, forwards first, and came to 2 mm. The plan was not at fault: it took the
+car 8 cm beyond where its side would end up, and that with the rear corner.
 
-**What the nine failures of seeds 10 to 12 showed.** Each was made into a video
+**What the four failures of seeds 10 to 15 showed.** Each was made into a video
 (`docs/run_video.py`) and looked at.
 
-- *The car parks, or is on a good way in, and then shuffles* (4 runs). The estimate of the
-  stall moved by a decimetre or two while the car drove in or after it had arrived, and the
-  car set out to correct a position that was right: up to nine gear changes, and an end
-  position 0.6 m too far out. In one of the four a line had grown 0.7 m into the lane and
-  taken the stall with it. Now the car is content within 20 cm and 3 degrees, corrects once
-  at most, holds the estimate over the last 2 m, and takes a stall from where its row starts
-  ([control.md](control.md#watching-the-path),
-  [sensors.md](sensors.md#a-stall-starts-on-a-line-along-the-lane)). All four park.
-- *The car drives past* (3 runs). One of the two lines of the free stall was never found.
-  Such a stall is now taken from the one line and its row
-  ([sensors.md](sensors.md#one-line-found-the-other-not)). All three park.
-- *The car gives up* (1 run, angled, no cars). A single map cell at the mouth of the chosen
-  stall turned into an obstacle while the car stood and planned. It now takes the next stall,
-  and parks. Why the cell appears is known and not fixed
-  ([sensors.md](sensors.md#limits)).
-- *The nose touches a kerb* (1 run, parallel, no cars). The planner does not know the kerb is
-  there, and the stereo pair sees it as an obstacle only from 4 m. Nothing was changed for
-  this, and it still fails.
+- *The car touches the kerb beside a parallel stall* (2 runs). The plan swung the nose over a
+  kerb that nothing in the map knew of, 0.8 m and 2.0 m beyond where the side of the parked
+  car would be. For a parallel stall the planner now keeps the car on the street side of
+  where it will stand ([planning.md](planning.md#parallel-parking-the-room-is-on-the-street)).
+  Both park.
+- *The estimate of the stall jumps, and the car follows it* (1 run). A line of the stall was
+  found late, from 2.5 m into the stall, and the stall was rebuilt from there, 0.7 m deeper.
+  A line that runs the way its row does is now taken from the row's mouth wherever it begins,
+  and an estimate more than half a metre from the one the plan was made for is not followed
+  ([sensors.md](sensors.md#a-stall-starts-on-a-line-along-the-lane),
+  [control.md](control.md#keeping-the-plan-attached-to-the-stall)). It parks.
+- *The car stops 0.53 m short* (1 run). The kerb behind the stall had been seen only from 11
+  to 14 m away and from the side, and a line fitted to what was seen of it came out slanted.
+  The slant of a kerb is now that of the lane ([sensors.md](sensors.md#how-deep-a-stall-is)).
+  It parks, 0.13 m short.
 
-**What did not park on the unseen seeds 13 to 15.** All three fail with the version before as
+**The version before, with stalls from one line,** was made on the nine failures of seeds 10
+to 12 in the same way.
+
+- *The car parks, or is on a good way in, and then shuffles* (4 runs). The estimate of the
+  stall moved by a decimetre or two, and the car set out to correct a position that was
+  right: up to nine gear changes, and an end position 0.6 m too far out. Since then the car is
+  content within 20 cm and 3 degrees, corrects once at most, and holds the estimate over the
+  last 2 m ([control.md](control.md#watching-the-path)).
+- *The car drives past* (3 runs). One of the two lines of the free stall was never found.
+  Such a stall is taken from the one line and its row
+  ([sensors.md](sensors.md#one-line-found-the-other-not)).
+- *The car gives up* (1 run). A single map cell at the mouth of the chosen stall turned into
+  an obstacle while the car stood and planned. It now takes the next stall. Why the cell
+  appears is known and not fixed ([sensors.md](sensors.md#limits)).
+- *The nose touches a kerb* (1 run). That one was left for this version, above.
+
+On seeds 13 to 15, unseen then, it parked 42 of 45 where the version before it parked 38: four
+scenarios more, none fewer.
+
+**What did not park on the unseen seeds 16 to 18.** Both fail with the version before as
 well.
 
-- *The estimate of the stall jumps, and the car follows it* (1 run, angled, cars on both
-  sides). The version before drove past this stall. Now the car takes it from one line and
-  its row, backs up to drive in, and 8 s later a second estimate of the same stall appears,
-  half a metre further along the lane and deeper. It stays for more than a second, so the car
-  plans again, and ends 0.43 m to the side and 0.57 m too deep, over the line and 0.37 m from
-  the van next to it. On the other machine, with other pixels, the same scenario parks.
-- *The car touches the kerb* (1 run, parallel, with the lidar, no cars near the stall). It
-  ends inside the lines, 11 cm off the middle. The version before touched as well, and
-  then corrected twice.
-- *The car stops 0.53 m short* (1 run, perpendicular, with the lidar, a car on one side) and
-  sticks out into the lane. The car's end is kept 0.40 m short of the kerb that the scene
-  network saw behind the stall ([sensors.md](sensors.md#how-deep-a-stall-is)), and here that
-  kerb was smeared over 1.5 m in range and taken to begin 0.4 m before it does. The version
-  before stopped at the same place.
+- *The car drives past* (1 run, perpendicular, a car on one side). The free stall is the last
+  of its row, with open ground beyond it. Neither of its lines was found, so there is nothing
+  to make a stall of, with or without the row.
+- *The car gives up half-way in* (1 run, perpendicular, a car on one side). It backs into the
+  first stall of a row. After 16 s of the maneuver a few obstacle cells appear inside the
+  stall, 0.7 m from the van parked next to it, and block the path. From where the car stands
+  there is no other way in, and it has left the lane, so it cannot search on. What those cells
+  are was not looked into.
 
-The stand-in parks all 74. Its one miss, a parallel stall, was a correction at the end during
-which the car touched something, and that correction is not made any more. It ends 1 cm
-further off the middle of the stall on average than before, since it no longer sets out again
-for less than 20 cm. The stand-in does not use the network, the rows or the single-line rule.
+The stand-in parks all 74. It does not use the network, the rows or the single-line rule.
 
-`python tests/run_set.py cameras`, `python tests/run_set.py cameras --seeds 13,14,15` and
+`python tests/run_set.py cameras`, `python tests/run_set.py cameras --seeds 16,17,18` and
 `python tests/run_set.py standin` run these sets. `python docs/run_video.py OUT` with the
 arguments of a run makes a video of it: the scene from above with what the car believes drawn
 on it. A run repeats exactly, so a run that failed in a set fails the same way for the video.

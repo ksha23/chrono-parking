@@ -87,7 +87,7 @@ def one_line_stalls(tracks, rows, slots, trail, grid, lane, along, tick):
                     slot = Slot("parallel", d * s_c + nu * 0.5 * (la + lb), d, nu, abs(la - lb), s1 - s0, corners)
                 else:
                     s_c = s0 + min(max(0.5 * (s1 - s0), 2.65), 2.95)
-                    kerb = _kerb_behind(grid, d, nu, s0, min(la, lb), max(la, lb))
+                    kerb = _kerb_behind(grid, d, nu, s0, min(la, lb), max(la, lb), along)
                     if kerb is not None:
                         if kerb - s0 < 4.0:
                             continue           # (no room for a car: whatever this is, it is not such a stall)

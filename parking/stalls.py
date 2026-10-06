@@ -10,6 +10,14 @@ from .vehicle import EGO
 LATE = 2.0           # a line may be seen to start this much further in, or out, than its row does [m]
 
 
+def _runs_with(track, row):
+    """Is this a line of that row by its direction? A piece of paint too short to have a
+    direction is one only if it starts near the row's mouth (LATE). A line that runs the way
+    the row does is one wherever in the stall it begins: while the car drives in, its cameras
+    find the far half of a line whose first half is worn away or hidden."""
+    return track.length >= 1.5 and row.d is not None and abs(track.d[0] * row.d[1] - track.d[1] * row.d[0]) < 0.1
+
+
 class JoinedLine:
     """Pieces of one painted line with gaps between them, taken as one line. It has what a
     LineTrack has that the stall inference reads."""
@@ -194,13 +202,18 @@ def find_slots(tracks, trail, grid, stubs=False):
                 # something that looked like paint: in one run a line grew 0.7 m into the lane
                 # while the car turned in, and took the stall with it. Either way the stall
                 # starts where the row does. (This goes by where the paint was seen, not by the
-                # extent assumed above for a partly seen line.)
+                # extent assumed above for a partly seen line.) A line that runs the way the
+                # row does may begin anywhere in the stall (_runs_with).
                 oa, ob = (min(q @ u_in for q in t.ends()) for t in (a, b))
                 ea, eb = row.entrance(a, u_in), row.entrance(b, u_in)
                 if 0.25 < abs(oa - ea) < LATE:
                     in_a = ea
+                elif _runs_with(a, row) and LATE <= oa - ea < EGO.length:
+                    bk_a, in_a = bk_a - (in_a - ea), ea    # (its far end was assumed from where it began)
                 if 0.25 < abs(ob - eb) < LATE:
                     in_b = eb
+                elif _runs_with(b, row) and LATE <= ob - eb < EGO.length:
+                    bk_b, in_b = bk_b - (in_b - eb), eb
             elif stubs and lane is not None and abs(u_in @ lane) > 0.3:
                 # The two lines of a stall start on one line along the lane. If one was seen to
                 # start up to 0.75 m further in than the other, its first piece is worn off or was
@@ -225,7 +238,7 @@ def find_slots(tracks, trail, grid, stubs=False):
                             abs(sep), s1 - s0, corners)
             else:
                 s_c = s0 + min(max(0.5 * (s1 - s0), 2.65), 2.95)
-                kerb = _kerb_behind(grid, u_in, nu, s0, min(la, lb), max(la, lb))
+                kerb = _kerb_behind(grid, u_in, nu, s0, min(la, lb), max(la, lb), along)
                 if kerb is not None:           # however deep the lines say the stall is, the car ends short of the kerb
                     s_c = min(s_c, kerb - 0.5 * EGO.length - KERB_GAP)
                 skew = abs(in_a - in_b) / max(abs(la - lb), 1e-6)

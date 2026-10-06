@@ -98,7 +98,7 @@ stateDiagram-v2
     PLAN --> SEARCH: blocked while still on the lane, stall rejected
     PLAN --> FAILED: blocked in mid-maneuver and no alternative
     DRIVE --> DRIVE: next segment (gear change)
-    DRIVE --> BRAKE: stall estimate jumped, or path blocked
+    DRIVE --> BRAKE: path blocked
     DRIVE --> PLAN: end pose out of tolerance (correction)
     DRIVE --> PARKED: end pose within tolerance
     PARKED --> [*]
@@ -115,21 +115,22 @@ stateDiagram-v2
 | `PARKED`, `FAILED` | brake held, wheels straightened, result printed |
 | `WAIT` | drag mode only: the car stands still, keeps mapping what it can see, and waits for a target |
 
-Three events can interrupt `DRIVE`:
+Two events can interrupt `DRIVE`:
 
-1. The estimate of the target stall moves by more than 0.5 m or 0.1 rad and stays there for a
-   second. The car stops and replans. Smaller movements do not interrupt anything. They shift the
-   end of the plan gradually, until the last 2 m of the way in (see
-   [control.md](control.md#keeping-the-plan-attached-to-the-stall)).
-2. Newly seen obstacle cells lie inside the footprint along the remaining path, on two consecutive
+1. Newly seen obstacle cells lie inside the footprint along the remaining path, on two consecutive
    perception ticks. The car stops and replans. If no plan exists, it does not drive a blocked
    path: it searches on if it has not left the lane yet, and the run fails otherwise. With a
    sensor rig the footprint is grown by a margin for this test, because a camera places an
    obstacle exactly only once it is close
    ([sensors.md](sensors.md#the-monitor-looks-for-margin)).
-3. After the last segment, the pose is more than 0.20 m sideways, 3 degrees, or 0.4 m lengthwise
+2. After the last segment, the pose is more than 0.20 m sideways, 3 degrees, or 0.4 m lengthwise
    from the goal. The car plans a correction, once
    ([control.md](control.md#watching-the-path)).
+
+A better estimate of the target stall does not interrupt anything. It shifts the end of the
+plan gradually, as long as it stays within 0.5 m and 0.1 rad of where the stall was when the
+plan was made and the car has more than 2 m to go
+([control.md](control.md#keeping-the-plan-attached-to-the-stall)).
 
 ## Coordinates and conventions
 

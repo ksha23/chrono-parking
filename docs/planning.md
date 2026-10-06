@@ -121,6 +121,33 @@ With a sensor rig the margins are wider:
 A camera places an obstacle less exactly than the stand-in scan does, and what it has not looked
 at lately it knows only from before. The wider first setting costs nothing where there is room.
 
+### Parallel parking: the room is on the street
+
+Beyond a parallel stall is a kerb, whether or not anything has seen it. A camera cannot tell a
+kerb from the road until it is 4 m away, a lidar reports the pavement behind it as level ground,
+and in two runs the scene network labelled none of it. In both, the map the planner was given
+had the pavement as mostly drivable, and the plan swung the nose over it on the way in: 0.8 m
+and 2.0 m beyond where the side of the parked car would be, with the true kerb 0.4 m and
+0.2 m beyond that side. The car touched the kerb.
+
+So for a parallel stall the planning map gets one more blocked region, a half-plane along the
+stall: no part of the car may come more than 0.15 m nearer to the kerb than the kerb-side edge
+of the car as it will stand when parked (`ParkingSim.KERB_SIDE`). The room for the maneuver is
+on the street side. With it, the same two plans stay 0.9 m and 0.8 m short of that edge with
+the nose and reach 5 cm beyond it with the rear corner.
+
+If no plan exists with 0.15 m at any of the margins, 0.25 m is allowed. Backing in between two
+cars needs that: on the last arc the rear corner passes 10 cm beyond where the side ends up,
+and the limit is enforced through the collision table, which adds its margin at a turned
+corner (6 cm) and the size of a grid cell (5 cm). With 0.15 m alone, one stall between two
+cars had no plan and the car drove on. With 0.25 m from the start, a car that had room behind
+the stall drove into it nose first, came 0.14 m beyond the edge with the nose 8 degrees towards
+the kerb, and met the kerb with its front corner. The nose is 3.8 m ahead of the rear axle, and
+what the tracking is off by there is more than what was left.
+
+The region is placed from the goal, not from a kerb in the map. If the stall itself is taken
+to be nearer to the kerb than it is, the car still parks too near to it.
+
 ## Hybrid A*
 
 A node is a continuous pose. Nodes are merged when they fall in the same cell of a 0.35 m by

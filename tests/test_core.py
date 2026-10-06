@@ -468,12 +468,41 @@ def test_stalls_from_their_row():
         grid.add_kerb(np.stack([np.repeat(X, 3), np.tile([-8.5, -8.6, -8.7], len(X))], axis=1), 0.4)
         capped = min(find_slots(worn, trail, grid, True), key=lambda s: s.center[0])
         assert abs(capped.center[1] + 8.5 - 0.4 - 0.5 * EGO.length) < 0.11, capped.center.round(2)
-        # and one that lies at a slant, 0.58 m further in per metre along the lane: what counts is
-        # where it is at the side of the car that it is nearer to
+        # The same kerb seen from 12 m away and from the side: smeared along the line of sight,
+        # which crosses the stall at an angle, so that what was seen of it lies deeper the
+        # further along the lane. The kerb runs along the lane all the same, and the car ends
+        # 0.4 m short of where the nearest fifth of that begins, not 0.4 m short of a slanted line.
         grid = GridMap((-12.0, -14.0, 24.0, 4.0))
-        grid.add_kerb(np.stack([X, -8.5 - 0.58 * (X - 1.35)], axis=1), 0.4)
+        grid.add_kerb(np.array([(x, -8.5 - t) for x in X for t in np.arange(0.0, 0.1 + 0.7 * max(x, 0.0), 0.1)]), 0.4)
         capped = min(find_slots(worn, trail, grid, True), key=lambda s: s.center[0])
-        assert abs(capped.center[1] + 8.5 - 0.58 * (EGO.half_width + 0.1) - 0.4 - 0.5 * EGO.length) < 0.15, capped.center.round(2)
+        short = capped.center[1] - 0.5 * EGO.length + 8.5
+        assert 0.05 < short < 0.45, "the car's end is %.2f m short of the kerb" % short
+        # Behind stalls at 60 degrees the kerb lies at a slant to the stall: what counts is where
+        # it is at the side of the car that it is nearer to.
+        d = np.array([0.5, -math.sqrt(0.75)])
+
+        def slanted(x, s0=0.0, s1=6.0):                   # a line at 60 degrees, found from s0 to s1 along it
+            a, b = np.array([x, -3.5]) + s0 * d, np.array([x, -3.5]) + s1 * d
+            t = types.SimpleNamespace(c=0.5 * (a + b), d=d, length=s1 - s0, watched=2.0)
+            t.ends = lambda: (a, b)
+            return t
+
+        grid = GridMap((-12.0, -14.0, 24.0, 4.0))
+        Xk = np.arange(-1.0, 20.0, 0.1)
+        grid.add_kerb(np.stack([np.repeat(Xk, 3), np.tile([-8.5, -8.6, -8.7], len(Xk))], axis=1), 0.4)
+        first = min(find_slots([slanted(x) for x in (0.0, 3.1, 6.2, 9.3)], trail, grid, True), key=lambda s: s.center[0])
+        assert first.kind == "angled", first.kind
+        nose = [first.center + 0.5 * EGO.length * first.u_in + k * EGO.half_width * np.array([-first.u_in[1], first.u_in[0]]) for k in (-1, 1)]
+        gap = min(q[1] + 8.5 for q in nose)               # of the corner that is nearer to the kerb, square to it
+        assert 0.25 < gap < 0.55, "the nearer corner of the car ends %.2f m from the kerb" % gap
+        # A line whose first 2.5 m are gone, found over 2.4 m further in (what the cameras see of
+        # it once the car is driving in). It runs the way the row does, so it is a line of the
+        # row: the stall starts where the row does, like the one next to it.
+        grid = GridMap((-12.0, -14.0, 24.0, 4.0))
+        slots = sorted(find_slots([slanted(0.0, 2.5, 4.9)] + [slanted(x) for x in (3.1, 6.2, 9.3)], trail, grid, True),
+                       key=lambda s: s.center[0])
+        off = slots[0].center + (3.1, 0.0) - slots[1].center
+        assert len(slots) == 3 and np.abs(off).max() < 0.1, "the stall is %.2f m too deep" % (off @ d)
         # parallel stalls along a kerb, 6.5 m long: two ends of ticks and the kerb behind them
         grid = GridMap((-12.0, -14.0, 24.0, 4.0))
         ticks = [line(6.5 * k, -1.75, -2.3) for k in range(4)]

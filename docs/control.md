@@ -336,9 +336,12 @@ plan was made for.
   where `l` is the path length from a point to the goal. Points within 4 m of the goal move fully,
   points more than 9 m away stay put, and the weight is continuous across cusps. The far part of
   the plan, which was checked against obstacles, is not disturbed.
-- **Large change** (over 0.5 m or 0.1 rad). The car stops and replans, if the estimate has stayed
-  at its new place for a second. Until then the plan keeps the stall it was made for. A jump may
-  be one bad frame's worth of lines.
+- **Large change.** An estimate more than 0.5 m or 0.1 rad from where the stall was when the
+  plan was made is not followed (`ParkingSim.FOLLOW`). The plan keeps the stall it was made
+  for. Such an estimate is another reading of the paint, not a better one of the same. The car
+  used to stop and plan again for it, at once and later after it had lasted a second. Of the
+  jumps that were looked at, each was wrong: a line that had grown 0.7 m into the lane, and a
+  stall rebuilt 0.7 m deeper from a line found late.
 - **On the last 2 m of the way in**, nothing is changed any more. What the cameras show of a
   stall from inside it is little, and an estimate that moves there moves for the worse as often
   as not.
@@ -383,6 +386,10 @@ width of the middle of a stall stays there.
 
 ## Limits
 
+- When an obstacle turns out to be nearer to the path than the plan allowed for, the car stops
+  and plans again, and the new plan can be answered the same way at once. One run planned six
+  times in three seconds, standing still, before it drove on and parked. Why the new plans
+  did not keep the distance the monitor asks for was not looked into.
 - The MPC model is linear in the errors. That is accurate for the few centimetres and degrees seen
   here, not for recovering from a large disturbance.
 - Only the steering is predictive. Speed is a separate loop, so the MPC cannot trade speed against

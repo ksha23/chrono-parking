@@ -768,6 +768,12 @@ The same holds for a line that was seen to start further out than its row. In on
 grew 0.7 m into the lane while the car turned in, carried on by something that looked like
 paint. The stall moved out with it, and the car set out to correct a position that was right.
 
+And 2 m is the limit only for a piece of paint too short to say which way it runs. A line of
+1.5 m or more that runs the way its row does is a line of that row wherever in the stall it
+begins. That is what the cameras find once the car is driving in: the far half of a line whose
+first half is worn away or was hidden by the car next to it. In one run such a line was found
+from 2.5 m in, the stall was rebuilt from there, 0.7 m deeper than it is, and the car followed.
+
 While the car backs in, the rear camera sees both lines of the stall at close range. The
 estimate then rests on those, and the plan follows it (see
 [control.md](control.md#keeping-the-plan-attached-to-the-stall)).
@@ -781,10 +787,19 @@ it.
 
 Where the scene network saw the kerb behind a stall ([Kerbs](#kerbs)), the car's end stays
 0.40 m short of it, whatever the lines say. The kerb is looked for between the two lines, 2.5
-to 9.5 m in from the mouth. Behind an angled stall it lies at a slant, so a line is fitted to
-what was seen, and the distance that counts is the one at the side of the car that the kerb is
-nearer to. Seen from far away a kerb is smeared over half a metre in range, most of it beyond
-its face, so the line is put where the nearest fifth of what was seen begins.
+to 9.5 m in from the mouth. Seen from far away a kerb is smeared over half a metre in range,
+most of it beyond its face, so it is put where the nearest fifth of what was seen begins.
+
+The kerb behind a row runs along the lane. Behind an angled stall it therefore lies at a slant
+to the stall, and the distance that counts is the one at the side of the car that the kerb is
+nearer to. That slant is taken from the direction of the lane, which the car knows from the way
+it has come. It used to be read from the kerb itself, by a line fitted to what was seen of it,
+and that went wrong behind a stall the kerb is square to. The kerb there had been seen only
+from 11 to 14 m away, 443 points of it, and from the side. Range error smears a point along
+the line of sight, which crossed the stall at an angle, so the points lay deeper the further
+along the lane they were. The fitted line came out slanted, the kerb was taken to be 0.39 m
+nearer than it is, and the car stopped 0.53 m short of the middle of the stall, sticking out
+into the lane. With the slant of the lane, which is none there, it stops 0.13 m short.
 
 ### Lines remember
 
@@ -855,6 +870,8 @@ the map sharpens. See [planning.md](planning.md).
 A parallel stall is aligned with the kerb behind it, which only the stereo pair can see as a
 kerb. It does so while the car drives up, from 5 to 8 m. During the reverse the rear camera sees
 the two tick lines and the road, not the kerb, so the alignment rests on what was mapped before.
+The plan itself never takes the car nearer to the kerb than it will stand when parked
+([planning.md](planning.md#parallel-parking-the-room-is-on-the-street)).
 
 Between two parked cars, the ticks of a parallel stall show as stubs too: 0.6 and 0.8 m of
 their 2.5 m in one run. Such a stall is taken from its row
@@ -912,18 +929,29 @@ made of that data shows up in three more places:
   of the lane. Two lots at different distances from the lane on the same side would be read as
   one row.
 - **Chosen on a few scenarios.** How much lighter faint paint has to be where the network sees a
-  marking, how a row is read, and when the car is content with where it stands were settled on
-  the scenarios of seeds 1 to 3 and 10 to 12. Of those 105, 104 park. Of 45 on seeds never
-  run, 42 do, against 38 with the version before ([results.md](results.md#verification)).
-- **A stall's estimate can still jump while the car drives in.** A jump of more than 0.5 m
-  is believed once it has lasted a second, and it is not always right. On the unseen seeds one
-  stall, taken from one line and its row, was replaced on the way in by a second estimate
-  half a metre off, and the car ended over the line ([results.md](results.md#verification)).
-- **The kerb behind a stall can be placed too near.** Seen from far away it is smeared in
-  range, in one run over 1.5 m. The car then stops short and sticks out into the lane.
+  marking, how a row is read, when the car is content with where it stands and how near to a
+  kerb a plan may go were settled on the scenarios of seeds 1 to 3 and 10 to 15. All 150 of
+  those park, one of them after coming within 2 mm of a kerb. Of 45 on seeds never run, 43
+  park, and the same 43 did with the version before ([results.md](results.md#verification)).
+- **A stall of which no line was found is not a stall.** At the end of a row, with open
+  ground beyond, the far line of the last stall has no car behind it to say that a stall is
+  there. If that line is worn away and the near one is under the car parked next to it, the
+  car drives past.
+- **Next to a kerb the nose is where the error is.** A docking run driven forwards can end
+  with the heading 3 degrees off, and the nose is 3.8 m ahead of the rear axle: 20 cm. In a
+  parallel stall that is most of the gap to the kerb. One run came within 2 mm of it that way
+  ([results.md](results.md#verification)).
+- **A stall is not corrected by more than half a metre.** Once a plan is made, an estimate of
+  the stall more than 0.5 m or 0.1 rad from the one it was made for is taken for a wrong
+  reading and not followed ([control.md](control.md#keeping-the-plan-attached-to-the-stall)).
+  If the first estimate was the wrong one, the car parks there.
 - **The planner does not know the kerbs the network sees.** They limit how deep a stall is and
-  nothing else. A plan can still swing the nose towards a kerb that the stereo pair has not yet
-  seen as an obstacle, which it does from 4 m.
+  nothing else. Next to a parallel stall the planner keeps the car on the street side of where
+  it will stand, whatever was seen ([planning.md](planning.md#parallel-parking-the-room-is-on-the-street)).
+  Elsewhere a plan can still swing the nose towards a kerb that the stereo pair has not yet
+  seen as an obstacle, which it does from 4 m. In the two runs where a kerb was touched the
+  network had labelled none of that kerb, so giving its kerbs to the planner would not have
+  helped there.
 - **The networks were not trained for this.** They run with published weights. IGEV++ does well
   on the textured road and badly on a road of one flat colour, where it has nothing to match.
 - **Points in the air next to the car.** Along the edge of the car's own bonnet in the image, a
