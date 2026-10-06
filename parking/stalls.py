@@ -216,14 +216,17 @@ def find_slots(tracks, trail, grid, stubs=False):
                 pass                               # (taken from the mouth of the row already)
             elif row is not None and row.count >= 3 and not parallel and u_in @ row.inward > 0.3:
                 # The lines of a row start on one line along the lane. A line that was seen to
-                # start further in than that has lost its first piece to wear or to a shadow:
-                # the stall starts where the row does. (This goes by where the paint was seen,
-                # not by the extent assumed above for a partly seen line.)
+                # start further in than that has lost its first piece to wear or to a shadow.
+                # One that was seen to start further out has been carried on past its end by
+                # something that looked like paint: in one run a line grew 0.7 m into the lane
+                # while the car turned in, and took the stall with it. Either way the stall
+                # starts where the row does. (This goes by where the paint was seen, not by the
+                # extent assumed above for a partly seen line.)
                 oa, ob = (min(q @ u_in for q in t.ends()) for t in (a, b))
                 ea, eb = row.entrance(a, u_in), row.entrance(b, u_in)
-                if 0.25 < oa - ea < LATE:
+                if 0.25 < abs(oa - ea) < LATE:
                     in_a = ea
-                if 0.25 < ob - eb < LATE:
+                if 0.25 < abs(ob - eb) < LATE:
                     in_b = eb
             elif stubs and lane is not None and abs(u_in @ lane) > 0.3:
                 # The two lines of a stall start on one line along the lane. If one was seen to
@@ -256,16 +259,122 @@ def find_slots(tracks, trail, grid, stubs=False):
                 slot = Slot("perpendicular" if skew < 0.2 else "angled",
                             u_in * s_c + nu * 0.5 * (la + lb), u_in, nu, abs(sep), s1 - s0, corners)
             slot.watched, slot.by_row = min(a.watched, b.watched), bool(by_row)
-            _classify(slot, grid, s0, s1, min(la, lb), max(la, lb), deep=stubs and not parallel)
+            _classify(slot, grid, s0, s1, min(la, lb), max(la, lb), deep=stubs and not parallel,
+                      stagger=(in_b - in_a) * (1.0 if la < lb else -1.0))
             if parallel:
                 _align_with_kerb(slot, grid, s1, min(la, lb), max(la, lb), along)
             slots.append(slot)
+    if rows:
+        slots += _one_line_stalls(tracks, rows, slots, trail, grid, lane, along, tick)
     return slots
+
+
+def _one_line_stalls(tracks, rows, slots, trail, grid, lane, along, tick):
+    """Stalls of which one line was found and the other was not: worn away, or under the wheels
+    of the car parked next to it. The row says where the other line has to be, one stall's width
+    on. Such a stall counts if its ground was seen to be free and there is a reason to take the
+    place for a stall: a parked car beyond the line that was not found, or a parked car beyond
+    the one that was, as long as the row across the lane reaches as far (beyond the last line of
+    a row there is free ground too, and no stall)."""
+    origin, out = trail[0], []
+
+    def anchors(r):                            # the lines of a row that start at its mouth
+        return [t for t in tracks if abs(t.d @ lane) > 0.3 and (t.c - origin) @ r.inward > 0.5
+                and -0.4 < r.start(t) - r.mouth < 1.0]
+
+    def where(r, p, dr):                       # where a point, carried along dr to the mouth of row r, is along the lane
+        return float((p + (r.mouth - r.off_path(p)) / (dr @ r.inward) * dr) @ along)
+
+    for side, row in rows.items():
+        own = anchors(row)
+        if len(own) < 3:
+            continue
+        # Which kind of stall the row is made of. The ticks of parallel stalls are short and a
+        # car's length apart. Lines of other stalls are a car's width apart, and although some
+        # are missed, most neighbours are not. (The stalls already made out do not say: two line
+        # ends two stalls apart pass for the ticks of a parallel stall, and a tick with a bit
+        # of something beside it for a narrow stall.)
+        at = np.sort([min(t.ends(), key=row.off_path) @ along for t in own])
+        gaps = np.diff(at)
+        gaps = gaps[gaps > 0.6]                # (one line found as two pieces)
+        if not len(gaps):
+            continue
+        parallel = row.longest <= 3.6 and float(np.median(gaps)) >= 4.5
+        mine = [s for s in slots if (s.center - origin) @ row.inward > 0.5 and (s.kind == "parallel") == parallel]
+        d = row.inward if parallel else row.d
+        if d is None:
+            continue
+        nu = np.array([-d[1], d[0]])
+        slant = abs(d @ row.inward)
+        xs = [where(row, t.c, d) for t in own]
+        known = [where(row, s.center, d) for s in mine]
+        # the width of a stall along the lane: from the stalls already made out on this side, or
+        # from how far apart the lines are, which is a whole number of stalls
+        lo, hi = (5.0, 7.8) if parallel else (2.2 / slant, 3.5 / slant)
+        if mine:
+            pitch = float(np.median([s.width for s in mine])) / (1.0 if parallel else slant)
+        else:
+            cand = [abs(a - b) / k for i, a in enumerate(xs) for b in xs[i + 1:] for k in (1, 2, 3, 4) if lo <= abs(a - b) / k <= hi]
+            if not cand:
+                continue
+            fits = lambda p: sum(abs((x - xs[0]) / p - round((x - xs[0]) / p)) * p < 0.4 for x in xs)
+            pitch = max(cand, key=lambda p: (fits(p), p))
+        if not lo <= pitch <= hi:
+            continue
+        other = rows.get(-side)
+        far = []
+        if other is not None:
+            do = other.inward if other.d is None else other.d
+            far = [where(other, t.c, do) for t in anchors(other)]
+        for t, x in zip(own, xs):
+            if t.length < (tick if parallel else 1.5):
+                continue
+            for sg in (1.0, -1.0):
+                if any(abs(x + sg * pitch - q) < 0.6 for q in xs):
+                    continue                   # (there is a line where the other one belongs: a pair, above)
+                step = sg * pitch * along
+                if any(abs(k - (x + 0.5 * sg * pitch)) < 0.5 * pitch for k in known):
+                    continue                   # (a stall is known there already)
+                in_a = row.entrance(t, d)
+                in_b = in_a + step @ d
+                la = t.c @ nu
+                lb = la + step @ nu
+                deep = TICK if parallel else EGO.length + 0.7
+                s0, s1 = max(in_a, in_b), min(in_a, in_b) + deep
+                corners = np.array([d * in_a + nu * la, d * in_b + nu * lb, d * (in_b + deep) + nu * lb, d * (in_a + deep) + nu * la])
+                if parallel:
+                    s_c = 0.5 * (in_a + in_b) + min(max(0.5 * (s1 - s0), 1.2), 1.4)
+                    slot = Slot("parallel", d * s_c + nu * 0.5 * (la + lb), d, nu, abs(la - lb), s1 - s0, corners)
+                else:
+                    s_c = s0 + min(max(0.5 * (s1 - s0), 2.65), 2.95)
+                    kerb = _kerb_behind(grid, d, nu, s0, min(la, lb), max(la, lb))
+                    if kerb is not None:
+                        if kerb - s0 < 4.0:
+                            continue           # (no room for a car: whatever this is, it is not such a stall)
+                        s_c = min(s_c, kerb - 0.5 * EGO.length - KERB_GAP)
+                    skew = abs(in_a - in_b) / max(abs(la - lb), 1e-6)
+                    slot = Slot("perpendicular" if skew < 0.2 else "angled", d * s_c + nu * 0.5 * (la + lb), d, nu,
+                                abs(la - lb), s1 - s0, corners)
+                slot.watched, slot.by_row = t.watched, True
+                _classify(slot, grid, s0, s1, min(la, lb), max(la, lb), deep=not parallel,
+                          stagger=(in_b - in_a) * (1.0 if la < lb else -1.0))
+                if slot.status != Slot.FREE:
+                    continue
+                beyond_found, beyond_other = slot.neighbors if la < lb else slot.neighbors[::-1]
+                reaches = len(far) >= 2 and min(far) - 0.5 * pitch <= x + sg * pitch <= max(far) + 0.5 * pitch
+                if not (beyond_other or (beyond_found and reaches)):
+                    continue
+                if parallel:
+                    if _seen_along(grid, d, nu, s0 + 1.8, s0 + 3.8, min(la, lb) + 0.5, max(la, lb) - 0.5) < 1.5:
+                        continue
+                    _align_with_kerb(slot, grid, s1, min(la, lb), max(la, lb), along)
+                out.append(slot)
+    return out
 
 
 KERB_GAP = 0.40      # between the end of the parked car and a kerb that a camera network saw [m]
 TICK = 2.5           # how deep a parallel stall is taken to be when only the ends of its ticks were seen [m]
-LATE = 2.0           # a line may be seen to start this much further in than its row does [m]
+LATE = 2.0           # a line may be seen to start this much further in, or out, than its row does [m]
 
 
 def _seen_along(grid, u, nu, s_lo, s_hi, l0, l1):
@@ -358,9 +467,10 @@ def _align_with_kerb(slot, grid, s1, l0, l1, lane=None):
     slot.u_in, slot.along = u_k, along
 
 
-def _classify(slot, grid, s0, s1, l0, l1, deep=False):
+def _classify(slot, grid, s0, s1, l0, l1, deep=False, stagger=0.0):
     """Free / occupied / unknown from the grid cells inside the stall, plus neighbours.
-    deep: the far end of the stall may be out of sight (a sensor rig that looks along the lane)."""
+    deep: the far end of the stall may be out of sight (a sensor rig that looks along the lane).
+    stagger: how much further in the stall starts at l1 than at l0 (angled stalls) [m]."""
     c = slot.corners
     win = grid.window(c[:, 0].min() - 3.0, c[:, 1].min() - 3.0, c[:, 0].max() + 3.0, c[:, 1].max() + 3.0)
     if win is None:
@@ -388,11 +498,22 @@ def _classify(slot, grid, s0, s1, l0, l1, deep=False):
     # seen empty and the empty ground is seen at least 2 m into it.
     wedge = deep and frac_mouth >= 0.55 and frac_free >= 0.25 and \
         (free & inside).any() and float(S[free & inside].max()) - s0 >= 2.0
+    # A stall that is known from its row is taken when the car is level with it (agent.py), and
+    # by then the cameras have seen all of it that they are going to. Behind a wide car the
+    # wedge is narrower than that. What is left to ask is whether a car could stand in the
+    # stall: its front would be in the first 1.2 m, across most of the width.
+    front = inside & (S < s0 + 1.2)
+    level = deep and slot.by_row and front.any() and (free & front).sum() >= 0.75 * front.sum() and \
+        float(S[free & inside].max()) - s0 >= 2.0
     if n_occ >= 4:
         slot.status = Slot.OCCUPIED
-    elif n_occ <= 1 and (frac_free >= 0.6 or (frac_mouth >= 0.8 and frac_free >= 0.3) or wedge):
+    elif n_occ <= 1 and (frac_free >= 0.6 or (frac_mouth >= 0.8 and frac_free >= 0.3) or wedge or level):
         slot.status = Slot.FREE
-    side = (S > s0 - 0.3) & (S < s1 - back)
+    # The stalls of an angled row are staggered: the one next to this one starts further in,
+    # or further out, and so does the car in it. (A band straight across found the car on one
+    # side by its front, and of the car on the other side only what the cameras do not see.)
+    enter = s0 + (Lc - (l1 if stagger > 0.0 else l0)) * stagger / max(l1 - l0, 1e-6) if slot.kind == "angled" else s0
+    side = (S > enter - 0.3) & (S < enter + s1 - s0 - back)
     reach = 2.4 if slot.kind != "parallel" else 3.0
     slot.neighbors = [bool((occ & side & (Lc < l0 - 0.05) & (Lc > l0 - reach)).sum() >= 4),
                       bool((occ & side & (Lc > l1 + 0.05) & (Lc < l1 + reach)).sum() >= 4)]

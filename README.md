@@ -138,21 +138,24 @@ anything. All offsets are measured against the ground-truth stall.
 The car is told only what a real car would know: a pose with the error of a satellite receiver
 with an inertial unit (10 cm and 0.3 degrees), its speed from a wheel encoder, its pitch, roll
 and height from the road it sees, and that it starts in a lane with stalls along it. The paint
-is worn and the road is uneven. Rendered with OptiX on an RTX 5070 Ti:
+is worn and the road is uneven. Rendered with OptiX:
 
-| Perception | Parked, unseen seeds 10 to 12 | Parked, seeds 1 to 3 | Lateral offset: mean, worst | Heading error: mean, worst | Smallest clearance |
-| --- | --- | --- | --- | --- | --- |
-| cameras: stereo pair, rear, bumper | 29 of 36 | 42 of 42 | 6.0, at most 25.2 cm | 0.8, at most 4.2 deg | 0.03 m |
-| cameras + forward lidar | 7 of 9 | 18 of 18 | 2.4, at most 4.2 cm | 0.6, at most 1.4 deg | 0.14 m |
-| stand-in, no sensors | | 73 of 74 | 4.1, at most 14.7 cm | 0.7, at most 2.9 deg | 0.08 m |
+| Perception | Parked, unseen seeds 13 to 15 | Parked, seeds 10 to 12 | Parked, seeds 1 to 3 | Lateral offset: mean, worst | Heading error: mean, worst | Smallest clearance |
+| --- | --- | --- | --- | --- | --- | --- |
+| cameras: stereo pair, rear, bumper | 35 of 36 | 35 of 36 | 42 of 42 | 5.5, at most 18.9 cm | 1.3, at most 3.4 deg | 0.14 m |
+| cameras + forward lidar | 7 of 9 | 9 of 9 | 18 of 18 | 4.1, at most 9.9 cm | 0.9, at most 2.1 deg | 0.15 m |
+| stand-in, no sensors | | | 74 of 74 | 5.0, at most 14.6 cm | 0.8, at most 2.5 deg | 0.08 m |
 
-Seeds 1 to 3 are the scenarios the method was changed on, and seeds 10 to 12 had never been
-run: 36 of 45 is the number to go by. (The offsets of the rig are those of the unseen seeds.)
-The version before the last change, in which a network that labels the images points out faint
-paint and kerbs and a stall can be taken from the ends of its lines, parked 31 of the same 45
-and 49 of the 60. What still does not park: the car drives past a stall it does not recognise
-(3 runs), touches something (4), parks 0.6 m short (1) or gives up after replanning (1). The
-[results](docs/results.md) have the list.
+Seeds 1 to 3 and 10 to 12 are scenarios the method was changed on. Seeds 13 to 15 had never
+been run: 42 of 45 is the number to go by. (The offsets of the rig are those of the unseen
+seeds.) The version before parked 38 of the same 45, and 36 of 45 on seeds 10 to 12 when those
+were unseen. Its failures there were looked at on video, and three things were changed: the car
+no longer shuffles after a stall estimate that moves by a decimetre, a stall of which only one
+line was found is taken from that line and its row, and a stall that turns out to be blocked
+while the car is still on the lane is given up for the next one. What still does not park on
+the unseen seeds: the estimate of a stall jumps while the car drives in and the car follows
+it (1 run), the car touches the kerb of a parallel stall (1), the car stops 0.5 m short of a
+kerb it places too near (1). The [results](docs/results.md) have the list.
 
 **Before that**, the car was given its true pose, pitch, roll, height and speed, the lane and
 the extent of the lot, on a flat road with clean paint (`--give all --wear 0 --bumps 0`, and a

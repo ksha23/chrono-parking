@@ -488,6 +488,89 @@ def test_stalls_from_their_row():
     print("stalls taken from their row: ok")
 
 
+def test_stall_with_one_line():
+    """A stall of which one line was found: the row says where the other is, a parked car that it is one."""
+    def line(x, y1, y0=-3.5, d=(0.0, -1.0)):             # from (x, y0) at the lane, along d, as far in as y1
+        d = np.array(d)
+        far = np.array([x, y0]) + d * (y1 - y0) / d[1]
+        t = types.SimpleNamespace(c=0.5 * (np.array([x, y0]) + far), d=d, length=float(np.hypot(*(far - (x, y0)))), watched=2.0)
+        t.ends = lambda: (np.array([x, y0]), far)
+        return t
+
+    def fill(layer, x0, x1, y0, y1, keep=lambda x, y: True):
+        X, Y = np.meshgrid(np.arange(x0, x1, 0.1) + 0.05, np.arange(y0, y1, 0.1) + 0.05)
+        ix, iy, ok = grid.cells(X, Y)
+        ok = ok & keep(X, Y)
+        layer[iy[ok], ix[ok]] = 1.0
+
+    old = (EGO.rear, EGO.front, EGO.half_width, EGO.length)
+    EGO.rear, EGO.front, EGO.half_width, EGO.length = 1.0, 3.8, 0.9, 4.8
+    try:
+        trail = [np.array([-8.0, 0.0]), np.array([-4.0, 0.0])]
+        # stalls 2.7 m wide: cars in three of them, of whose lines only the ends show, then a free
+        # one of which the line at x = 8.1 is gone, then another car
+        lines = [line(0.0, -4.1), line(2.7, -4.1), line(5.4, -4.1), line(10.8, -6.5)]
+        for cars in (True, False):
+            grid = GridMap((-12.0, -14.0, 24.0, 4.0))
+            fill(grid.free, -2.0, 16.0, -3.5, 3.0)
+            fill(grid.free, 8.1, 10.8, -9.0, -3.5)
+            for x in (0.0, 2.7, 5.4, 10.8) if cars else ():
+                fill(grid.hits, x + 0.4, x + 2.3, -8.5, -4.0)
+            found = [s for s in find_slots(lines, trail, grid, True) if s.status == "free"]
+            if cars:
+                assert len(found) == 1 and found[0].by_row and found[0].kind == "perpendicular", [(s.kind, s.center.round(1)) for s in found]
+                assert np.abs(found[0].center - (9.45, -6.25)).max() < 0.06, found[0].center
+            else:               # free ground beside a line, and no car anywhere: not a stall
+                assert not found, [(s.kind, s.center.round(1)) for s in found]
+        # The car before the stall is a wide one, and of the stall's ground only a narrow wedge
+        # was seen past its corner: less than half of the first 2.5 m. But the first 1.2 m, where
+        # the front of a parked car would be, is seen empty nearly all across. Free.
+        for seen, free in ((lambda x, y: x > 8.1 + 1.1 * (-3.5 - y), True),
+                           (lambda x, y: (x > 8.1 + 1.1 * (-3.5 - y)) & (y < -4.3), False)):    # (the first 0.8 m not seen)
+            grid = GridMap((-12.0, -14.0, 24.0, 4.0))
+            fill(grid.free, -2.0, 16.0, -3.5, 3.0)
+            fill(grid.free, 8.1, 10.8, -5.7, -3.5, seen)
+            fill(grid.free, 10.2, 10.8, -6.1, -3.5)
+            for x in (0.0, 2.7, 5.4, 10.8):
+                fill(grid.hits, x + 0.4, x + 2.3, -8.5, -4.0)
+            found = [s for s in find_slots(lines, trail, grid, True) if s.status == "free"]
+            assert len(found) == free, [(s.kind, s.center.round(1)) for s in found]
+
+        # Angled stalls, 60 degrees, 3.1 m apart along the lane. The stall next to a staggered one
+        # starts 1.55 m further out, and so does the car in it: of that car the cameras saw the
+        # front only. It has to count as the neighbour, or nothing says the free place is a stall.
+        d = (0.5, -math.sqrt(0.75))
+        lines = [line(x, -4.7, -2.8, d) for x in (0.0, 3.1, 6.2, 9.3)]                    # (the line at 12.4 is gone)
+        lines += [line(x, 4.7, 2.8, (0.5, math.sqrt(0.75))) for x in np.arange(0.0, 18.0, 3.1)]      # the row across the lane
+        grid = GridMap((-12.0, -14.0, 24.0, 8.0))
+        fill(grid.free, -2.0, 20.0, -2.8, 2.8)
+        fill(grid.free, 9.0, 18.0, -8.0, -2.8, lambda x, y: (x - 9.3 > 0.5 * (-2.8 - y) / 0.866) & (x - 12.4 < 0.5 * (-2.8 - y) / 0.866))
+        for x in (0.0, 3.1, 6.2):                           # the front of the car in each stall before
+            m = np.array([x + 1.55, -2.8]) + 1.3 * np.array(d)
+            fill(grid.hits, m[0] - 0.6, m[0] + 0.6, m[1] - 0.6, m[1] + 0.6)
+        found = [s for s in find_slots(lines, trail, grid, True) if s.status == "free" and s.center[1] < 0.0]
+        assert len(found) == 1 and found[0].by_row and found[0].kind == "angled", [(s.kind, s.center.round(1)) for s in found]
+        assert sum(found[0].neighbors) == 1 and abs((found[0].center - (10.85, -2.8)) @ (0.866, 0.5)) < 0.06, (found[0].neighbors, found[0].center)
+
+        # Parallel stalls 7.2 m long along a kerb, the tick at x = 28.8 gone, a van before the free
+        # one. Beside the first tick lies a bit of something else that makes a narrow stall with
+        # it. The row is one of parallel stalls all the same: its ticks are a car's length apart.
+        lines = [line(x, -4.2, -1.8) for x in (0.0, 7.2, 14.4, 21.6, 36.0)] + [line(2.5, -4.3, -3.8)]
+        grid = GridMap((-12.0, -14.0, 50.0, 4.0))
+        fill(grid.free, -2.0, 45.0, -1.8, 3.0)
+        fill(grid.free, 28.8, 36.0, -4.2, -1.8)
+        for x in (0.0, 7.2, 14.4, 21.6):
+            fill(grid.hits, x + 0.8, x + 6.4, -4.0, -2.1)
+        X = np.arange(-1.0, 45.0, 0.1)
+        grid.add_kerb(np.stack([np.repeat(X, 2), np.tile([-4.3, -4.4], len(X))], axis=1), 0.4)
+        found = [s for s in find_slots(lines, trail, grid, True) if s.status == "free"]
+        assert len(found) == 1 and found[0].by_row and found[0].kind == "parallel", [(s.kind, s.center.round(1)) for s in found]
+        assert np.abs(found[0].center - (32.4, -3.05)).max() < 0.06, found[0].center
+    finally:
+        EGO.rear, EGO.front, EGO.half_width, EGO.length = old
+    print("a stall with one line found: ok")
+
+
 def test_parallel_stall_and_kerb():
     """A parallel stall is aligned with the kerb behind it, and not with what else was hit there."""
     def tick(x):                                          # from the lane edge at y = -1.75 to the kerb
@@ -617,6 +700,7 @@ if __name__ == "__main__":
     test_lines_in_pieces()
     test_half_seen_stall()
     test_stalls_from_their_row()
+    test_stall_with_one_line()
     test_parallel_stall_and_kerb()
     test_own_pose()
     test_worn_paint()

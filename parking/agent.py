@@ -54,7 +54,13 @@ class ParkingSim:
     MAX_REPLANS = 6
     SEARCH_REACH = 70.0      # how far along the lane the car looks for a stall [m]
     MAP = (20.0, 80.0, 15.0)     # the map covers this much behind, ahead and to each side of where the car starts [m]
-    MAX_CORRECTIONS = 2
+    MAX_CORRECTIONS = 1
+    # When the car has arrived, it is where it should be if it is this near the goal: sideways
+    # [m], along its axis [m] and in heading [rad]. The car does not know its own pose better
+    # than to 10 cm, nor the stall: asking for more makes it shuffle after noise.
+    ARRIVED = (0.20, 0.40, math.radians(3.0))
+    SETTLED = 2.0            # for the last metres of its way in, the stall is where it was taken to be [m]
+    JUMP_HOLD = 1.0          # a stall estimate that jumps is believed once it has stayed there this long [s]
 
     def __init__(self, args):
         self.args = args
@@ -76,6 +82,7 @@ class ParkingSim:
         self.state = "SETTLE"
         self.message = ""
         self.slots, self.target, self.goal = [], None, None
+        self.jump_t = None           # since when the stall estimate has stood away from the one in use
         self.path, self.seg_i = [], 0
         self.rejected = []
         self.watch = []                # recent estimates of the leading candidate stall
@@ -528,6 +535,17 @@ class ParkingSim:
         res = self.plan_result
         if res is None:
             if self.must_replan:
+                # If the car has not left the lane yet, this stall is lost and the others are
+                # not: in one run a single map cell at the mouth of the stall turned into an
+                # obstacle while the car stood and planned, with 13 free stalls further on.
+                x, y, th = self.pose
+                off = np.array([x, y]) - np.array(self.origin[:2])
+                fwd = self.travel_dir
+                if self.manual is None and self.target is not None and abs(wrap(th - self.origin[2])) < 0.2 and \
+                        abs(off[0] * fwd[1] - off[1] * fwd[0]) < 0.6 and self.SEARCH_REACH - off @ fwd > 3.0:
+                    self.path, self.seg_i, self.must_replan, self.blocked = [], 0, False, 0
+                    self._search_on("the way into that stall is blocked, searching on")
+                    return
                 self._finish(False, "the way is blocked and there is no other maneuver")
                 return
             if self.path and self.seg_i < len(self.path):
@@ -542,14 +560,7 @@ class ParkingSim:
             if self.manual is not None:
                 self._finish(False, "cannot reach that spot (blocked, or not seen to be free yet)")
                 return
-            here = np.array(self.pose[:2]) + EGO.center * self.travel_dir
-            old = [r for r in self.rejected if np.hypot(*(self.target.center - r[0])) < 1.5]
-            self.rejected = [r for r in self.rejected if r not in old]
-            self.rejected.append((self.target.center.copy(), here, 1 + sum(r[2] for r in old)))
-            self.target = None
-            self.say("no feasible maneuver into that stall, searching on")
-            self.state = "SEARCH"
-            self._follow(self._search_route(), presteer=False)
+            self._search_on("no feasible maneuver into that stall, searching on")
             return
         segs = res["segments"]
         self.goal, self.nominal = res["goal"], res["nominal"]
@@ -569,6 +580,17 @@ class ParkingSim:
         self.state = "DRIVE"
         self._follow(segs[0])
 
+    def _search_on(self, why):
+        """Give up the chosen stall for now and drive on along the lane."""
+        here = np.array(self.pose[:2]) + EGO.center * self.travel_dir
+        old = [r for r in self.rejected if np.hypot(*(self.target.center - r[0])) < 1.5]
+        self.rejected = [r for r in self.rejected if r not in old]
+        self.rejected.append((self.target.center.copy(), here, 1 + sum(r[2] for r in old)))
+        self.target = None
+        self.say(why)
+        self.state = "SEARCH"
+        self._follow(self._search_route(), presteer=False)
+
     # ---- execution -------------------------------------------------------------
 
     def _retarget(self):
@@ -581,21 +603,39 @@ class ParkingSim:
 
     def _refine(self):
         """Keep the plan attached to the stall as its line estimates improve."""
+        # Not on the last metres. What the cameras show of a stall from inside it is little, and
+        # an estimate that changes there changes for the worse as often as not: the car had
+        # parked well, the estimate moved, and two corrections later it stood 0.6 m off.
+        cur = self.path[self.seg_i]
+        rest = cur.s[-1] - cur.s[min(self.tracker.i, len(cur.s) - 1)] + sum(sg.length for sg in self.path[self.seg_i + 1:])
+        if rest < self.SETTLED:
+            return
+        held = self.target
         if not self._retarget():
             return
         new = self.target.goal(self.nose_in, self.park_dir)
         old = self.nominal
         d, dth = math.hypot(new[0] - old[0], new[1] - old[1]), abs(wrap(new[2] - old[2]))
         if d < 0.01 and dth < 0.003:
+            self.jump_t = None
             self._recentre()
             return
         if d > 0.5 or dth > 0.1:
+            # A jump may be one bad frame's worth of lines: it has to last before it is acted on.
+            self.target = held
+            if self.jump_t is None:
+                self.jump_t = self.time
+            if self.time - self.jump_t < self.JUMP_HOLD - 1e-6:
+                return
+            self.jump_t = None
+            self._retarget()
             if self.replans < self.MAX_REPLANS:
                 self.replans += 1
                 self.say("the stall estimate jumped, replanning")
                 self.tracker.stop()
                 self.state, self.t_still = "BRAKE", None
             return
+        self.jump_t = None
         a = 0.3                       # move the plan gradually so the tracker is not jerked around
         new = (old[0] + a * (new[0] - old[0]), old[1] + a * (new[1] - old[1]),
                old[2] + a * wrap(new[2] - old[2]))
@@ -663,7 +703,7 @@ class ParkingSim:
             self._follow(self.path[self.seg_i])
             return
         lon, lat, dth = self._pose_error(self.goal)
-        if (abs(lat) > 0.08 or abs(dth) > math.radians(1.5) or abs(lon) > 0.3) and \
+        if (abs(lat) > self.ARRIVED[0] or abs(lon) > self.ARRIVED[1] or abs(dth) > self.ARRIVED[2]) and \
                 self.corrections < self.MAX_CORRECTIONS:
             self.corrections += 1
             self.say("off the stall centre by %.2f m / %.1f deg, correcting" % (lat, math.degrees(dth)))

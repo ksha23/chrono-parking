@@ -694,6 +694,41 @@ A stall known from stubs alone is placed less well than one with a line of its o
 takes it only once it is level with it
 ([perception-and-mapping.md](perception-and-mapping.md#choosing-a-stall)).
 
+### One line found, the other not
+
+Sometimes one of the two lines is not found at all: worn away, or under the side of the car
+parked next to it. On seeds nobody had looked at, the car drove past the free stall for that
+reason in three runs of 45.
+
+| Run | What was found of the free stall |
+| --- | --- |
+| angled stalls, a car before it | the line next to the car, over 2.2 m. The line at the open end of the stall was not found |
+| parallel stalls, a van before it | the tick at the open end, whole. The tick beside the van was not found |
+| perpendicular stalls, a car on each side | the far line, over 3.0 m. Nothing of the near one |
+
+The row says where the missing line has to be: one stall's width along the lane from the one
+that was found. The width is that of the stalls already made out on that side, or else the
+spacing that fits the most lines of the row. Such a stall counts if
+
+- the line that was found starts at the mouth of the row and is long enough to be a line of that
+  row (1.5 m, or a tick for parallel stalls), and
+- no line was found where the other one belongs, and no stall is known there, and
+- its ground was seen to be free, and
+- there is a reason to take the place for a stall: a parked car beyond the line that was not
+  found, or a parked car beyond the one that was while the row across the lane reaches that far.
+  Beyond the last line of a row there is free ground too, and no stall.
+
+A parallel stall of this kind also needs the kerb behind it, as above. Any other kind is dropped
+if a kerb was seen less than 4 m in: whatever that place is, it does not hold the car.
+
+Which kind of stall a row is made of is read from its lines, not from the stalls found so far.
+The ticks of parallel stalls are short (no line of the row longer than 3.6 m) and a car's length
+apart (the middle one of the gaps between neighbouring lines is at least 4.5 m). In the run with
+the van, a tick and a bit of something else beside it had passed for a narrow stall, and one
+such stall had made the whole row count as perpendicular.
+
+Like a stall from two stubs, a stall from one line is taken only once the car is level with it.
+
 ### A line in pieces is one line
 
 A camera often sees a stripe in pieces. Paint wears off. And where the edge of a shadow runs
@@ -728,6 +763,10 @@ With three lines or more on a side, the mouth of the row takes the place of the 
 line seen to start 0.25 to 2 m further in than the mouth is taken from the mouth. Two lines by
 themselves can differ by 0.75 m at most before it is unclear which of them is right. A row can
 say so for 2 m.
+
+The same holds for a line that was seen to start further out than its row. In one run a line
+grew 0.7 m into the lane while the car turned in, carried on by something that looked like
+paint. The stall moved out with it, and the car set out to correct a position that was right.
 
 While the car backs in, the rear camera sees both lines of the stall at close range. The
 estimate then rests on those, and the plan follows it (see
@@ -771,6 +810,23 @@ rig a stall is free if
 - no obstacle was seen in it, and
 - at least 55 percent of its mouth and 25 percent of the whole was seen empty, and
 - the empty ground was seen at least 2 m into it.
+
+Behind a wide car the wedge is narrower than that. In one run 51 percent of the mouth and 24
+percent of the stall were seen empty, and the car drove past. A stall that is known from its row
+is taken when the car is level with it, and by then the cameras have seen all of it that they
+are going to. What is left to ask is whether a car could be standing in it. Its front would be
+in the first 1.2 m of the stall, across most of the width. So such a stall is also free if
+
+- no obstacle was seen in it, and
+- at least 75 percent of its first 1.2 m was seen empty (84 percent in that run), and
+- the empty ground was seen at least 2 m into it.
+
+Whether there is a car in the stall next to this one is asked in the same way: by obstacles
+where that car would stand. In an angled row the stalls are staggered, 1.55 m from one to the
+next at 60 degrees. The car in the stall before starts that much further out, and of it the
+cameras see the front and little else. The band that is searched follows the stagger. A band
+straight across found the car on one side by its front and on the other side nothing, and a
+free stall with a car before it then looked like free ground with no car anywhere.
 
 The planner then needs room that nobody has looked at. The region assumed free is extended to
 hold the parked car, and what is really there comes into view of the rear camera while backing
@@ -856,13 +912,15 @@ made of that data shows up in three more places:
   of the lane. Two lots at different distances from the lane on the same side would be read as
   one row.
 - **Chosen on a few scenarios.** How much lighter faint paint has to be where the network sees a
-  marking, and how a row is read, were settled on the scenarios of seeds 1 to 3. All 60 of
-  those park. Of 45 on seeds never run, 36 do, against 31 before
-  ([results.md](results.md#verification)).
-- **A stall's estimate can still move late.** With more paint seen, a stall is found more
-  often, and its estimate also changes more often while the car is on its way in. On the unseen
-  seeds one run parked 0.6 m short for that reason, and one touched something in a manoeuvre
-  that corrected a heading.
+  marking, how a row is read, and when the car is content with where it stands were settled on
+  the scenarios of seeds 1 to 3 and 10 to 12. Of those 105, 104 park. Of 45 on seeds never
+  run, 42 do, against 38 with the version before ([results.md](results.md#verification)).
+- **A stall's estimate can still jump while the car drives in.** A jump of more than 0.5 m
+  is believed once it has lasted a second, and it is not always right. On the unseen seeds one
+  stall, taken from one line and its row, was replaced on the way in by a second estimate
+  half a metre off, and the car ended over the line ([results.md](results.md#verification)).
+- **The kerb behind a stall can be placed too near.** Seen from far away it is smeared in
+  range, in one run over 1.5 m. The car then stops short and sticks out into the lane.
 - **The planner does not know the kerbs the network sees.** They limit how deep a stall is and
   nothing else. A plan can still swing the nose towards a kerb that the stereo pair has not yet
   seen as an obstacle, which it does from 4 m.
@@ -876,6 +934,17 @@ made of that data shows up in three more places:
   With the scene network they are left out ([The car's own bonnet](#the-cars-own-bonnet)).
   Without it (`--scene none`, and by default on Apple silicon) they are still there. The one run
   that showed the fault was not repeated with the network.
+- **The ground just over the edge of the bonnet reads too high.** The same pull towards the
+  bonnet reaches further than those points. In the rows of the image right above the bonnet,
+  the road 3.4 to 4 m from the camera comes out raised: by 17 cm at the edge, 10 cm four rows
+  of the range image up, 7 cm at eight rows, 4 cm at twelve to twenty, and level from 36 rows
+  on (one frame, one column, measured with the car standing). An obstacle is anything above
+  11 cm at that range. Again it takes a standing car for one cell to collect half a second of
+  it. In one run on a seed nobody had looked at, a single cell at the mouth of the chosen stall
+  became an obstacle in the 2 s the car stood and planned. The car now gives such a stall up
+  and takes the next one ([control.md](control.md#watching-the-path)). The cause is still
+  there. Leaving those rows out is not the answer by itself: it is also where the pair sees a
+  kerb at its nearest.
 - **Stray obstacle cells with the lidar.** The map of the lidar run above has a handful of
   obstacle cells in the open lane, and one false line along the side of a parked car. Where the
   cells come from was not tracked down. They did not change a run.

@@ -336,7 +336,12 @@ plan was made for.
   where `l` is the path length from a point to the goal. Points within 4 m of the goal move fully,
   points more than 9 m away stay put, and the weight is continuous across cusps. The far part of
   the plan, which was checked against obstacles, is not disturbed.
-- **Large change** (over 0.5 m or 0.1 rad). The car stops and replans.
+- **Large change** (over 0.5 m or 0.1 rad). The car stops and replans, if the estimate has stayed
+  at its new place for a second. Until then the plan keeps the stall it was made for. A jump may
+  be one bad frame's worth of lines.
+- **On the last 2 m of the way in**, nothing is changed any more. What the cameras show of a
+  stall from inside it is little, and an estimate that moves there moves for the worse as often
+  as not.
 
 **Back to the centre.** The planner may have put the goal off the stall centre, to stay clear of
 something the map showed there (see [planning.md](planning.md#goal-pose-and-docking-run)). With
@@ -350,8 +355,8 @@ positions from 10 to 20 cm off centre to under 1 cm.
 ## Watching the path
 
 Each perception tick, `_monitor` places the footprint at every third remaining path sample and
-tests it against the occupied cells. Two consecutive hits make the car stop and replan. If no plan
-exists the run fails. It does not drive a path it knows to be blocked.
+tests it against the occupied cells. Two consecutive hits make the car stop and replan. It does
+not drive a path it knows to be blocked.
 
 With a sensor rig the test is made twice. The footprint as it is decides whether the path is
 blocked, as above. The footprint grown by `min(0.10, plan margin - 0.03)` m decides whether an
@@ -360,8 +365,21 @@ happens when a far obstacle comes close and is placed properly. That also makes 
 look for a better plan, once per plan. If there is none, it carries on with the plan it has, which
 is still drivable.
 
-After the last segment the pose is compared with the goal. More than 8 cm sideways, 1.5 degrees
-or 30 cm lengthwise triggers a correction plan, at most twice.
+If the car has not left the lane yet when its path is blocked and no other plan exists, the run
+does not fail: the stall goes on the rejected list and the car searches on. In one run a single
+map cell at the mouth of the chosen stall turned into an obstacle while the car stood and
+planned ([sensors.md](sensors.md#limits)), in a lot with 13 more free stalls.
+
+After the last segment the pose is compared with the goal. More than 20 cm sideways, 3 degrees
+or 40 cm lengthwise triggers a correction plan, once.
+
+Those tolerances were 8 cm, 1.5 degrees and 30 cm, with two corrections. With a sensor rig that
+asks for more than the car knows. Its own pose is good to about 10 cm, and the stall is placed
+no better. A car that stood 9 cm off a goal that was itself 10 cm off set out again, came to
+rest where the estimate had been a moment before, and set out once more. In four runs of 45 on
+seeds nobody had looked at, the car had parked well and then shuffled its way out of the stall:
+up to nine gear changes, and an end position 0.6 m too far out. A driver who is within a hand's
+width of the middle of a stall stays there.
 
 ## Limits
 

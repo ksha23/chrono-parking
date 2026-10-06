@@ -95,7 +95,8 @@ stateDiagram-v2
     BRAKE --> PLAN: standing still for 0.3 s
     PLAN --> DRIVE: plan found
     PLAN --> SEARCH: no plan, stall rejected
-    PLAN --> FAILED: blocked and no alternative
+    PLAN --> SEARCH: blocked while still on the lane, stall rejected
+    PLAN --> FAILED: blocked in mid-maneuver and no alternative
     DRIVE --> DRIVE: next segment (gear change)
     DRIVE --> BRAKE: stall estimate jumped, or path blocked
     DRIVE --> PLAN: end pose out of tolerance (correction)
@@ -116,16 +117,19 @@ stateDiagram-v2
 
 Three events can interrupt `DRIVE`:
 
-1. The estimate of the target stall moves by more than 0.5 m or 0.1 rad. The car stops and replans.
-   Smaller movements do not interrupt anything. They shift the end of the plan gradually (see
+1. The estimate of the target stall moves by more than 0.5 m or 0.1 rad and stays there for a
+   second. The car stops and replans. Smaller movements do not interrupt anything. They shift the
+   end of the plan gradually, until the last 2 m of the way in (see
    [control.md](control.md#keeping-the-plan-attached-to-the-stall)).
 2. Newly seen obstacle cells lie inside the footprint along the remaining path, on two consecutive
-   perception ticks. The car stops and replans. If no plan exists, the run fails instead of driving
-   a blocked path. With a sensor rig the footprint is grown by a margin for this test, because a
-   camera places an obstacle exactly only once it is close
+   perception ticks. The car stops and replans. If no plan exists, it does not drive a blocked
+   path: it searches on if it has not left the lane yet, and the run fails otherwise. With a
+   sensor rig the footprint is grown by a margin for this test, because a camera places an
+   obstacle exactly only once it is close
    ([sensors.md](sensors.md#the-monitor-looks-for-margin)).
-3. After the last segment, the pose is more than 0.08 m sideways, 1.5 degrees, or 0.3 m lengthwise
-   from the goal. The car plans a correction, at most twice.
+3. After the last segment, the pose is more than 0.20 m sideways, 3 degrees, or 0.4 m lengthwise
+   from the goal. The car plans a correction, once
+   ([control.md](control.md#watching-the-path)).
 
 ## Coordinates and conventions
 

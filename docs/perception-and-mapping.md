@@ -232,7 +232,7 @@ parallel) so that a neighbour parked close to the line does not count:
 | Result | Condition |
 | --- | --- |
 | occupied | at least 4 occupied cells inside |
-| free | at most 1 occupied cell **and** enough of the stall seen free for half a second or more: 60 percent of it, or 80 percent of its first 2.5 m and 30 percent overall. With a sensor rig also: 55 percent of its first 2.5 m, 25 percent overall, and free ground seen 2 m into it |
+| free | at most 1 occupied cell **and** enough of the stall seen free for half a second or more: 60 percent of it, or 80 percent of its first 2.5 m and 30 percent overall. With a sensor rig also: 55 percent of its first 2.5 m, 25 percent overall, and free ground seen 2 m into it. For a stall known from its row, which is taken when the car is level with it: 75 percent of its first 1.2 m and free ground seen 2 m into it |
 | unknown | anything else |
 
 "Free" needs positive evidence. A stall the car has not looked into yet is unknown, not free. For
@@ -244,7 +244,8 @@ for a rig whose only range sensor with two cameras looks forward. It sees an emp
 wedge, see [sensors.md](sensors.md#free-means-a-wedge-of-the-mouth-is-empty).
 
 The same pass counts occupied cells just outside each line, which tells whether there is a
-neighbour on each side.
+neighbour on each side. Beside an angled stall the band that is searched follows the stagger
+of the row ([sensors.md](sensors.md#free-means-a-wedge-of-the-mouth-is-empty)).
 
 ## Choosing a stall
 
@@ -252,7 +253,8 @@ neighbour on each side.
 
 1. Candidates are stalls that are free, whose two lines have both been watched for 0.65 s, that
    have not been rejected by the planner before, and that lie between 8 m behind and 10 m ahead
-   of the car. A stall that is known only from two stubs and its row is a candidate once the
+   of the car. A stall that is known only from its row, by two stubs or by one line
+   ([sensors.md](sensors.md#one-line-found-the-other-not)), is a candidate once the
    car is level with it, its middle at most 1 m ahead of the car's: until then more of its far
    line is still coming into view. Taken from 2 to 4 m before that, such a stall was placed
    badly enough that the car needed five to nine gear changes to get into it, where two do.
