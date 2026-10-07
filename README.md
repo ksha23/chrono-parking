@@ -191,6 +191,7 @@ parking_sim.py                  entry point: python parking_sim.py [options]
 parking/
   cli.py                        options, the tour, the main loop
   agent.py                      the parking agent: one state machine from search to parked
+  agent_plan.py, agent_drive.py its two longer parts: the plan into a stall, and keeping the plan on the stall
   chrono_env.py                 finds and imports PyChrono
   config.py, vehicle.py         rates and speeds, the car as read from the Chrono model
   geometry.py                   footprints and distances

@@ -1,13 +1,16 @@
-"""The parking agent: perception, map, stall decision, plan and tracking, as one state machine."""
+"""The parking agent: perception, map, stall decision, plan and tracking, as one state machine.
+
+How a plan into a stall is made is in agent_plan.py. How the plan is kept on its stall while the
+car drives in, and watched, is in agent_drive.py."""
 
 import math
 import os
 import sys
-import threading
-import time
 
 import numpy as np
 
+from .agent_drive import DriveIn
+from .agent_plan import PlanStall
 from .chrono_env import veh
 from .config import A_BRAKE, CONTROL_DT, PERCEPTION_DT, STEER_RATE, STEP, V_SEARCH
 from .control import MpcTracker
@@ -15,7 +18,7 @@ from .geometry import ego_poly, footprint_hits, poly_distance, wrap
 from .mapping import GridMap, LineMap
 from .localization import Localization
 from .perception import Perception
-from .planner import CSpace, Planner, Segment, holonomic_distance, split_segments
+from .planner import Planner, Segment
 from .scenario import make_scenario
 from .networks import DepthWorker, find_depth_python
 from .sensors import SensorRig
@@ -50,8 +53,7 @@ def start_depth_worker(args):
         sys.exit("[parking] %s" % exc)
 
 
-class ParkingSim:
-    MAX_REPLANS = 6
+class ParkingSim(PlanStall, DriveIn):
     SEARCH_REACH = 70.0      # how far along the lane the car looks for a stall [m]
     MAP = (20.0, 80.0, 15.0)     # the map covers this much behind, ahead and to each side of where the car starts [m]
     MAX_CORRECTIONS = 1
@@ -59,29 +61,6 @@ class ParkingSim:
     # [m], along its axis [m] and in heading [rad]. The car does not know its own pose better
     # than to 10 cm, nor the stall: asking for more makes it shuffle after noise.
     ARRIVED = (0.20, 0.40, math.radians(3.0))
-    SETTLED = 2.0            # for the last metres of its way in, the stall is where it was taken to be [m]
-    # The estimate of the chosen stall is followed while it stays this near to where the stall
-    # was when the plan was made, across the stall [m] and in direction [rad]. An estimate
-    # further off than that is another reading of the paint, not a better one of the same: of
-    # those that were looked at, each was wrong.
-    #
-    # Along the stall it is followed one way only: towards the lane. Paint that is seen is
-    # there. Paint that is not seen may be worn, in a shadow or behind something, so a stall
-    # may turn out to begin nearer to the lane than it was taken to, and not further in. In 21
-    # runs the estimate moved by up to 30 cm either way while the car drove in. Followed
-    # wherever it went, the car ended 12 cm off in depth on average and 34 cm at worst.
-    # Followed towards the lane only, by the same numbers, 7 cm and 18 cm. Not followed at
-    # all, 9 cm and 21 cm, and in one run 84 cm: that stall had been taken 0.9 m too deep.
-    # (A parallel stall is not followed at all across the kerb: see _toward_lane.)
-    FOLLOW = (0.5, 0.1)
-    # Parallel parking: the car may not come nearer to the kerb than its side will be when it
-    # is parked, plus this much with its front corners and this much with its rear ones [m].
-    # The room for the maneuver is on the street. What lies beyond the stall is a kerb whether
-    # or not anything has seen it, and a camera cannot tell it from the road until it is close.
-    # Backing in between two cars takes the rear corner 10 cm beyond where the side ends up.
-    # The nose needs nothing there, and it is where an error in heading shows: 3 degrees are
-    # 20 cm at the front corner. So the car backs in, and does not drive in nose first.
-    KERB_SIDE = (0.05, 0.15)
 
     def __init__(self, args):
         self.args = args
@@ -436,360 +415,8 @@ class ParkingSim:
             self.tracker.stop()
             self.state, self.t_still = "BRAKE", None
 
-    # ---- planning --------------------------------------------------------------
-
-    def _goal_spec(self):
-        """What the planner should aim for: the chosen stall, or the pose the user asked for."""
-        if self.target is not None:
-            s = self.target
-            nominal = self._held_goal(s)
-            if s.kind == "parallel":     # reverse in, then pull forward to the middle of the stall
-                return dict(kind=s.kind, nominal=nominal, u=s.u_in, signs=(1.0,), runs=(1.6, 1.1, 0.6, 0.0),
-                            trials=sorted((abs(a) + 2.0 * b, a, b) for a in np.arange(-0.6, 0.61, 0.1)
-                                          for b in np.arange(0.0, 0.31, 0.05)),
-                            margins=((0.20, 0.30), (0.12, 0.22), (0.10, 0.18)) if isinstance(self.sensor, SensorRig)
-                            else ((0.12, 0.22), (0.08, 0.15), (0.06, 0.12)))
-            return dict(kind=s.kind, nominal=nominal, u=s.u_in, signs=(1.0 if self.nose_in else -1.0,),
-                        runs=(3.5, 2.5, 1.5, 0.8),
-                        trials=sorted((abs(a) + b, a, b) for a in np.arange(-0.3, 0.31, 0.05)
-                                      for b in np.arange(0.0, 0.61, 0.15)),
-                        margins=((0.30, 0.35), (0.20, 0.25), (0.12, 0.15)) if isinstance(self.sensor, SensorRig)
-                        else ((0.25, 0.30), (0.15, 0.20), (0.08, 0.12)))
-        x, y, th = self.manual
-        nominal = (x - EGO.center * math.cos(th), y - EGO.center * math.sin(th), th)
-        return dict(kind="manual", nominal=nominal, u=np.array([math.cos(th), math.sin(th)]),
-                    signs=(1.0, -1.0), runs=(3.0, 2.0, 1.2, 0.6, 0.0),
-                    trials=sorted((abs(a) + abs(b), a, b) for a in np.arange(-0.2, 0.21, 0.1)
-                                  for b in np.arange(-0.2, 0.21, 0.1)),
-                    margins=((0.25, 0.30), (0.15, 0.20), (0.08, 0.12)))
-
-    def _held_goal(self, s):
-        """The pose to park at in stall s, as it is estimated now: across the stall and in
-        direction by that estimate, and along the stall no further in than the first plan had
-        it or any estimate since (FOLLOW)."""
-        goal = s.goal(self.nose_in, self.park_dir)
-        if self.planned is None:
-            return goal
-        u = np.array([math.cos(self.planned[1]), math.sin(self.planned[1])])
-        back = float((s.center - self.planned[0]) @ u)
-        return (goal[0] - back * u[0], goal[1] - back * u[1], goal[2])
-
-    def _toward_lane(self):
-        """Where along the stall the car is to stand moves with the estimate if that puts the
-        stall nearer to the lane, a third of the way per look, and stays if it does not. Not
-        beside a kerb: how far a parallel stall is from the kerb was seen while the car drove
-        up, and nothing sees the kerb while it backs in. (Followed towards the street, one such
-        estimate took the car 0.58 m out of its stall.)"""
-        if self.planned is None or self.target is None or self.target.kind == "parallel":
-            return
-        u = np.array([math.cos(self.planned[1]), math.sin(self.planned[1])])
-        back = float((self.target.center - self.planned[0]) @ u)
-        if back < 0.0:
-            self.planned = (self.planned[0] + 0.3 * back * u, self.planned[1])
-
-    def _request_plan(self):
-        occ = self.grid.blocked()
-        region = self.target.region if self.target is not None else self._box_cells(0.3)
-        if region is not None:       # the chosen spot was judged free (by the map, or by the user)
-            mask, sl = region
-            if isinstance(self.sensor, SensorRig) and self.target is not None and self.target.kind == "parallel":
-                # A parallel stall lies open to the lane: what a camera has not seen of it is small.
-                # Only fill gaps, within 0.5 m of ground seen to be free. Its far side is the kerb,
-                # which a camera cannot tell from the road until it is close.
-                mask = mask & self.grid.grow(self.grid.seen_free(), 5)[sl]
-            occ[sl] &= ~mask | self.grid.occupied()[sl]
-        self.state = "PLAN"
-        self.odo.hold(True)            # (also for a spot the user asked for)
-        self.say("planning ...")
-        self.plan_result = None
-        self._plan_wall = time.time()
-        job = (self.pose, self._goal_spec(), occ)
-        self.plan_thread = threading.Thread(target=self._plan_job, args=job, daemon=True)
-        self.plan_thread.start()
-        if self.args.headless:
-            self.plan_thread.join()
-
-    def _plan_job(self, start, spec, occ):
-        try:
-            best = None
-            for k, (m_lat, m_lon) in enumerate(spec["margins"]):
-                self.planner.max_iter = 30000 if k == len(spec["margins"]) - 1 else 12000
-                res = self._plan_once(start, spec, occ, m_lat, m_lon)
-                if res is None:
-                    if best is not None:
-                        break
-                    continue
-                if best is None:
-                    # A wider margin comes first, but not at any price. With 0.30 m one stall
-                    # was to be had by 36 m of driving in five pieces, and with 0.20 m by 18 m
-                    # in four: a plan of more than three pieces is held against the next
-                    # margin, once, and gives way if that one is simpler and much the cheaper.
-                    best = res
-                    if len(res["segments"]) <= 3:
-                        break
-                    continue
-                if len(res["segments"]) < len(best["segments"]) and res["stats"]["cost"] < 0.7 * best["stats"]["cost"]:
-                    best = res
-                break
-            if best is not None:
-                self.plan_result = best
-        except Exception:             # never leave the main loop waiting on a dead thread
-            import traceback
-            traceback.print_exc()
-
-    def _plan_once(self, start, spec, occ, m_lat, m_lon):
-        g, res = self.grid, self.grid.RES
-        nominal = spec["nominal"]
-        win = 13.0
-        i0 = max(0, int((min(start[0], nominal[0]) - win - g.x0) / res))
-        i1 = min(g.nx, int((max(start[0], nominal[0]) + win - g.x0) / res))
-        j0 = max(0, int((min(start[1], nominal[1]) - win - g.y0) / res))
-        j1 = min(g.ny, int((max(start[1], nominal[1]) + win - g.y0) / res))
-        sub = occ[j0:j1, i0:i1]
-        wx0, wy0 = g.x0 + i0 * res, g.y0 + j0 * res
-        cs = CSpace(sub, wx0, wy0, res, m_lat, m_lon)
-        if spec["kind"] == "parallel":
-            # Not towards the kerb (KERB_SIDE). The line is that of the kerb-side edge of the
-            # car where it will stand. A car that is beyond the allowance already, after a
-            # docking run that ended a few degrees off, may not go further.
-            th = nominal[2]
-            at = (nominal[0] + EGO.center * math.cos(th), nominal[1] + EGO.center * math.sin(th))
-            cs.keep_off(at, spec["u"], 0.0, 0.0)
-            f0, r0 = cs.reach(*start)
-            cs.keep_off(at, spec["u"], max(EGO.half_width + self.KERB_SIDE[0], f0 + 0.02),
-                        max(EGO.half_width + self.KERB_SIDE[1], r0 + 0.02))
-        if cs.query(*start) == CSpace.HARD:
-            return None
-        edge = sub.copy()                      # only the rim of the blocked regions matters
-        edge[1:-1, 1:-1] &= ~(sub[:-2, 1:-1] & sub[2:, 1:-1] & sub[1:-1, :-2] & sub[1:-1, 2:])
-        jy, ix = np.nonzero(edge)
-        pts = np.stack([wx0 + (ix + 0.5) * res, wy0 + (jy + 0.5) * res], axis=1)
-        tight = min(m_lat, 0.12)
-
-        # Final pose: the nominal one, nudged just enough to clear what is actually there. The
-        # maneuver ends with a straight run along the stall axis (the docking run), so the
-        # search aims at the start of that run.
-        th = nominal[2]
-        h = np.array([math.cos(th), math.sin(th)])
-        if spec["kind"] == "manual":
-            u, nu = -h, np.array([-h[1], h[0]])            # trials: a sideways, b along the box
-        else:
-            u, nu = spec["u"], np.array([-spec["u"][1], spec["u"][0]])   # b: back out of the stall
-        best = None
-        for sign in spec["signs"]:
-            goal = None
-            for _, a, b in spec["trials"]:
-                shift = (a, b)
-                p = (nominal[0] + a * nu[0] - b * u[0], nominal[1] + a * nu[1] - b * u[1], th)
-                if footprint_hits(np.array([p]), pts, tight)[0] or sub[
-                        min(max(int((p[1] - wy0) / res), 0), sub.shape[0] - 1),
-                        min(max(int((p[0] - wx0) / res), 0), sub.shape[1] - 1)]:
-                    continue
-                for dock in spec["runs"]:
-                    q = (p[0] - sign * dock * h[0], p[1] - sign * dock * h[1], th)
-                    n = int(dock / 0.2) + 1
-                    line = np.stack([np.linspace(q[0], p[0], n), np.linspace(q[1], p[1], n), np.full(n, th)], axis=1)
-                    if cs.query(*q) != CSpace.HARD and not footprint_hits(line, pts, tight).any():
-                        goal, pre = p, q
-                        break
-                if goal is not None:
-                    break
-            if goal is None:
-                continue
-            h2d, cell = holonomic_distance(sub, res, pre[:2], wx0, wy0)
-            docking = dict(goal=goal, sign=sign, length=dock) if dock > 0.0 else None
-            rows = self.planner.search(start, pre, cs, h2d, cell, docking)
-            if rows is None:
-                continue
-            stats = dict(self.planner.stats)
-            segs = split_segments(start, rows) if len(rows) else []
-            if any(footprint_hits(sg.poses(), pts, 0.03).any() for sg in segs):
-                continue
-            if best is None or stats["cost"] < best["stats"]["cost"]:
-                best = dict(segments=segs, goal=goal, nominal=nominal, margin=m_lat, stats=stats, shift=shift,
-                            explored=self.planner.explored)
-        return best
-
-    def _plan_done(self):
-        self.plan_time += time.time() - self._plan_wall
-        res = self.plan_result
-        if res is None:
-            if self.must_replan:
-                # If the car has not left the lane yet, this stall is lost and the others are
-                # not: in one run a single map cell at the mouth of the stall turned into an
-                # obstacle while the car stood and planned, with 13 free stalls further on.
-                x, y, th = self.pose
-                off = np.array([x, y]) - np.array(self.origin[:2])
-                fwd = self.travel_dir
-                if self.manual is None and self.target is not None and abs(wrap(th - self.origin[2])) < 0.2 and \
-                        abs(off[0] * fwd[1] - off[1] * fwd[0]) < 0.6 and self.SEARCH_REACH - off @ fwd > 3.0:
-                    self.path, self.seg_i, self.must_replan, self.blocked = [], 0, False, 0
-                    self._search_on("the way into that stall is blocked, searching on")
-                    return
-                self._finish(False, "the way is blocked and there is no other maneuver")
-                return
-            if self.path and self.seg_i < len(self.path):
-                self.say("no better plan found, continuing with the current one")
-                self.state = "DRIVE"
-                self.gear_changes += 1
-                self._follow(self.path[self.seg_i])
-                return
-            if self.path:      # a final correction was not possible: stay where we are
-                self._finish(True, "parked (no room to correct further)")
-                return
-            if self.manual is not None:
-                self._finish(False, "cannot reach that spot (blocked, or not seen to be free yet)")
-                return
-            self._search_on("no feasible maneuver into that stall, searching on")
-            return
-        segs = res["segments"]
-        self.goal, self.nominal = res["goal"], res["nominal"]
-        if self.target is not None and self.planned is None:
-            self.planned = (self.target.center.copy(), math.atan2(self.target.u_in[1], self.target.u_in[0]))
-        self.blocked, self.must_replan, self.watch_margin = 0, False, True
-        self.plan_info = dict(res["stats"], margin=res["margin"], explored=res["explored"])
-        st = res["stats"]
-        a, b = res["shift"]
-        moved = "" if abs(a) < 0.01 and abs(b) < 0.01 else \
-            ", goal shifted %.2f m sideways and %.2f m outward to stay clear" % (abs(a), b)
-        self.say("plan: %s  (%d expansions, %.1f s, margin %.2f m)" % (
-            " + ".join("%s %.1f m" % ("fwd" if s.dir > 0 else "rev", s.length) for s in segs) or "already there",
-            st["iterations"], time.time() - self._plan_wall, res["margin"]) + moved)
-        self.path, self.seg_i = segs, 0
-        if not segs:
-            self._finish(True, "parked")
-            return
-        # What the monitor will hold the plan to: 3 cm less than the margin it was planned with,
-        # 10 cm at most, and no more than the plan has. The collision table knows a pose to a
-        # cell and 3 degrees, so a fresh plan can pass a cell nearer than its margin says, and
-        # asked for the full margin the monitor sent such a plan back at once, six times in a row.
-        self.near_margin = 0.0
-        if isinstance(self.sensor, SensorRig):
-            self.near_margin = min(0.10, res["margin"] - 0.03)
-            pts = self.grid.occupied_points()
-            pts = pts[np.hypot(pts[:, 0] - self.pose[0], pts[:, 1] - self.pose[1]) < 25.0] if len(pts) else pts
-            poses = np.concatenate([sg.poses() for sg in segs])
-            while self.near_margin > 0.0 and len(pts) and footprint_hits(poses, pts, self.near_margin).any():
-                self.near_margin = max(self.near_margin - 0.03, 0.0)
-        self.state = "DRIVE"
-        self._follow(segs[0])
-
-    def _search_on(self, why):
-        """Give up the chosen stall for now and drive on along the lane."""
-        here = np.array(self.pose[:2]) + EGO.center * self.travel_dir
-        old = [r for r in self.rejected if np.hypot(*(self.target.center - r[0])) < 1.5]
-        self.rejected = [r for r in self.rejected if r not in old]
-        self.rejected.append((self.target.center.copy(), here, 1 + sum(r[2] for r in old)))
-        self.target = None
-        self.planned = None
-        self.say(why)
-        self.state = "SEARCH"
-        self.odo.hold(False)
-        self.pose = self.odo.update(self.true_pose, self.time, self.world.wheel_travel())
-        self._follow(self._search_route(), presteer=False)
 
     # ---- execution -------------------------------------------------------------
-
-    def _retarget(self):
-        """Follow the chosen stall through the stream of fresh stall estimates. Once a plan has
-        been made for it, only as far as FOLLOW from where it was then."""
-        cand = [s for s in self.slots if s.kind == self.target.kind and
-                np.hypot(*(s.center - self.target.center)) < 1.2]
-        if self.planned is not None and self.path:
-            across = np.array([-math.sin(self.planned[1]), math.cos(self.planned[1])])
-            cand = [s for s in cand if abs((s.center - self.planned[0]) @ across) < self.FOLLOW[0] and
-                    abs(wrap(math.atan2(s.u_in[1], s.u_in[0]) - self.planned[1])) < self.FOLLOW[1]]
-        if cand:
-            self.target = min(cand, key=lambda s: np.hypot(*(s.center - self.target.center)))
-            if self.path:
-                self._toward_lane()
-        return bool(cand)
-
-    def _refine(self):
-        """Keep the plan attached to the stall as its line estimates improve."""
-        # Not on the last metres. What the cameras show of a stall from inside it is little, and
-        # an estimate that changes there changes for the worse as often as not: the car had
-        # parked well, the estimate moved, and two corrections later it stood 0.6 m off.
-        cur = self.path[self.seg_i]
-        rest = cur.s[-1] - cur.s[min(self.tracker.i, len(cur.s) - 1)] + sum(sg.length for sg in self.path[self.seg_i + 1:])
-        if rest < self.SETTLED:
-            return
-        if not self._retarget():
-            return
-        new = self._held_goal(self.target)
-        old = self.nominal
-        d, dth = math.hypot(new[0] - old[0], new[1] - old[1]), abs(wrap(new[2] - old[2]))
-        if d < 0.01 and dth < 0.003:
-            self._recentre()
-            return
-        a = 0.3                       # move the plan gradually so the tracker is not jerked around
-        new = (old[0] + a * (new[0] - old[0]), old[1] + a * (new[1] - old[1]),
-               old[2] + a * wrap(new[2] - old[2]))
-        beyond = 0.0
-        for seg in reversed(self.path[self.seg_i:]):
-            seg.reanchor(old, new, beyond)
-            beyond += seg.length
-        c, s = math.cos(new[2] - old[2]), math.sin(new[2] - old[2])
-        dx, dy = self.goal[0] - old[0], self.goal[1] - old[1]
-        self.goal = (new[0] + dx * c - dy * s, new[1] + dx * s + dy * c, wrap(self.goal[2] + new[2] - old[2]))
-        self.nominal = new
-        self._recentre()
-
-    def _recentre(self):
-        """A goal that was planned off the stall centre, to stay clear of something the map showed
-        there, goes back towards the centre once the map says the way is clear. From a distance a
-        camera places the side of a parked car to a decimetre or two. Up close it knows better."""
-        off = np.array(self.goal[:2]) - np.array(self.nominal[:2])
-        cur = self.path[self.seg_i]
-        rest = cur.s[-1] - cur.s[min(self.tracker.i, len(cur.s) - 1)] + sum(sg.length for sg in self.path[self.seg_i + 1:])
-        if np.hypot(*off) < 0.02 or rest < 3.0:          # (the car needs some distance to follow the move)
-            return
-        step = off * max(0.3, min(1.0, 0.02 / np.hypot(*off)))
-        cand = (self.goal[0] - step[0], self.goal[1] - step[1], self.goal[2])
-        left = self.path[self.seg_i:]
-        was = [(seg.x.copy(), seg.y.copy(), seg.th.copy()) for seg in left]
-        beyond = 0.0
-        for seg in reversed(left):
-            seg.reanchor(self.goal, cand, beyond)
-            beyond += seg.length
-        # Not if that brings any of what is left of the path within 12 cm of an obstacle, or
-        # nearer than the monitor allows. (Only the goal used to be looked at. The goal can
-        # have been put off centre for the sake of the run up to it: moved back, the path was
-        # nearer to an obstacle than the monitor allows, and the car stopped to plan again.)
-        pts = self.grid.occupied_points()
-        if len(pts):
-            pts = pts[np.hypot(pts[:, 0] - cand[0], pts[:, 1] - cand[1]) < 25.0]
-            poses = np.concatenate([left[0].poses(self.tracker.i)] + [seg.poses() for seg in left[1:]])
-            if len(pts) and footprint_hits(poses, pts, max(0.12, self.near_margin + 0.02)).any():
-                for seg, (x, y, th) in zip(left, was):
-                    seg.x, seg.y, seg.th = x, y, th
-                return
-        self.goal = cand
-
-    def _monitor(self):
-        """Stop and replan if newly seen obstacles are in the way of the remaining path."""
-        pts = self.grid.occupied_points()
-        if len(pts) == 0:
-            return
-        poses = [self.path[self.seg_i].poses(self.tracker.i)] + [s.poses() for s in self.path[self.seg_i + 1:]]
-        poses = np.concatenate(poses)
-        near = pts[np.hypot(pts[:, 0] - self.pose[0], pts[:, 1] - self.pose[1]) < 25.0]
-        hard = bool(footprint_hits(poses, near, 0.0).any())
-        # With cameras, an obstacle is only placed exactly once it is close, often after the plan
-        # was made: also react when it turns out to be nearer to the path than the plan allowed
-        # for. That asks for a better plan. If there is none, the current one is still drivable.
-        margin = self.near_margin
-        close = not hard and margin > 0.0 and self.watch_margin and self.replans < self.MAX_REPLANS and \
-            bool(footprint_hits(poses, near, margin).any())
-        self.blocked = self.blocked + 1 if hard or close else 0
-        if self.blocked >= 2:
-            self.replans += 1
-            self.must_replan = hard            # the current plan cannot be driven any further
-            self.watch_margin = hard           # (asked once per plan)
-            self.say("the path is blocked by something newly seen, replanning" if hard else
-                     "an obstacle is nearer to the path than planned for, replanning")
-            self.tracker.stop()
-            self.state, self.t_still = "BRAKE", None
 
     def _segment_done(self):
         self.seg_i += 1

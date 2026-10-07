@@ -154,7 +154,9 @@ agent, and `cli.py` starts one or both.
 | Module | Lines | Main names |
 | --- | --- | --- |
 | `cli.py` | 192 | `parse_args`, `main` |
-| `agent.py` | 850 | `ParkingSim` (state machine, decision, planning requests, refinement, monitor) |
+| `agent.py` | 477 | `ParkingSim` (state machine, search, decision, the spot the user points at, the score) |
+| `agent_plan.py` | 250 | `PlanStall`: the part of `ParkingSim` that asks for a plan into the stall and takes it up |
+| `agent_drive.py` | 153 | `DriveIn`: the part of `ParkingSim` that keeps the plan on its stall while it is driven (refinement, monitor) |
 | `chrono_env.py` | 87 | the PyChrono imports, and the rerun in a Python that has PyChrono |
 | `config.py` | 20 | `STEP`, `CONTROL_DT`, `PERCEPTION_DT`, speeds and acceleration limits |
 | `vehicle.py` | 51 | `Ego`, `EGO` (geometry, mass and limits read from the Chrono model) |
