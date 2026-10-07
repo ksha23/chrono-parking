@@ -565,6 +565,24 @@ def test_stall_with_one_line():
             found = [s for s in find_slots(lines, trail, grid, True) if s.status == "free"]
             assert len(found) == free, [(s.kind, s.center.round(1)) for s in found]
 
+        # The last stall of a row, with open ground beyond it. The row's last line is worn away,
+        # and of the line between the last car and the stall only the end at the lane shows. That
+        # stub is the line of a stall already made out (the last car's), so it is a stall's line.
+        # The row across the lane goes on that far, and so the free place is a stall.
+        for across in (True, False):
+            lines = [line(0.0, -4.1), line(2.7, -4.1), line(5.4, -4.1)]
+            lines += [line(x, 6.5, 3.5, (0.0, 1.0)) for x in np.arange(0.0, 11.0, 2.7)] if across else []
+            grid = GridMap((-12.0, -14.0, 24.0, 8.0))
+            fill(grid.free, -2.0, 16.0, -3.5, 3.5)
+            fill(grid.free, 5.4, 12.0, -9.0, -3.5)
+            for x in (0.0, 2.7):
+                fill(grid.hits, x + 0.4, x + 2.3, -8.5, -4.0)
+            found = [s for s in find_slots(lines, trail, grid, True) if s.status == "free" and s.center[1] < 0.0]
+            if across:
+                assert len(found) == 1 and found[0].by_row and np.abs(found[0].center - (6.75, -6.25)).max() < 0.06, [(s.kind, s.center.round(2)) for s in found]
+            else:               # nothing says the row goes on: beyond the last car there may be anything
+                assert not found, [(s.kind, s.center.round(1)) for s in found]
+
         # Angled stalls, 60 degrees, 3.1 m apart along the lane. The stall next to a staggered one
         # starts 1.55 m further out, and so does the car in it: of that car the cameras saw the
         # front only. It has to count as the neighbour, or nothing says the free place is a stall.
@@ -598,6 +616,89 @@ def test_stall_with_one_line():
     finally:
         EGO.rear, EGO.front, EGO.half_width, EGO.length = old
     print("a stall with one line found: ok")
+
+
+def test_hold_and_speed():
+    """Parking by the wheels, not by the receiver's position, and at a speed the steering can follow."""
+    from parking.planner import Segment
+    # A car that drives 12 m, backs 8 m along an arc and pulls forward 2 m, in 40 s. Held from
+    # the 5th second, its pose moves with it to a few centimetres. The receiver wanders on.
+    def drive(hold_at, release_at=None, seed=5):
+        loc = Localization((0.0, 0.0, 0.0), np.random.default_rng(seed), "gps", 1.0)
+        x = y = th = 0.0
+        out = []
+        for k in range(1, 4001):
+            t = 0.01 * k
+            v = 1.0 if t < 12.0 else (-0.8 if t < 22.0 else (0.5 if 30.0 < t < 34.0 else 0.0))
+            w = 0.12 * v if 12.0 <= t < 22.0 else 0.0
+            x, y, th = x + v * math.cos(th) * 0.01, y + v * math.sin(th) * 0.01, th + w * 0.01
+            if hold_at is not None and abs(t - hold_at) < 0.005:
+                loc.hold(True)
+            if release_at is not None and abs(t - release_at) < 0.005:
+                loc.hold(False)
+            pose = loc.update((x, y, th), t)
+            out.append((pose[0] - x, pose[1] - y, wrap(pose[2] - th)))
+        return np.array(out)
+    free, held = drive(None), drive(5.0)
+    wander = np.hypot(*(free[500:, :2] - free[500, :2]).T).max()
+    kept = np.hypot(*(held[500:, :2] - held[500, :2]).T).max()
+    assert kept < 0.06 and wander > 2.0 * kept, "held %.3f m, receiver %.3f m" % (kept, wander)
+    assert np.allclose(held[:, 2], free[:, 2]), "the heading stays the receiver's"
+    assert np.allclose(held[:499], free[:499]) and np.allclose(drive(5.0, 20.0)[2100:], free[2100:]), "the receiver's error is its own"
+    old = (EGO.wheelbase,)
+    EGO.wheelbase = 2.78
+    try:
+        # full lock one way for 1 m, then full lock the other way: slow there, and slowing in time
+        k = np.concatenate([np.full(10, 0.168), np.full(50, -0.168)])
+        s = 0.1 * np.arange(60)
+        seg = Segment(np.stack([s, np.zeros(60), np.zeros(60)], axis=1), k, 1, 1.4)
+        assert seg.v_ref[10] < 0.45 and seg.v_ref[-1] == 1.4, seg.v_ref[[0, 10, 30, 59]]
+        assert (np.diff(seg.v_ref ** 2) >= -2.0 * 0.5 * 0.1 - 1e-9).all(), "it brakes at 0.5 m/s^2 at most"
+        arc = Segment(np.stack([s, np.zeros(60), np.zeros(60)], axis=1), np.full(60, 0.168), 1, 1.4)
+        assert (arc.v_ref == 1.4).all()
+    finally:
+        EGO.wheelbase, = old
+    print("the pose held by the wheels, and a speed the steering can follow: ok")
+
+
+def test_kerb_side():
+    """Parallel parking: a line the car may not cross, with its own allowance for the nose and for the tail."""
+    from parking.planner import CSpace, Planner, holonomic_distance
+    old = (EGO.rear, EGO.front, EGO.half_width, EGO.length, EGO.center, EGO.radius, EGO.kappa, EGO.wheelbase)
+    EGO.rear, EGO.front, EGO.half_width, EGO.length = 1.06, 3.82, 0.92, 4.88
+    EGO.center, EGO.radius, EGO.kappa, EGO.wheelbase = 1.38, 5.95, 1.0 / 5.95, 2.78
+    try:
+        occ = np.zeros((200, 400), dtype=bool)                # 40 m of street by 20 m, with nothing in it
+        x0, y0, res = -10.0, -10.0, 0.1
+        goal = (10.0, -3.0, 0.0)                              # parked along +x, the kerb towards -y
+        cs = CSpace(occ, x0, y0, res, 0.20, 0.30)
+        cs.keep_off((goal[0] + EGO.center, goal[1]), np.array([0.0, -1.0]), EGO.half_width + 0.05, EGO.half_width + 0.15)
+        assert cs.query(*goal) != CSpace.HARD
+        assert cs.query(goal[0], goal[1], math.radians(-3.0)) == CSpace.HARD, "the nose 20 cm towards the kerb"
+        assert cs.query(goal[0], goal[1], math.radians(3.0)) != CSpace.HARD, "the tail 5 cm towards the kerb"
+        assert cs.query(goal[0], goal[1], math.radians(10.0)) == CSpace.HARD, "the tail 17 cm towards the kerb"
+        many = cs.query_many(np.full(3, goal[0]), np.full(3, goal[1]), np.radians([-3.0, 3.0, 10.0]))
+        assert (many == CSpace.HARD).tolist() == [True, False, True]
+        # A plan from the street, 6 m before the stall. With the line it backs in. Without it the
+        # shortest way is nose first, with the front corner well beyond where the side will be.
+        start, pre = (4.0, 0.0, 0.0), (goal[0] - 1.6, goal[1], 0.0)
+        dock = dict(goal=goal, sign=1.0, length=1.6)
+        h2d, cell = holonomic_distance(occ, res, pre[:2], x0, y0)
+        planner = Planner()
+        planner.max_iter = 30000
+        rows = planner.search(start, pre, cs, h2d, cell, dock)
+        assert rows is not None and len(rows), "no plan with the line"
+        front, rear = cs.reach(rows[:, 0], rows[:, 1], rows[:, 2])
+        assert front.max() <= EGO.half_width + 0.05 + 1e-6 and rear.max() <= EGO.half_width + 0.15 + 1e-6, (front.max(), rear.max())
+        assert (rows[:, 3] < 0).any(), "it has to back in"
+        free = CSpace(occ, x0, y0, res, 0.20, 0.30)
+        rows = planner.search(start, pre, free, h2d, cell, dock)
+        cs.line = cs.line[:4] + (9.0, 9.0)
+        front, rear = cs.reach(rows[:, 0], rows[:, 1], rows[:, 2])
+        assert front.max() > EGO.half_width + 0.3, "without the line the nose went %.2f m beyond the side" % (front.max() - EGO.half_width)
+    finally:
+        EGO.rear, EGO.front, EGO.half_width, EGO.length, EGO.center, EGO.radius, EGO.kappa, EGO.wheelbase = old
+    print("parallel parking keeps off the kerb: ok")
 
 
 def test_parallel_stall_and_kerb():
@@ -730,6 +831,8 @@ if __name__ == "__main__":
     test_half_seen_stall()
     test_stalls_from_their_row()
     test_stall_with_one_line()
+    test_hold_and_speed()
+    test_kerb_side()
     test_parallel_stall_and_kerb()
     test_own_pose()
     test_worn_paint()

@@ -92,6 +92,12 @@ class SensorRig:
     DISP_ERR = 0.25                          # disparity error that the processing assumes [pixels]
     MONO_ERR = (0.02, 0.07)                  # range error assumed for monocular depth: 2 cm + 7 %
     MONO_RANGE = 3.0                         # ground seen by a single camera counts as probably free up to here
+    # A single camera's obstacles are taken from the middle of its image only, less this share of
+    # the width at either side. Out there the depth network had put whole things a metre or two
+    # from where they stand, and ground in the air: of 52 000 obstacle points within 1.9 m in
+    # those two fifths, 13 percent were more than 0.6 m from anything real (eight runs, both
+    # cameras, in six of the runs), and of 41 000 in the middle, nine points.
+    MONO_SIDES = 0.20
     CAM_FAR = 30.0             # what is further than this, or the sky, is reported at this range
     CAM_RANGE = 12.0           # obstacles and free ground are taken from a depth image up to here at most
     PAINT_RANGE = 11.0         # painted lines are looked for up to here in the image of the stereo pair,
@@ -547,6 +553,9 @@ class SensorRig:
                        rgb=image, range=np.where(depth < 0.99 * self.CAM_FAR, depth, 0.0))
         ground = seen & (np.abs(z) < self.Z_GROUND + 1.25 * zs)
         obstacle = seen & (z > self.Z_OBSTACLE + 2.5 * zs)
+        if cam["role"] == "mono":              # (MONO_SIDES: what is out there still stops free ground, below)
+            k = int(round(self.MONO_SIDES * obstacle.shape[1]))
+            obstacle[:, :k] = obstacle[:, obstacle.shape[1] - k:] = False
         head = math.atan2(R[1, 0], R[0, 0])
         half = cam["half"]
         n_bins = int(round(math.degrees(2.0 * half) / 0.5))

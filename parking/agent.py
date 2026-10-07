@@ -61,17 +61,27 @@ class ParkingSim:
     ARRIVED = (0.20, 0.40, math.radians(3.0))
     SETTLED = 2.0            # for the last metres of its way in, the stall is where it was taken to be [m]
     # The estimate of the chosen stall is followed while it stays this near to where the stall
-    # was when the plan was made [m, rad]. An estimate further off than that is another reading of
-    # the paint, not a better one of the same: of those that were looked at, each was wrong.
+    # was when the plan was made, across the stall [m] and in direction [rad]. An estimate
+    # further off than that is another reading of the paint, not a better one of the same: of
+    # those that were looked at, each was wrong.
+    #
+    # Along the stall it is followed one way only: towards the lane. Paint that is seen is
+    # there. Paint that is not seen may be worn, in a shadow or behind something, so a stall
+    # may turn out to begin nearer to the lane than it was taken to, and not further in. In 21
+    # runs the estimate moved by up to 30 cm either way while the car drove in. Followed
+    # wherever it went, the car ended 12 cm off in depth on average and 34 cm at worst.
+    # Followed towards the lane only, by the same numbers, 7 cm and 18 cm. Not followed at
+    # all, 9 cm and 21 cm, and in one run 84 cm: that stall had been taken 0.9 m too deep.
+    # (A parallel stall is not followed at all across the kerb: see _toward_lane.)
     FOLLOW = (0.5, 0.1)
-    # Parallel parking: no part of the car may come nearer to the kerb than the side of the
-    # parked car will be, plus this [m]. The room for the maneuver is on the street. What lies
-    # beyond the stall is a kerb whether or not anything has seen it, and a camera cannot tell
-    # it from the road until it is close. The first value is tried with every margin before
-    # the second is: backing in between two cars takes the rear corner 10 cm beyond that side,
-    # which with the planner's margins at a turned corner and its grid needs the second. With
-    # the second alone, a car that drove nose first into a stall met the kerb with its corner.
-    KERB_SIDE = (0.15, 0.25)
+    # Parallel parking: the car may not come nearer to the kerb than its side will be when it
+    # is parked, plus this much with its front corners and this much with its rear ones [m].
+    # The room for the maneuver is on the street. What lies beyond the stall is a kerb whether
+    # or not anything has seen it, and a camera cannot tell it from the road until it is close.
+    # Backing in between two cars takes the rear corner 10 cm beyond where the side ends up.
+    # The nose needs nothing there, and it is where an error in heading shows: 3 degrees are
+    # 20 cm at the front corner. So the car backs in, and does not drive in nose first.
+    KERB_SIDE = (0.05, 0.15)
 
     def __init__(self, args):
         self.args = args
@@ -107,6 +117,7 @@ class ParkingSim:
         self.replans = self.corrections = self.blocked = self.lane_blocked = 0
         self.must_replan = False
         self.watch_margin = True       # whether the path monitor still asks for more margin on this plan
+        self.near_margin = 0.0         # the room it asks for [m]: what the plan had when it was made
         self.plan_info = None          # statistics and search tree of the last plan
         self.plan_thread = self.plan_result = None
         self.plan_time = 0.0
@@ -350,6 +361,12 @@ class ParkingSim:
                  (s.kind, (s.center - ctr) @ fwd, nb, how))
         self.tracker.stop()
         self.state, self.t_still = "BRAKE", None
+        self.planned = None
+        # From here to the stall the car takes its position from its wheels, not from the
+        # receiver: the stall and what stands around it are where the map has them, and the
+        # map was made with the pose of a few seconds ago. A receiver that wanders by 10 cm in
+        # half a minute took the car 25 cm towards a kerb it had planned to pass by 15.
+        self.odo.hold(True)
 
     # ---- manual target ---------------------------------------------------------
 
@@ -358,6 +375,7 @@ class ParkingSim:
         If the box sits on a stall the map knows about, that stall becomes the target."""
         self.manual = (box[0], box[1], wrap(box[2]))
         self.target, self.path, self.seg_i, self.result = None, [], 0, None
+        self.planned = None
         self.replans = self.corrections = 0
         self.must_replan = False
         self.rejected = []
@@ -424,7 +442,7 @@ class ParkingSim:
         """What the planner should aim for: the chosen stall, or the pose the user asked for."""
         if self.target is not None:
             s = self.target
-            nominal = s.goal(self.nose_in, self.park_dir)
+            nominal = self._held_goal(s)
             if s.kind == "parallel":     # reverse in, then pull forward to the middle of the stall
                 return dict(kind=s.kind, nominal=nominal, u=s.u_in, signs=(1.0,), runs=(1.6, 1.1, 0.6, 0.0),
                             trials=sorted((abs(a) + 2.0 * b, a, b) for a in np.arange(-0.6, 0.61, 0.1)
@@ -445,6 +463,30 @@ class ParkingSim:
                                   for b in np.arange(-0.2, 0.21, 0.1)),
                     margins=((0.25, 0.30), (0.15, 0.20), (0.08, 0.12)))
 
+    def _held_goal(self, s):
+        """The pose to park at in stall s, as it is estimated now: across the stall and in
+        direction by that estimate, and along the stall no further in than the first plan had
+        it or any estimate since (FOLLOW)."""
+        goal = s.goal(self.nose_in, self.park_dir)
+        if self.planned is None:
+            return goal
+        u = np.array([math.cos(self.planned[1]), math.sin(self.planned[1])])
+        back = float((s.center - self.planned[0]) @ u)
+        return (goal[0] - back * u[0], goal[1] - back * u[1], goal[2])
+
+    def _toward_lane(self):
+        """Where along the stall the car is to stand moves with the estimate if that puts the
+        stall nearer to the lane, a third of the way per look, and stays if it does not. Not
+        beside a kerb: how far a parallel stall is from the kerb was seen while the car drove
+        up, and nothing sees the kerb while it backs in. (Followed towards the street, one such
+        estimate took the car 0.58 m out of its stall.)"""
+        if self.planned is None or self.target is None or self.target.kind == "parallel":
+            return
+        u = np.array([math.cos(self.planned[1]), math.sin(self.planned[1])])
+        back = float((self.target.center - self.planned[0]) @ u)
+        if back < 0.0:
+            self.planned = (self.planned[0] + 0.3 * back * u, self.planned[1])
+
     def _request_plan(self):
         occ = self.grid.blocked()
         region = self.target.region if self.target is not None else self._box_cells(0.3)
@@ -457,6 +499,7 @@ class ParkingSim:
                 mask = mask & self.grid.grow(self.grid.seen_free(), 5)[sl]
             occ[sl] &= ~mask | self.grid.occupied()[sl]
         self.state = "PLAN"
+        self.odo.hold(True)            # (also for a spot the user asked for)
         self.say("planning ...")
         self.plan_result = None
         self._plan_wall = time.time()
@@ -468,18 +511,33 @@ class ParkingSim:
 
     def _plan_job(self, start, spec, occ):
         try:
-            for kerb_side in self.KERB_SIDE if spec["kind"] == "parallel" else (None,):
-                for k, (m_lat, m_lon) in enumerate(spec["margins"]):
-                    self.planner.max_iter = 30000 if k == len(spec["margins"]) - 1 else 12000
-                    res = self._plan_once(start, spec, occ, m_lat, m_lon, kerb_side)
-                    if res is not None:
-                        self.plan_result = res
-                        return
+            best = None
+            for k, (m_lat, m_lon) in enumerate(spec["margins"]):
+                self.planner.max_iter = 30000 if k == len(spec["margins"]) - 1 else 12000
+                res = self._plan_once(start, spec, occ, m_lat, m_lon)
+                if res is None:
+                    if best is not None:
+                        break
+                    continue
+                if best is None:
+                    # A wider margin comes first, but not at any price. With 0.30 m one stall
+                    # was to be had by 36 m of driving in five pieces, and with 0.20 m by 18 m
+                    # in four: a plan of more than three pieces is held against the next
+                    # margin, once, and gives way if that one is simpler and much the cheaper.
+                    best = res
+                    if len(res["segments"]) <= 3:
+                        break
+                    continue
+                if len(res["segments"]) < len(best["segments"]) and res["stats"]["cost"] < 0.7 * best["stats"]["cost"]:
+                    best = res
+                break
+            if best is not None:
+                self.plan_result = best
         except Exception:             # never leave the main loop waiting on a dead thread
             import traceback
             traceback.print_exc()
 
-    def _plan_once(self, start, spec, occ, m_lat, m_lon, kerb_side=None):
+    def _plan_once(self, start, spec, occ, m_lat, m_lon):
         g, res = self.grid, self.grid.RES
         nominal = spec["nominal"]
         win = 13.0
@@ -489,13 +547,17 @@ class ParkingSim:
         j1 = min(g.ny, int((max(start[1], nominal[1]) + win - g.y0) / res))
         sub = occ[j0:j1, i0:i1]
         wx0, wy0 = g.x0 + i0 * res, g.y0 + j0 * res
-        if kerb_side is not None:
-            # nothing of the car beyond the kerb-side edge of where it will stand (KERB_SIDE)
-            u, th = spec["u"], nominal[2]
-            X, Y = np.meshgrid(wx0 + (np.arange(sub.shape[1]) + 0.5) * res - nominal[0] - EGO.center * math.cos(th),
-                               wy0 + (np.arange(sub.shape[0]) + 0.5) * res - nominal[1] - EGO.center * math.sin(th))
-            sub = sub | (X * u[0] + Y * u[1] > EGO.half_width + kerb_side + m_lat)
         cs = CSpace(sub, wx0, wy0, res, m_lat, m_lon)
+        if spec["kind"] == "parallel":
+            # Not towards the kerb (KERB_SIDE). The line is that of the kerb-side edge of the
+            # car where it will stand. A car that is beyond the allowance already, after a
+            # docking run that ended a few degrees off, may not go further.
+            th = nominal[2]
+            at = (nominal[0] + EGO.center * math.cos(th), nominal[1] + EGO.center * math.sin(th))
+            cs.keep_off(at, spec["u"], 0.0, 0.0)
+            f0, r0 = cs.reach(*start)
+            cs.keep_off(at, spec["u"], max(EGO.half_width + self.KERB_SIDE[0], f0 + 0.02),
+                        max(EGO.half_width + self.KERB_SIDE[1], r0 + 0.02))
         if cs.query(*start) == CSpace.HARD:
             return None
         edge = sub.copy()                      # only the rim of the blocked regions matters
@@ -582,7 +644,7 @@ class ParkingSim:
             return
         segs = res["segments"]
         self.goal, self.nominal = res["goal"], res["nominal"]
-        if self.target is not None:
+        if self.target is not None and self.planned is None:
             self.planned = (self.target.center.copy(), math.atan2(self.target.u_in[1], self.target.u_in[0]))
         self.blocked, self.must_replan, self.watch_margin = 0, False, True
         self.plan_info = dict(res["stats"], margin=res["margin"], explored=res["explored"])
@@ -597,6 +659,18 @@ class ParkingSim:
         if not segs:
             self._finish(True, "parked")
             return
+        # What the monitor will hold the plan to: 3 cm less than the margin it was planned with,
+        # 10 cm at most, and no more than the plan has. The collision table knows a pose to a
+        # cell and 3 degrees, so a fresh plan can pass a cell nearer than its margin says, and
+        # asked for the full margin the monitor sent such a plan back at once, six times in a row.
+        self.near_margin = 0.0
+        if isinstance(self.sensor, SensorRig):
+            self.near_margin = min(0.10, res["margin"] - 0.03)
+            pts = self.grid.occupied_points()
+            pts = pts[np.hypot(pts[:, 0] - self.pose[0], pts[:, 1] - self.pose[1]) < 25.0] if len(pts) else pts
+            poses = np.concatenate([sg.poses() for sg in segs])
+            while self.near_margin > 0.0 and len(pts) and footprint_hits(poses, pts, self.near_margin).any():
+                self.near_margin = max(self.near_margin - 0.03, 0.0)
         self.state = "DRIVE"
         self._follow(segs[0])
 
@@ -607,8 +681,11 @@ class ParkingSim:
         self.rejected = [r for r in self.rejected if r not in old]
         self.rejected.append((self.target.center.copy(), here, 1 + sum(r[2] for r in old)))
         self.target = None
+        self.planned = None
         self.say(why)
         self.state = "SEARCH"
+        self.odo.hold(False)
+        self.pose = self.odo.update(self.true_pose, self.time, self.world.wheel_travel())
         self._follow(self._search_route(), presteer=False)
 
     # ---- execution -------------------------------------------------------------
@@ -619,10 +696,13 @@ class ParkingSim:
         cand = [s for s in self.slots if s.kind == self.target.kind and
                 np.hypot(*(s.center - self.target.center)) < 1.2]
         if self.planned is not None and self.path:
-            cand = [s for s in cand if np.hypot(*(s.center - self.planned[0])) < self.FOLLOW[0] and
+            across = np.array([-math.sin(self.planned[1]), math.cos(self.planned[1])])
+            cand = [s for s in cand if abs((s.center - self.planned[0]) @ across) < self.FOLLOW[0] and
                     abs(wrap(math.atan2(s.u_in[1], s.u_in[0]) - self.planned[1])) < self.FOLLOW[1]]
         if cand:
             self.target = min(cand, key=lambda s: np.hypot(*(s.center - self.target.center)))
+            if self.path:
+                self._toward_lane()
         return bool(cand)
 
     def _refine(self):
@@ -636,7 +716,7 @@ class ParkingSim:
             return
         if not self._retarget():
             return
-        new = self.target.goal(self.nose_in, self.park_dir)
+        new = self._held_goal(self.target)
         old = self.nominal
         d, dth = math.hypot(new[0] - old[0], new[1] - old[1]), abs(wrap(new[2] - old[2]))
         if d < 0.01 and dth < 0.003:
@@ -666,15 +746,24 @@ class ParkingSim:
             return
         step = off * max(0.3, min(1.0, 0.02 / np.hypot(*off)))
         cand = (self.goal[0] - step[0], self.goal[1] - step[1], self.goal[2])
-        pts = self.grid.occupied_points()
-        if len(pts):
-            pts = pts[np.hypot(pts[:, 0] - cand[0], pts[:, 1] - cand[1]) < 8.0]
-            if len(pts) and footprint_hits(np.array([cand]), pts, 0.12)[0]:
-                return
+        left = self.path[self.seg_i:]
+        was = [(seg.x.copy(), seg.y.copy(), seg.th.copy()) for seg in left]
         beyond = 0.0
-        for seg in reversed(self.path[self.seg_i:]):
+        for seg in reversed(left):
             seg.reanchor(self.goal, cand, beyond)
             beyond += seg.length
+        # Not if that brings any of what is left of the path within 12 cm of an obstacle, or
+        # nearer than the monitor allows. (Only the goal used to be looked at. The goal can
+        # have been put off centre for the sake of the run up to it: moved back, the path was
+        # nearer to an obstacle than the monitor allows, and the car stopped to plan again.)
+        pts = self.grid.occupied_points()
+        if len(pts):
+            pts = pts[np.hypot(pts[:, 0] - cand[0], pts[:, 1] - cand[1]) < 25.0]
+            poses = np.concatenate([left[0].poses(self.tracker.i)] + [seg.poses() for seg in left[1:]])
+            if len(pts) and footprint_hits(poses, pts, max(0.12, self.near_margin + 0.02)).any():
+                for seg, (x, y, th) in zip(left, was):
+                    seg.x, seg.y, seg.th = x, y, th
+                return
         self.goal = cand
 
     def _monitor(self):
@@ -689,7 +778,7 @@ class ParkingSim:
         # With cameras, an obstacle is only placed exactly once it is close, often after the plan
         # was made: also react when it turns out to be nearer to the path than the plan allowed
         # for. That asks for a better plan. If there is none, the current one is still drivable.
-        margin = min(0.10, self.plan_info["margin"] - 0.03) if isinstance(self.sensor, SensorRig) else 0.0
+        margin = self.near_margin
         close = not hard and margin > 0.0 and self.watch_margin and self.replans < self.MAX_REPLANS and \
             bool(footprint_hits(poses, near, margin).any())
         self.blocked = self.blocked + 1 if hard or close else 0

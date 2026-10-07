@@ -259,12 +259,28 @@ because the rate limit is a property of the actuator, not of the controller.
 ## Speed and torque
 
 **Speed limit from the steering.** Where the path curvature changes by `d kappa / d s` per metre,
-driving at `v` requires the steering angle to change at about `L v d kappa / d s`, which must not
-exceed the steering rate:
+driving at `v` requires the steering angle to change at about `1.3 L v d kappa / d s`: the real
+car needs 1.3 times the wheel angle that the bicycle model gives for a curvature (see
+[the steering gain](#the-steering-gain)). Half of the steering rate is allowed for that. The
+other half is for correcting:
 
 ```math
-v_{ref}(s) = \min\left( v_{max},\; \mathrm{clamp}\!\left( \frac{0.8}{L\,|d\kappa/ds|},\; 0.5,\; v_{max} \right) \right)
+v_{ref}(s) = \min\left( v_{max},\; \mathrm{clamp}\!\left( \frac{0.5 \cdot 0.8}{1.3\,L\,|d\kappa/ds|},\; 0.25,\; v_{max} \right) \right)
 ```
+
+The curvature is smoothed over a metre for this, so the entry into an arc at the curvature
+limit comes out at 0.7 m/s and a change from full lock one way to full lock the other at
+0.36 m/s. The limit is also carried backwards along the path with 0.5 m/s^2, so that the car
+is down to a speed where it has to be, not from there on.
+
+The limit used to take all of the steering rate for the path, with the bicycle model's wheel
+angle and no less than 0.5 m/s. One plan began with an arc of 1 m at full curvature one way
+and went on at full curvature the other way. The car started 9 cm beside it, with the wheels
+at the stop to correct that, and met the change at 0.9 m/s. Five metres on it was 0.5 m and 16
+degrees off the path with the wheels at the other stop, and its front corner touched the car
+parked beside the stall. A path that takes all the steering rate there is cannot be followed
+by a car that is not exactly on it. With the limit as it is now the car follows the same plan
+and passes that car at 0.45 m.
 
 `v_max` is 2.2 m/s while searching, 1.4 m/s forward and 1.0 m/s in reverse while maneuvering. The
 target speed also ramps down toward the end of the segment, so the car arrives at a creep, and it
@@ -336,12 +352,22 @@ plan was made for.
   where `l` is the path length from a point to the goal. Points within 4 m of the goal move fully,
   points more than 9 m away stay put, and the weight is continuous across cusps. The far part of
   the plan, which was checked against obstacles, is not disturbed.
-- **Large change.** An estimate more than 0.5 m or 0.1 rad from where the stall was when the
-  plan was made is not followed (`ParkingSim.FOLLOW`). The plan keeps the stall it was made
-  for. Such an estimate is another reading of the paint, not a better one of the same. The car
-  used to stop and plan again for it, at once and later after it had lasted a second. Of the
-  jumps that were looked at, each was wrong: a line that had grown 0.7 m into the lane, and a
-  stall rebuilt 0.7 m deeper from a line found late.
+- **Large change.** An estimate more than 0.5 m across the stall or 0.1 rad from where the stall
+  was when the plan was made is not followed (`ParkingSim.FOLLOW`). The plan keeps the stall it
+  was made for. Such an estimate is another reading of the paint, not a better one of the
+  same. The car used to stop and plan again for it. Of the jumps that were looked at, each
+  was wrong: a line that had grown 0.7 m into the lane, and a stall rebuilt 0.7 m deeper from
+  a line found late.
+- **Along the stall, one way only: towards the lane.** Paint that is seen is there. Paint that
+  is not seen may be worn, in a shadow or behind something. So a stall may turn out to begin
+  nearer to the lane than it was taken to, and that is followed, a third of the way per look.
+  It may not turn out to begin further in. In 21 runs the estimate of where the stall begins
+  moved by up to 30 cm either way while the car drove in. The car that followed it wherever
+  it went ended 12 cm off in depth on average and 34 cm at worst, over the line in one run.
+  Following it towards the lane only would have left it 7 cm off on average and 18 cm at
+  worst. Not following it at all, 9 cm and 21 cm, and that was tried: in one more run the
+  stall had been taken 0.9 m too deep when the plan was made, because the first 0.9 m of one
+  of its lines had not been found yet, and the car backed into the kerb.
 - **On the last 2 m of the way in**, nothing is changed any more. What the cameras show of a
   stall from inside it is little, and an estimate that moves there moves for the worse as often
   as not.
@@ -355,6 +381,12 @@ stall centre without the car's outline, grown by 12 cm, touching an obstacle cel
 of the path is moved there with the same weighting. In the verification runs this took five final
 positions from 10 to 20 cm off centre to under 1 cm.
 
+The move is made only if nothing of what is left of the path comes within 12 cm of an obstacle
+cell by it, or nearer than the monitor below allows. Only the goal used to be looked at. But a
+goal can have been put off centre for the sake of the run up to it, and moved back, the path
+then passed an obstacle nearer than the monitor allows. The car stopped, planned again with
+the goal off centre, moved it back, and stopped again.
+
 ## Watching the path
 
 Each perception tick, `_monitor` places the footprint at every third remaining path sample and
@@ -367,6 +399,11 @@ obstacle has turned out to be nearer to the path than the plan allowed for, whic
 happens when a far obstacle comes close and is placed properly. That also makes the car stop and
 look for a better plan, once per plan. If there is none, it carries on with the plan it has, which
 is still drivable.
+
+That distance is never more than the plan had when it was made. The collision table knows a
+pose to a grid cell and 3 degrees, so a fresh plan can pass an obstacle cell nearer than its
+margin says. Held to the full distance, such a plan was sent back the moment it was made, and
+so was the next: one run planned six times in three seconds, standing still.
 
 If the car has not left the lane yet when its path is blocked and no other plan exists, the run
 does not fail: the stall goes on the rejected list and the car searches on. In one run a single
@@ -386,10 +423,6 @@ width of the middle of a stall stays there.
 
 ## Limits
 
-- When an obstacle turns out to be nearer to the path than the plan allowed for, the car stops
-  and plans again, and the new plan can be answered the same way at once. One run planned six
-  times in three seconds, standing still, before it drove on and parked. Why the new plans
-  did not keep the distance the monitor asks for was not looked into.
 - The MPC model is linear in the errors. That is accurate for the few centimetres and degrees seen
   here, not for recovering from a large disturbance.
 - Only the steering is predictive. Speed is a separate loop, so the MPC cannot trade speed against

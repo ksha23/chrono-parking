@@ -59,11 +59,33 @@ class CSpace:
                 C = np.fft.irfft2(O * G, s=(fy, fx))[:self.ny, :self.nx]
                 self.cost[kk] = np.where(C > big - 0.5, self.HARD, np.where(C > 0.5, self.SOFT, self.FREE))
         self._kth = self.NTH / (2.0 * math.pi)
+        self.line = None
+
+    def keep_off(self, origin, u, front, rear):
+        """One more thing a pose may not do: put a front corner of the car further than `front`
+        along u from origin, or a rear corner further than `rear`. That is a line the car has
+        to stay on one side of, with its own allowance for each end of the car: the nose is
+        3.8 m ahead of the rear axle and the tail 1.1 m behind it, and what a small error in
+        heading does at each differs as much. It is worked out from the pose itself, not
+        looked up in the table, which knows a heading to 3 degrees: 20 cm at the nose."""
+        self.line = (float(origin[0]), float(origin[1]), float(u[0]), float(u[1]), float(front), float(rear))
+
+    def reach(self, x, y, th):
+        """How far along the line's u the front corners and the rear corners of the car reach."""
+        ox, oy, ux, uy, _, _ = self.line
+        c, s = np.cos(th), np.sin(th)
+        at = (x - ox) * ux + (y - oy) * uy + EGO.half_width * np.abs(c * uy - s * ux)
+        along = c * ux + s * uy
+        return at + EGO.front * along, at - EGO.rear * along
 
     def query(self, x, y, th):
         fx, fy = (x - self.x0) / self.res, (y - self.y0) / self.res
         if fx < 0.0 or fy < 0.0 or fx >= self.nx or fy >= self.ny:
             return self.HARD
+        if self.line is not None:
+            f, r = self.reach(x, y, th)
+            if f > self.line[4] or r > self.line[5]:
+                return self.HARD
         return self.cost[int(round(th * self._kth)) % self.NTH, int(fy), int(fx)]
 
     def query_many(self, x, y, th):
@@ -72,6 +94,9 @@ class CSpace:
         out = np.full(len(x), self.HARD, dtype=np.uint8)
         k = np.round(th[ok] * self._kth).astype(int) % self.NTH
         out[ok] = self.cost[k, fy[ok].astype(int), fx[ok].astype(int)]
+        if self.line is not None:
+            f, r = self.reach(x, y, th)
+            out[(f > self.line[4]) | (r > self.line[5])] = self.HARD
         return out
 
 
@@ -281,6 +306,9 @@ class Planner:
         gx, gy, gth = goal
         x0, y0, inv, nx, ny = cs.x0, cs.y0, 1.0 / cs.res, cs.nx, cs.ny
         cost_arr, kth, nthc = cs.cost, cs._kth, cs.NTH
+        line = cs.line
+        if line is not None:
+            lox, loy, lux, luy, lfront, lrear = line
         inv_xy, k_key = 1.0 / self.XY_RES, self.NTH / (2.0 * math.pi)
         hny, hnx = h2d.shape
         inv_h = 1.0 / h2d_cell
@@ -343,6 +371,13 @@ class Planner:
                     if v == 2:
                         soft = 2
                         break
+                    if line is not None:           # (CSpace.reach, written out)
+                        ct, st = math.cos(TH), math.sin(TH)
+                        at = (X - lox) * lux + (Y - loy) * luy + EGO.half_width * abs(ct * luy - st * lux)
+                        al = ct * lux + st * luy
+                        if at + EGO.front * al > lfront or at - EGO.rear * al > lrear:
+                            soft = 2
+                            break
                     soft |= v
                 if soft == 2:
                     continue
@@ -400,12 +435,19 @@ class Segment:
         self.length = float(self.s[-1])
         self.kappa = np.asarray(kappa, dtype=float)
         # Speed limit from the steering actuator: where the path curvature changes by dk/ds, the
-        # steering must move at v * dk/ds, which may not exceed what STEER_RATE allows.
+        # steering must move at v * dk/ds. Half of what STEER_RATE allows is for that. The other
+        # half is for correcting, and the real car needs 1.3 times the wheel angle that the
+        # bicycle model gives for a curvature (control.md). With all of the rate taken up by
+        # the path, a car that started a decimetre beside an arc of 1 m followed by full lock
+        # the other way was 16 degrees and half a metre off the path 5 m later, at full lock.
         n = max(1, min(5, (len(self.kappa) - 1) // 2))     # ~1 m moving average
         pad = np.concatenate([np.full(n, self.kappa[0]), self.kappa, np.full(n, self.kappa[-1])])
         smooth = np.convolve(pad, np.ones(2 * n + 1) / (2 * n + 1), mode="valid")
         dk = np.abs(np.gradient(smooth, np.maximum(self.s, 1e-9))) if len(smooth) > 2 else np.zeros(len(smooth))
-        self.v_ref = np.minimum(v_max, np.clip(STEER_RATE / EGO.wheelbase / np.maximum(dk, 1e-6), 0.5, v_max))
+        self.v_ref = np.minimum(v_max, np.clip(0.5 * STEER_RATE / (1.3 * EGO.wheelbase) / np.maximum(dk, 1e-6), 0.25, v_max))
+        # and the car has to be down to that speed when it gets there (braking at 0.5 m/s^2)
+        for j in range(len(self.v_ref) - 2, -1, -1):
+            self.v_ref[j] = min(self.v_ref[j], math.sqrt(self.v_ref[j + 1] ** 2 + 2.0 * 0.5 * (self.s[j + 1] - self.s[j])))
 
     def reanchor(self, old, new, beyond=0.0, full=4.0, fade=9.0):
         """Move the path by the rigid transform that takes pose 'old' to pose 'new'. Points

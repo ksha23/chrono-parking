@@ -20,6 +20,14 @@ class Localization:
                 around change: 10 cm per axis, changing over about half a minute, and smooth from
                 one moment to the next because the inertial unit bridges the fixes. The heading
                 is off by 0.3 degrees, wandering over 20 s. Nothing grows with the distance driven.
+                While the car is told to hold (`hold`), it carries the position it has on by
+                its wheels, along the heading the receiver gives, and leaves the receiver's
+                position aside. Over the 20 m and half a minute of a parking maneuver the
+                wheels are good to a few centimetres, and the receiver's position wanders by a
+                decimetre or two. A map made a few seconds ago then stays where the car is,
+                which is what parking needs. The heading stays the receiver's: it is good to
+                0.3 degrees however far the car turns, where a gyro with a scale error of 1
+                percent is 0.9 degrees off after the turn into a stall.
     'odometry'  No reception: the car counts how far its wheels have rolled and adds up its yaw
                 rate. The rolling radius is known to 0.5 percent and the yaw rate to 1 percent
                 (one value each for the run), the gyro has 0.02 deg/s of bias left after being
@@ -49,12 +57,16 @@ class Localization:
         self.rolled, self.counts, self.t_count, self.v_wheel = 0.0, 0, None, 0.0
         self.level = np.radians(0.15) * scale * rng.normal(size=2)          # pitch, roll: the constant part
         self.wander = np.zeros(2)
+        self.held = False
         if source == "gps":
             self.sigma = np.array([0.10, 0.10, math.radians(0.3)]) * scale     # x, y, heading
             self.tau = np.array([30.0, 30.0, 20.0])
             self.drive = self.sigma * rng.normal(size=3)        # what the error is heading for
             self.error = self.drive.copy()                      # the error itself, which follows smoothly
-            self.k_dist = 1.0
+            # (the wheels, for when the position is held: from a number of their own, so that
+            # the receiver's error is the same run with or without holding)
+            own = np.random.default_rng(rng.bit_generator.seed_seq.spawn(1)[0])
+            self.k_dist = 1.0 + 0.005 * scale * float(own.normal())
         else:
             self.k_dist = 1.0 + 0.005 * scale * float(rng.normal())
             self.k_yaw = 1.0 + 0.01 * scale * float(rng.normal())
@@ -63,6 +75,11 @@ class Localization:
 
     def _gps(self):
         return (self.true[0] + self.error[0], self.true[1] + self.error[1], wrap(self.true[2] + self.error[2]))
+
+    def hold(self, on=True):
+        """From now on carry the position on by the wheels (on), or take it from the receiver
+        again (off). With 'odometry' the wheels carry it anyway."""
+        self.held = bool(on) and self.source == "gps" and self.scale != 0.0
 
     def update(self, true, t, rolled=None):
         """The estimate after the car has moved to the pose `true` at time t. rolled: how far
@@ -81,7 +98,16 @@ class Localization:
                 keep = np.exp(-dt / self.tau)
                 self.drive = keep * self.drive + self.sigma * np.sqrt(1.0 - keep * keep) * self.rng.normal(size=3)
                 self.error += (self.drive - self.error) * (1.0 - math.exp(-dt / 1.0))
-            self.pose = self._gps()
+            if not self.held:
+                self.pose = self._gps()
+                return self.pose
+            # held: what the wheels have rolled, along the heading the receiver gives
+            mid = before[2] + 0.5 * wrap(true[2] - before[2])
+            ds = ((true[0] - before[0]) * math.cos(mid) + (true[1] - before[1]) * math.sin(mid)) * self.k_dist
+            x, y, th0 = self.pose
+            th = wrap(true[2] + self.error[2])
+            mid = th0 + 0.5 * wrap(th - th0)
+            self.pose = (x + ds * math.cos(mid), y + ds * math.sin(mid), th)
             return self.pose
         dx, dy, dth = true[0] - before[0], true[1] - before[1], wrap(true[2] - before[2])
         mid = before[2] + 0.5 * dth

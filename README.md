@@ -140,22 +140,25 @@ with an inertial unit (10 cm and 0.3 degrees), its speed from a wheel encoder, i
 and height from the road it sees, and that it starts in a lane with stalls along it. The paint
 is worn and the road is uneven. Rendered with OptiX:
 
-| Perception | Parked, unseen seeds 16 to 18 | Parked, seeds 10 to 15 | Parked, seeds 1 to 3 | Lateral offset: mean, worst | Heading error: mean, worst | Smallest clearance |
+| Perception | Parked, unseen seeds 28 to 30 | Of those that committed to a stall, completed | Parked, seeds 1 to 3 | Lateral offset: mean, worst | Heading error: mean, worst | Smallest clearance |
 | --- | --- | --- | --- | --- | --- | --- |
-| cameras: stereo pair, rear, bumper | 34 of 36 | 72 of 72 | 42 of 42 | 5.6, at most 14.5 cm | 0.9, at most 3.3 deg | 0.12 m |
-| cameras + forward lidar | 9 of 9 | 18 of 18 | 18 of 18 | 6.3, at most 16.1 cm | 0.8, at most 1.6 deg | 0.18 m |
-| stand-in, no sensors | | | 74 of 74 | 5.0, at most 15.3 cm | 0.8, at most 2.5 deg | 0.08 m |
+| cameras: stereo pair, rear, bumper | 34 of 36 | 34 of 34 | 42 of 42 | 3.7, at most 16.4 cm | 0.4, at most 1.1 deg | 0.20 m |
+| cameras + forward lidar | 8 of 9 | 8 of 8 | 18 of 18 | 3.7, at most 14.5 cm | 0.4, at most 0.9 deg | 0.18 m |
+| stand-in, no sensors | | | 74 of 74 | 2.1, at most 9.7 cm | 0.2, at most 0.8 deg | 0.20 m |
 
-Seeds 1 to 3 and 10 to 15 are scenarios the method was changed on. Seeds 16 to 18 had never
-been run: 43 of 45 is the number to go by. (The offsets of the rig are those of the unseen
-seeds.) Each version was made on what the failures of the one before showed, on video: a car
-that shuffled after a stall estimate that moved by a decimetre, stalls of which only one line
-was found, a plan that swung the nose over the kerb beside a parallel stall, a kerb placed
-too near behind a stall. The last of these changes made no difference on the unseen seeds,
-where the version before parks the same 43. What does not park there: the last stall of a row
-of which neither line was found (1 run), and a car that gives up half-way into a stall when
-obstacle cells appear in it (1). One run on seeds 10 to 12 parked after coming within 2 mm
-of a kerb. The [results](docs/results.md) have the list.
+A run can miss in two ways. The car can drive past a free stall it does not recognise, which
+every stall detector does some of the time. Or it can choose a stall and then touch something,
+stop half-way or end over the line, which is a failure of the car. Seeds 28 to 30 had never
+been run: 42 of 45 parked, the three that did not drove past a parallel stall, and all 42 that
+committed to a stall completed it with nothing touched. (The offsets of the rig are those of
+the unseen seeds.) The version before parked 41 of the same 45. Seeds 1 to 3 are scenarios the
+method was changed on.
+
+Each version was made on what the failures of the one before showed, taken apart one by one: a
+car that shuffled after a stall estimate that moved by a decimetre, stalls of which only one
+line was found, a plan that swung the nose over the kerb beside a parallel stall, a satellite
+fix that wandered 25 cm towards a kerb during the maneuver, a path whose curvature reversed
+faster than the steering could follow. The [results](docs/results.md) have the list.
 
 **Before that**, the car was given its true pose, pitch, roll, height and speed, the lane and
 the extent of the lot, on a flat road with clean paint (`--give all --wear 0 --bumps 0`, and a

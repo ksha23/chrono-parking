@@ -385,6 +385,20 @@ The limits follow from one rule, the same for both: an obstacle goes into the ma
 far as it can be placed to 15 cm, and ground counts as free only from as far as it can be told
 from a kerb, which needs the height of a point to 4 cm. A single camera never meets the second.
 
+A single camera's obstacles are also taken from the middle of its image only: not from the
+fifth of the width at either side (`SensorRig.MONO_SIDES`). Out there the network had put
+whole things a metre or two from where they stand, and ground in the air. Every obstacle point
+of the two single cameras within 1.9 m was compared with the real cars and kerbs in eight runs:
+
+| Where in the image | Points | More than 0.6 m from anything real |
+| --- | --- | --- |
+| the fifth of the width at either side | 52 000 | 13 percent, in six of the eight runs, mostly a whole blob at a time |
+| the middle three fifths | 41 000 | 9 points |
+
+In one run the rear camera put the corner of the van parked beside the stall 1.1 m into the
+stall, two to three thousand pixels of it in frame after frame, and the car gave up half-way in. What a single
+camera sees at the sides still stops free ground there. It only makes no obstacle.
+
 ### Ground, obstacle, or unclear
 
 Each pixel with a range gives a point in the world. The points on the car's own body are dropped:
@@ -727,6 +741,13 @@ apart (the middle one of the gaps between neighbouring lines is at least 4.5 m).
 the van, a tick and a bit of something else beside it had passed for a narrow stall, and one
 such stall had made the whole row count as perpendicular.
 
+A found line that is too short to count by itself counts if it is one of the two lines of a
+stall already made out in that row. Then it is a stall's line, whatever its length. That is
+the last stall of a row with open ground beyond it: the line between the last car and the stall
+shows as a stub, and the row's last line has no car behind it to say that a stall is there. In
+one run that last line was nearly gone and the car drove past. The row across the lane went on
+that far, which is what says that the free place is a stall and not the end of the lot.
+
 Like a stall from two stubs, a stall from one line is taken only once the car is level with it.
 
 ### A line in pieces is one line
@@ -896,6 +917,18 @@ made of that data shows up in three more places:
   given a good deal that a real car would not know. Most of that is gone:
   - *Where it is.* It goes by a pose estimate (`parking/localization.py`): by default a
     satellite receiver with an inertial unit, off by a slowly wandering 10 cm and 0.3 degrees.
+    From the moment it has chosen a stall it carries its position on by its wheels, along the
+    heading the receiver gives, and leaves the receiver's position aside
+    (`Localization.hold`). The rolling radius is known to 0.5 percent, which over the 20 m of
+    a maneuver is a few centimetres. The receiver's 10 cm change over half a minute, which is
+    how long a maneuver takes, and the stall and the kerb are where the map of a few seconds
+    ago has them. In two runs on one seed the receiver's error moved 25 cm towards the kerb
+    between choosing a parallel stall and arriving in it. The plan had 15 cm of room there,
+    and the car touched the kerb. Held, the same two runs end 1 cm off the middle of the
+    stall. The heading stays the receiver's, which is good to 0.3 degrees however far the car
+    turns. Carried on by a gyro with a scale error of 1 percent it was 0.9 degrees off after
+    the turn into a stall, and 5 degrees off in one run in which the plan took the car three
+    quarters of the way round.
   - *How it leans and how high it rides.* From a plane fitted to the road the stereo pair sees
     (`SensorRig._road_plane`), with nothing else. In one run the true pitch went from -1.2 to
     +1.1 degrees under braking and acceleration, and the estimate was within 0.16 degrees of it
@@ -929,18 +962,19 @@ made of that data shows up in three more places:
   of the lane. Two lots at different distances from the lane on the same side would be read as
   one row.
 - **Chosen on a few scenarios.** How much lighter faint paint has to be where the network sees a
-  marking, how a row is read, when the car is content with where it stands and how near to a
-  kerb a plan may go were settled on the scenarios of seeds 1 to 3 and 10 to 15. All 150 of
-  those park, one of them after coming within 2 mm of a kerb. Of 45 on seeds never run, 43
-  park, and the same 43 did with the version before ([results.md](results.md#verification)).
-- **A stall of which no line was found is not a stall.** At the end of a row, with open
-  ground beyond, the far line of the last stall has no car behind it to say that a stall is
-  there. If that line is worn away and the near one is under the car parked next to it, the
-  car drives past.
-- **Next to a kerb the nose is where the error is.** A docking run driven forwards can end
-  with the heading 3 degrees off, and the nose is 3.8 m ahead of the rear axle: 20 cm. In a
-  parallel stall that is most of the gap to the kerb. One run came within 2 mm of it that way
+  marking, how a row is read, when the car is content with where it stands, how near to a kerb
+  a plan may go and how far a stall's estimate is followed were settled on the scenarios of
+  seeds 1 to 3 and 10 to 27. Of 45 on seeds never run, 42 park, against 41 with the version
+  before, and all 42 that committed to a stall completed it
   ([results.md](results.md#verification)).
+- **A stall of which no line was found is not a stall.** One stub is enough if it belongs to
+  a stall already made out and the row across the lane goes on
+  ([One line found, the other not](#one-line-found-the-other-not)). With no paint at all, or at
+  the end of a row with nothing across the lane, the car drives past.
+- **A single camera does not map what is at the sides of its image**
+  ([Range from a single camera](#range-from-a-single-camera)). The cars beside a stall are
+  known from the stereo pair, from before the car turned in. The rear camera no longer
+  corrects where they are.
 - **A stall is not corrected by more than half a metre.** Once a plan is made, an estimate of
   the stall more than 0.5 m or 0.1 rad from the one it was made for is taken for a wrong
   reading and not followed ([control.md](control.md#keeping-the-plan-attached-to-the-stall)).

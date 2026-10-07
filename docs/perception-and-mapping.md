@@ -284,7 +284,8 @@ search continues down the lane.
 ## What this stage does not do
 
 - It does not estimate the car's own pose. Detections are placed in the world with the pose the
-  car is given, which carries the error of a satellite receiver with an inertial unit
+  car is given, which carries the error of a satellite receiver with an inertial unit, and from
+  the moment a stall is chosen that of the wheels and the gyro
   (`parking/localization.py`, [sensors.md](sensors.md#limits)).
 - Obstacles are static. Nothing moves except the car.
 - The stall size thresholds assume ordinary car stalls. They are prior knowledge about parking

@@ -121,6 +121,13 @@ With a sensor rig the margins are wider:
 A camera places an obstacle less exactly than the stand-in scan does, and what it has not looked
 at lately it knows only from before. The wider first setting costs nothing where there is room.
 
+Where there is not, a wider margin is not worth any amount of driving. With 0.30 m one stall
+between two cars was to be had by 36 m in five pieces, backing 10 m up the lane first, and
+with 0.20 m by 18 m in four. So a plan of more than three pieces is held against the plan for
+the next margin, once, and gives way if that one has fewer pieces and less than 0.7 of the
+cost. A long plan is a risk of its own: the car drives it by its wheels
+([sensors.md](sensors.md#limits)), and it ended that one 0.4 m short.
+
 ### Parallel parking: the room is on the street
 
 Beyond a parallel stall is a kerb, whether or not anything has seen it. A camera cannot tell a
@@ -130,22 +137,34 @@ had the pavement as mostly drivable, and the plan swung the nose over it on the 
 and 2.0 m beyond where the side of the parked car would be, with the true kerb 0.4 m and
 0.2 m beyond that side. The car touched the kerb.
 
-So for a parallel stall the planning map gets one more blocked region, a half-plane along the
-stall: no part of the car may come more than 0.15 m nearer to the kerb than the kerb-side edge
-of the car as it will stand when parked (`ParkingSim.KERB_SIDE`). The room for the maneuver is
-on the street side. With it, the same two plans stay 0.9 m and 0.8 m short of that edge with
-the nose and reach 5 cm beyond it with the rear corner.
+So for a parallel stall the planner has one more rule, a line along the stall that the car
+has to stay on the street side of. The line is the kerb-side edge of the car as it will stand
+when parked, and each end of the car has its own allowance (`ParkingSim.KERB_SIDE`):
 
-If no plan exists with 0.15 m at any of the margins, 0.25 m is allowed. Backing in between two
-cars needs that: on the last arc the rear corner passes 10 cm beyond where the side ends up,
-and the limit is enforced through the collision table, which adds its margin at a turned
-corner (6 cm) and the size of a grid cell (5 cm). With 0.15 m alone, one stall between two
-cars had no plan and the car drove on. With 0.25 m from the start, a car that had room behind
-the stall drove into it nose first, came 0.14 m beyond the edge with the nose 8 degrees towards
-the kerb, and met the kerb with its front corner. The nose is 3.8 m ahead of the rear axle, and
-what the tracking is off by there is more than what was left.
+| | May pass the line by | Why |
+| --- | --- | --- |
+| front corners | 0.05 m | the nose needs nothing there. It is 3.8 m ahead of the rear axle, so 3 degrees of heading are 20 cm at the corner |
+| rear corners | 0.15 m | backing in between two cars takes the rear corner 10 cm beyond where the side ends up, on the last arc |
 
-The region is placed from the goal, not from a kerb in the map. If the stall itself is taken
+The room for the maneuver is on the street. A car cannot drive into a parallel stall nose
+first without swinging the nose beyond that line, so it backs in. With the rule, the same two
+plans stay 0.9 m and 0.8 m short of the line with the nose and reach 5 cm beyond it with the
+rear corner.
+
+The rule is worked out from each pose itself (`CSpace.keep_off`), not written into the
+collision table. The table knows a heading to 3 degrees, which is 20 cm at the nose. A car
+that is already beyond an allowance when a plan is asked for, after a docking run that ended
+a few degrees off, may not go further: its allowance is where it stands.
+
+Two simpler versions were tried first, as a blocked half-plane in the planning map with one
+allowance for the whole car. With 0.15 m a stall between two cars had no plan, because the
+table adds its margin at a turned corner and a grid cell on top. With 0.25 m a car that had
+room behind the stall drove into it nose first, 0.14 m beyond the line with the nose 8
+degrees towards the kerb, and met the kerb with its front corner. With one and then the
+other, a car that had ended its docking run 3 degrees off set out to correct that forwards
+and came within 2 mm of the kerb.
+
+The line is placed from the goal, not from a kerb in the map. If the stall itself is taken
 to be nearer to the kerb than it is, the car still parks too near to it.
 
 ## Hybrid A*

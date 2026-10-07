@@ -66,8 +66,14 @@ def one_line_stalls(tracks, rows, slots, trail, grid, lane, along, tick):
         if other is not None:
             do = other.inward if other.d is None else other.d
             far = [where(other, t.c, do) for t in anchors(other)]
+        # A found line has to be long enough to be one of this row (a stub may be anything),
+        # or be a line of a stall already made out here: then it is a stall's line whatever
+        # its length. At the end of a row that is all there is: the last car's line shows as
+        # a stub between the cars, and the row's last line has no car behind it to say that
+        # a stall is there. If that one is worn away, the last stall has one stub.
+        sure = [where(row, c, d) for s in mine for c in s.corners[:2]]
         for t, x in zip(own, xs):
-            if t.length < (tick if parallel else 1.5):
+            if t.length < (tick if parallel else 1.5) and (parallel or not any(abs(x - e) < 0.3 for e in sure)):
                 continue
             for sg in (1.0, -1.0):
                 if any(abs(x + sg * pitch - q) < 0.6 for q in xs):

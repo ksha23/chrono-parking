@@ -90,7 +90,7 @@ stateDiagram-v2
     SETTLE --> WAIT: drag mode
     WAIT --> SEARCH: GO, target far down the lane
     WAIT --> BRAKE: GO, target nearby
-    SEARCH --> BRAKE: a free stall has settled
+    SEARCH --> BRAKE: a free stall has settled (from here by the wheels, not the receiver)
     SEARCH --> FAILED: end of the lane, nothing usable
     BRAKE --> PLAN: standing still for 0.3 s
     PLAN --> DRIVE: plan found
@@ -154,7 +154,7 @@ agent, and `cli.py` starts one or both.
 | Module | Lines | Main names |
 | --- | --- | --- |
 | `cli.py` | 192 | `parse_args`, `main` |
-| `agent.py` | 755 | `ParkingSim` (state machine, decision, planning requests, refinement, monitor) |
+| `agent.py` | 850 | `ParkingSim` (state machine, decision, planning requests, refinement, monitor) |
 | `chrono_env.py` | 87 | the PyChrono imports, and the rerun in a Python that has PyChrono |
 | `config.py` | 20 | `STEP`, `CONTROL_DT`, `PERCEPTION_DT`, speeds and acceleration limits |
 | `vehicle.py` | 51 | `Ego`, `EGO` (geometry, mass and limits read from the Chrono model) |
@@ -162,20 +162,20 @@ agent, and `cli.py` starts one or both.
 | `scenario.py` | 216 | `Scenario`, `make_lot`, `make_street`, `parked_model` |
 | `world.py` | 352 | `World` (the model, the scene, the physical actuation in `step`), `surface_textures`, `light_scene` |
 | `perception.py` | 233 | `Perception` (stand-in), `planar_scan`, `paint_segments`, the ray helpers |
-| `sensors.py` | 616 | `SensorRig`, `sensor_mounts` |
+| `sensors.py` | 625 | `SensorRig`, `sensor_mounts` |
 | `networks.py` | 96 | `DepthWorker`: the process with the networks, as the simulation sees it. `find_depth_python` |
 | `stereo_worker.py` | 279 | the process that runs IGEV++, Depth Anything V2 and the scene network |
 | `scene_net.py` | 47 | `SceneNet`: Mask2Former labels for markings, kerbs and the car's own body |
-| `localization.py` | 145 | `Localization`: the pose the car believes it has (satellite receiver with inertial unit, or dead reckoning) |
+| `localization.py` | 171 | `Localization`: the pose the car believes it has (satellite receiver with inertial unit, dead reckoning, or the one carried on by the other while parking) |
 | `paint.py` | 90 | `paint_textures`, `lay`: worn paint for the lines |
 | `ground.py` | 83 | `Ground`: the height of the road, flat or uneven |
 | `mapping.py` | 310 | `GridMap`, `LineTrack`, `LineMap` |
-| `stalls.py` | 242 | `find_slots`: stalls from pairs of line tracks. `join_collinear` |
-| `slot.py` | 188 | `Slot`, and what the map says about one: `_classify`, `_kerb_behind`, `_align_with_kerb` |
-| `one_line.py` | 112 | `one_line_stalls`: stalls of which one line was found, from the row they stand in |
+| `stalls.py` | 255 | `find_slots`: stalls from pairs of line tracks. `join_collinear` |
+| `slot.py` | 197 | `Slot`, and what the map says about one: `_classify`, `_kerb_behind`, `_align_with_kerb` |
+| `one_line.py` | 118 | `one_line_stalls`: stalls of which one line was found, from the row they stand in |
 | `rows.py` | 69 | `Row`, `lane_rows`: the mouth and the direction of the stalls on one side of the lane |
 | `reeds_shepp.py` | 179 | `_rs_words`, `rs_paths`, `rs_length_table`, `rs_sample` |
-| `planner.py` | 446 | `CSpace`, `holonomic_distance`, `Planner` (`search`, `shoot`, `_rs_shot`, `_arc_shot`), `Segment`, `split_segments` |
+| `planner.py` | 488 | `CSpace`, `holonomic_distance`, `Planner` (`search`, `shoot`, `_rs_shot`, `_arc_shot`), `Segment`, `split_segments` |
 | `control.py` | 262 | `LateralMPC`, `SteeringGain`, `MpcTracker` |
 | `viewer.py` | 511 | `Viewer`: the views, the overlays, the input handling |
 | `viewer_pictures.py` | 184 | `PicturesMixin`: the sensor pictures and how they reach Irrlicht |
