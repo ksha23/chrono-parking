@@ -6,6 +6,7 @@ import math
 import numpy as np
 
 from .geometry import footprint_hits, wrap
+from .slot import Slot
 
 
 class DriveIn:
@@ -25,6 +26,18 @@ class DriveIn:
     # Followed towards the lane only, by the same numbers, 7 cm and 18 cm. Not followed at
     # all, 9 cm and 21 cm, and in one run 84 cm: that stall had been taken 0.9 m too deep.
     # (A parallel stall is not followed at all across the kerb: see _toward_lane.)
+    #
+    # And an estimate that the map shows as taken is not one of the stall the car is driving
+    # into. One stall was estimated right, to 3 cm, until the car was half-way in. Then one of
+    # its lines was paired with a stub of something beside the next car, 0.7 m further on: a
+    # stall 3.4 m wide, 0.33 m to the side, with the next car in it. For that moment it was
+    # the only estimate of its kind there, the car followed it, and from then on it was the
+    # nearest to the last one. The car parked 0.30 m off the centre. (Two more tests were
+    # tried with it and dropped. The same width as at the plan, to 0.3 m: the width of an
+    # angled stall moves by more than that as the direction of its lines gets known, and a car
+    # that was kept from following ended 16 cm and 2.4 degrees off. The estimate nearest to
+    # the plan and not to the last one: three cars ended 6 to 10 cm further along their
+    # parallel stalls, and none nearer to the middle.)
     FOLLOW = (0.5, 0.1)
 
     def _held_goal(self, s):
@@ -59,7 +72,8 @@ class DriveIn:
         if self.planned is not None and self.path:
             across = np.array([-math.sin(self.planned[1]), math.cos(self.planned[1])])
             cand = [s for s in cand if abs((s.center - self.planned[0]) @ across) < self.FOLLOW[0] and
-                    abs(wrap(math.atan2(s.u_in[1], s.u_in[0]) - self.planned[1])) < self.FOLLOW[1]]
+                    abs(wrap(math.atan2(s.u_in[1], s.u_in[0]) - self.planned[1])) < self.FOLLOW[1] and
+                    s.status != Slot.OCCUPIED]
         if cand:
             self.target = min(cand, key=lambda s: np.hypot(*(s.center - self.target.center)))
             if self.path:

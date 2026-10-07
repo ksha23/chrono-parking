@@ -661,6 +661,42 @@ def test_hold_and_speed():
     print("the pose held by the wheels, and a speed the steering can follow: ok")
 
 
+def test_same_stall():
+    """While the car drives in, it follows estimates of the stall it planned for, and not one that is taken."""
+    from parking.agent_drive import DriveIn
+    from parking.slot import Slot
+
+    def stall(across, width=2.7, status=Slot.FREE, kind="perpendicular", deep=0.0):
+        s = Slot(kind, np.array([across, 5.0 + deep]), np.array([0.0, 1.0]), None, width, 5.2, None)
+        s.status = status
+        return s
+
+    class Car(DriveIn):
+        def __init__(self, slots, planned=True):
+            self.slots, self.target = slots, stall(0.0)
+            self.planned = (self.target.center.copy(), 0.5 * math.pi) if planned else None
+            self.path = [object()] if planned else []
+
+    # The run this is from. One line of the stall is paired with a stub beside the next car:
+    # a stall 3.4 m wide, 0.33 m to the side, with that car in it. The stall itself is called
+    # angled for that moment, so the other is the only one of its kind.
+    car = Car([stall(0.33, 3.4, Slot.OCCUPIED), stall(0.02, kind="angled")])
+    was = car.target
+    assert not car._retarget() and car.target is was
+    # with both to choose from, the one that is free, though the other is nearer
+    car = Car([stall(0.05, status=Slot.OCCUPIED), stall(0.2)])
+    assert car._retarget() and car.target is car.slots[1]
+    assert not Car([stall(0.6)])._retarget(), "0.6 m to the side is another stall"
+    # an estimate of the same stall is followed, whatever its width, and also towards the lane
+    car = Car([stall(0.12, 3.1, Slot.UNKNOWN, deep=-0.3)])
+    assert car._retarget() and car.target is car.slots[0]
+    assert np.allclose(car.planned[0], (0.0, 4.91)), car.planned
+    # before there is a plan, the nearest to the last estimate, as it is
+    car = Car([stall(0.3, 3.4, Slot.OCCUPIED), stall(0.6)], planned=False)
+    assert car._retarget() and car.target is car.slots[0]
+    print("the stall that was planned for, and not one that is taken: ok")
+
+
 def test_kerb_side():
     """Parallel parking: a line the car may not cross, with its own allowance for the nose and for the tail."""
     from parking.planner import CSpace, Planner, holonomic_distance
@@ -832,6 +868,7 @@ if __name__ == "__main__":
     test_stalls_from_their_row()
     test_stall_with_one_line()
     test_hold_and_speed()
+    test_same_stall()
     test_kerb_side()
     test_parallel_stall_and_kerb()
     test_own_pose()

@@ -358,6 +358,13 @@ plan was made for.
   same. The car used to stop and plan again for it. Of the jumps that were looked at, each
   was wrong: a line that had grown 0.7 m into the lane, and a stall rebuilt 0.7 m deeper from
   a line found late.
+- **A stall that is taken.** An estimate that the map shows as taken is not followed either.
+  The stall the car is driving into was free when it was chosen, and no car has come since.
+  One stall was estimated to 3 cm until the car was half-way in. Then one of its lines was
+  paired with a stub of something beside the next car, 0.7 m further on. That made a stall
+  3.4 m wide, 0.33 m to the side, with the next car in it. For that moment it was the only
+  estimate of its kind there. The car followed it, and from then on it was the nearest to the
+  last one. The car parked 0.30 m off the centre, and with this rule 1 cm off.
 - **Along the stall, one way only: towards the lane.** Paint that is seen is there. Paint that
   is not seen may be worn, in a shadow or behind something. So a stall may turn out to begin
   nearer to the lane than it was taken to, and that is followed, a third of the way per look.
