@@ -43,7 +43,7 @@ lines and the row it stands in
 ([sensors.md](sensors.md#between-two-cars-a-stall-is-two-stubs)), or from one of its lines
 where the other was not found ([sensors.md](sensors.md#one-line-found-the-other-not)). Means
 and largest offsets are over the runs that parked. All of these runs were rendered with OptiX
-on an RTX 5070 Ti.
+on an RTX 5070 Ti, but for the one set that says otherwise.
 
 **Two numbers.** A run can miss in two ways. The car can drive past a free stall because it
 does not recognise it. Every stall detector does that some of the time, and it costs the stall.
@@ -86,9 +86,31 @@ The last two changes each concern one kind of stall only: how deep into a stall 
 is followed towards the lane for stalls that are not parallel, and not at all for parallel
 ones. So the parallel runs of these sets and the others come from two batches, each made with
 the code as it now is for its kind. One run was repeated with the final code and gave the
-batch's line to the last digit. The earlier seeds, 10 to 27, have not been run again as whole
-sets with the final code. Each of their runs that had failed was run again when the change
-for it was made, and parked.
+batch's line to the last digit.
+
+**One more change since, and two whole sets.** In one run on seed 25 the car parked 30 cm off
+the centre of its stall, between two cars. The stall had been estimated to 3 cm. Half-way in,
+the car followed an estimate that paired one line of its stall with a stub beside the next
+car: a stall 0.7 m too wide, with that car in it. An estimate that the map shows as taken is
+no longer followed ([control.md](control.md#keeping-the-plan-attached-to-the-stall)), and
+that run parks 1 cm off. Seeds 28 to 30 were then run again as one set with this code, on the
+same RTX 5070 Ti. Of the 45 result lines, 44 are those of the two batches to the last digit.
+The other moved by 1 cm and 0.3 degrees. The table above is the same to the digits shown, so
+it now also stands as the result of one set. The 74 stand-in runs give the same lines as
+before the change.
+
+Seeds 10 to 12 were run again as a whole set with the code as it was before that change, on
+another machine (an RTX 5060 Ti under WSL2, [sensors.md](sensors.md#what-it-needs)). A run does not
+give the same result on two machines, so this set is not paired with anything:
+
+| Perception, seeds 10 to 12, RTX 5060 Ti | Parked | Committed to a stall, and completed | Lateral: mean, worst | Depth: mean, worst | Heading: mean, worst | Smallest clearance | Gear changes: mean, most | Time |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| cameras | 36 of 36 | 36 of 36 | 2.6, at most 14.0 cm | 6.9, at most 18.2 cm | 0.6, at most 2.8 deg | 0.06 m | 1.6, 4 | 39 s |
+| cameras + lidar | 9 of 9 | 9 of 9 | 2.5, at most 4.6 cm | 5.1, at most 9.0 cm | 0.4, at most 0.9 deg | 0.19 m | 1.6, 2 | 37 s |
+
+The 6 cm is the parallel stall between two cars on seed 12. It has been 6 to 11 cm there with
+every version. Seeds 13 to 27 have not been run again as whole sets. Each of their runs that
+had failed was run again when the change for it was made, and parked.
 
 **How this version came about.** Seeds 19 to 27 were unseen sets for the version before, three
 at a time, and each showed something. Every failure in which the car had committed to a stall

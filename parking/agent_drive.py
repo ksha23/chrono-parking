@@ -33,11 +33,12 @@ class DriveIn:
     # stall 3.4 m wide, 0.33 m to the side, with the next car in it. For that moment it was
     # the only estimate of its kind there, the car followed it, and from then on it was the
     # nearest to the last one. The car parked 0.30 m off the centre. (Two more tests were
-    # tried with it and dropped. The same width as at the plan, to 0.3 m: the width of an
-    # angled stall moves by more than that as the direction of its lines gets known, and a car
-    # that was kept from following ended 16 cm and 2.4 degrees off. The estimate nearest to
-    # the plan and not to the last one: three cars ended 6 to 10 cm further along their
-    # parallel stalls, and none nearer to the middle.)
+    # tried with it and dropped. The same width as at the plan, to 0.3 m: with the noise on
+    # the lines doubled, one stall 2.70 m wide was taken to be 2.24 m wide when the plan was
+    # made. Every later estimate was nearer the truth, each was turned away, and the car ended
+    # 16 cm and 2.4 degrees off where it had ended 5 cm and 0.6 degrees off. The estimate
+    # nearest to the plan and not to the last one: three cars ended 6 to 10 cm further along
+    # their parallel stalls, and none nearer to the middle.)
     FOLLOW = (0.5, 0.1)
 
     def _held_goal(self, s):
