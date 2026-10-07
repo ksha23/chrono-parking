@@ -67,6 +67,27 @@ Without it Chrono compiles for a list of older ones that CUDA 13 no longer knows
 stops with `Unsupported gpu architecture 'compute_60'`. The patch was applied for this build as
 well, although OptiX is the backend the bindings already cover.
 
+**In WSL2 on Windows** the same build works, with two differences. A Windows driver supports an
+older CUDA than the newest toolkit (driver 576.88: CUDA 12.9), and nvcc 12.9 wants gcc 14 or
+older. And OptiX does not start: `optixInit` fails with `OPTIX_ERROR_ENTRY_SYMBOL_NOT_FOUND`,
+because the `libnvoptix.so.1` that WSL provides in `/usr/lib/wsl/lib` is a loader for a library
+the Windows driver does not ship. That library is in NVIDIA's Linux driver of the same branch
+(the version `nvidia-smi` reports inside WSL: 575.64 there). Unpack the driver without
+installing it and put four of its files in a directory of their own, first on the library path:
+
+```bash
+sh NVIDIA-Linux-x86_64-575.64.run --extract-only --target extracted
+mkdir ~/optix-wsl
+cp extracted/libnvoptix.so.575.64 ~/optix-wsl/libnvoptix.so.1
+cp extracted/libnvidia-rtcore.so.575.64 extracted/libnvidia-gpucomp.so.575.64 extracted/nvoptix.bin ~/optix-wsl/
+export LD_LIBRARY_PATH=~/optix-wsl:/usr/lib/wsl/lib:$LD_LIBRARY_PATH
+```
+
+NVIDIA calls OptiX in WSL unsupported, and the files have to match the Windows driver's branch,
+so this is done again after a driver update. On an RTX 5060 Ti a run takes as long there as on
+the same card under Linux. WSL stops a distribution half a minute after its last session ends,
+and a run with it: keep the session that started the run open.
+
 **What differs between the two.** Everything on this page was developed with Metal RT. The same
 scenes rendered with OptiX look alike: over three scenes the rear and bumper cameras are within
 3 percent in brightness. What is not the same:
